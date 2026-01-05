@@ -30,6 +30,21 @@ const getSystemTheme = (): ThemeMode => {
   }
   return "light";
 };
+const getDirFromPath = (path: string) => {
+  const slashIndex = path.lastIndexOf("/");
+  const backslashIndex = path.lastIndexOf("\\");
+  const lastIndex = Math.max(slashIndex, backslashIndex);
+  if (lastIndex < 0) {
+    return null;
+  }
+  if (lastIndex === 0) {
+    return path.slice(0, 1);
+  }
+  if (backslashIndex === lastIndex && lastIndex === 2 && path[1] === ":") {
+    return path.slice(0, lastIndex + 1);
+  }
+  return path.slice(0, lastIndex);
+};
 
 function App() {
   const [filePath, setFilePath] = useState<string | null>(null);
@@ -57,6 +72,7 @@ function App() {
   const [themePreference, setThemePreference] =
     useState<ThemePreference>("system");
   const [resolvedTheme, setResolvedTheme] = useState<ThemeMode>(getSystemTheme);
+  const [lastOpenDir, setLastOpenDir] = useState<string | null>(null);
   const dataRef = useRef<Map<number, string[]>>(new Map());
   const rowIndexMapRef = useRef<Map<number, number>>(new Map());
   const [, setDataVersion] = useState(0);
@@ -108,6 +124,7 @@ function App() {
         columnWidth?: number;
         columnWidths?: number[];
         theme?: ThemePreference;
+        lastOpenDir?: string;
       };
       if (typeof parsed.showIndex === "boolean") {
         setShowIndex(parsed.showIndex);
@@ -136,6 +153,9 @@ function App() {
       ) {
         setThemePreference(parsed.theme);
       }
+      if (typeof parsed.lastOpenDir === "string") {
+        setLastOpenDir(parsed.lastOpenDir);
+      }
     } catch {
       // Ignore malformed settings.
     }
@@ -148,13 +168,21 @@ function App() {
       columnWidth,
       columnWidths,
       theme: themePreference,
+      lastOpenDir,
     };
     try {
       localStorage.setItem(SETTINGS_KEY, JSON.stringify(payload));
     } catch {
       // Ignore storage failures.
     }
-  }, [showIndex, rowHeight, columnWidth, columnWidths, themePreference]);
+  }, [
+    showIndex,
+    rowHeight,
+    columnWidth,
+    columnWidths,
+    themePreference,
+    lastOpenDir,
+  ]);
 
   useEffect(() => {
     invoke("set_show_index_checked", { checked: showIndex }).catch(() => {});
@@ -237,6 +265,10 @@ function App() {
         setHeaders(csvHeaders);
         setTotalRows(CHUNK_SIZE);
         setSearchColumn(0);
+        const nextDir = getDirFromPath(path);
+        if (nextDir) {
+          setLastOpenDir(nextDir);
+        }
       } catch (err) {
         setError(
           typeof err === "string" ? err : "Unable to load CSV metadata.",
@@ -254,6 +286,7 @@ function App() {
     const selected = await open({
       multiple: false,
       filters: [{ name: "CSV", extensions: ["csv"] }],
+      defaultPath: lastOpenDir ?? undefined,
     });
 
     if (!selected || Array.isArray(selected)) {
@@ -261,7 +294,7 @@ function App() {
     }
 
     handleOpenPath(selected);
-  }, [handleOpenPath]);
+  }, [handleOpenPath, lastOpenDir]);
 
   const handleClearFile = useCallback(() => {
     setFilePath(null);

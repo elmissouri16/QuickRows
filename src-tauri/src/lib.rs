@@ -326,6 +326,9 @@ async fn get_sorted_chunk(
 ) -> Result<Vec<SortedRow>, String> {
     let sorted = state.sorted_order.lock().unwrap();
     let order = sorted.as_ref().ok_or("No sorted data")?;
+    if start >= order.len() {
+        return Ok(Vec::new());
+    }
     let end = usize::min(start + count, order.len());
     let slice = &order[start..end];
     let path = state
