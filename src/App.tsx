@@ -8,8 +8,9 @@ import { useDebounce } from "./hooks/useDebounce";
 import "./App.css";
 
 const DEFAULT_ROW_HEIGHT = 36;
-const PREFETCH = 20;
+const PREFETCH = 12;
 const CHUNK_SIZE = 800;
+const MAX_CACHED_ROWS = CHUNK_SIZE * 12;
 const COLUMN_WIDTH_MIN = 120;
 const SETTINGS_KEY = "csv-viewer.settings";
 const ROW_HEIGHT_OPTIONS = new Set([28, 36, 44]);
@@ -17,15 +18,25 @@ const ROW_HEIGHT_OPTIONS = new Set([28, 36, 44]);
 type SortDirection = "asc" | "desc";
 type SortState = { column: number; direction: SortDirection };
 type SortedRow = { index: number; row: string[] };
+type ThemeMode = "light" | "dark";
+type ThemePreference = ThemeMode | "system";
 
 const clampColumnWidth = (value: number) => Math.max(COLUMN_WIDTH_MIN, value);
+const getSystemTheme = (): ThemeMode => {
+  if (typeof window !== "undefined") {
+    if (window.matchMedia?.("(prefers-color-scheme: dark)").matches) {
+      return "dark";
+    }
+  }
+  return "light";
+};
 
 function App() {
   const [filePath, setFilePath] = useState<string | null>(null);
   const [checkingInitialOpen, setCheckingInitialOpen] = useState(true);
   const [headers, setHeaders] = useState<string[]>([]);
   const [totalRows, setTotalRows] = useState(0);
-  const [data, setData] = useState<Map<number, string[]>>(new Map());
+  const [rowCountReady, setRowCountReady] = useState(false);
   const [loadingRows, setLoadingRows] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
@@ -37,15 +48,19 @@ function App() {
   const [showIndex, setShowIndex] = useState(false);
   const [sortState, setSortState] = useState<SortState | null>(null);
   const [sortLoading, setSortLoading] = useState(false);
-  const [rowIndexMap, setRowIndexMap] = useState<Map<number, number>>(
-    new Map(),
-  );
   const [sortedIndexLookup, setSortedIndexLookup] = useState<number[] | null>(
     null,
   );
   const [rowHeight, setRowHeight] = useState(DEFAULT_ROW_HEIGHT);
   const [columnWidth, setColumnWidth] = useState(160);
   const [columnWidths, setColumnWidths] = useState<number[]>([]);
+  const [themePreference, setThemePreference] =
+    useState<ThemePreference>("system");
+  const [resolvedTheme, setResolvedTheme] = useState<ThemeMode>(getSystemTheme);
+  const dataRef = useRef<Map<number, string[]>>(new Map());
+  const rowIndexMapRef = useRef<Map<number, number>>(new Map());
+  const [, setDataVersion] = useState(0);
+  const [, setRowIndexVersion] = useState(0);
 
   const debouncedSearch = useDebounce(searchTerm, 450);
   const parentRef = useRef<HTMLDivElement>(null);
@@ -56,12 +71,14 @@ function App() {
     startX: number;
     startWidth: number;
   } | null>(null);
+  const resizeFrameRef = useRef<number | null>(null);
+  const pendingWidthRef = useRef<number | null>(null);
 
   const rowVirtualizer = useVirtualizer({
     count: totalRows,
     getScrollElement: () => parentRef.current,
     estimateSize: () => rowHeight,
-    overscan: 12,
+    overscan: 8,
   });
 
   const headerLabels = useMemo(
@@ -90,6 +107,7 @@ function App() {
         rowHeight?: number;
         columnWidth?: number;
         columnWidths?: number[];
+        theme?: ThemePreference;
       };
       if (typeof parsed.showIndex === "boolean") {
         setShowIndex(parsed.showIndex);
@@ -111,6 +129,13 @@ function App() {
           setColumnWidths(nextWidths);
         }
       }
+      if (
+        parsed.theme === "light" ||
+        parsed.theme === "dark" ||
+        parsed.theme === "system"
+      ) {
+        setThemePreference(parsed.theme);
+      }
     } catch {
       // Ignore malformed settings.
     }
@@ -122,17 +147,41 @@ function App() {
       rowHeight,
       columnWidth,
       columnWidths,
+      theme: themePreference,
     };
     try {
       localStorage.setItem(SETTINGS_KEY, JSON.stringify(payload));
     } catch {
       // Ignore storage failures.
     }
-  }, [showIndex, rowHeight, columnWidth, columnWidths]);
+  }, [showIndex, rowHeight, columnWidth, columnWidths, themePreference]);
 
   useEffect(() => {
     invoke("set_show_index_checked", { checked: showIndex }).catch(() => {});
   }, [showIndex]);
+
+  useEffect(() => {
+    if (themePreference !== "system") {
+      setResolvedTheme(themePreference);
+      return;
+    }
+    const media = window.matchMedia?.("(prefers-color-scheme: dark)");
+    const update = () => setResolvedTheme(media?.matches ? "dark" : "light");
+    update();
+    if (!media) {
+      return;
+    }
+    if (media.addEventListener) {
+      media.addEventListener("change", update);
+      return () => media.removeEventListener("change", update);
+    }
+    media.addListener(update);
+    return () => media.removeListener(update);
+  }, [themePreference]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = resolvedTheme;
+  }, [resolvedTheme]);
 
   useEffect(() => {
     if (!headers.length) {
@@ -154,13 +203,23 @@ function App() {
     setSortState(null);
     setSortLoading(false);
     setSortedIndexLookup(null);
-    setRowIndexMap(new Map());
+    rowIndexMapRef.current = new Map();
+    setRowIndexVersion((prev) => prev + 1);
     setShowFind(false);
     setSearchTerm("");
     setSearchResults(null);
     setCurrentMatch(0);
-    setData(new Map());
+    dataRef.current = new Map();
+    setDataVersion((prev) => prev + 1);
+    setRowCountReady(false);
     invoke("clear_sort").catch(() => {});
+  }, []);
+
+  const toggleTheme = useCallback(() => {
+    setThemePreference((prev) => {
+      const current = prev === "system" ? getSystemTheme() : prev;
+      return current === "dark" ? "light" : "dark";
+    });
   }, []);
 
   const handleOpenPath = useCallback(
@@ -169,14 +228,14 @@ function App() {
       setFilePath(path);
       setHeaders([]);
       setTotalRows(0);
+      setRowCountReady(false);
 
       try {
-        const [csvHeaders, rowCount] = await invoke<[string[], number]>(
-          "load_csv_metadata",
-          { path },
-        );
+        const csvHeaders = await invoke<string[]>("load_csv_metadata", {
+          path,
+        });
         setHeaders(csvHeaders);
-        setTotalRows(rowCount);
+        setTotalRows(CHUNK_SIZE);
         setSearchColumn(0);
       } catch (err) {
         setError(
@@ -185,6 +244,7 @@ function App() {
         setFilePath(null);
         setHeaders([]);
         setTotalRows(0);
+        setRowCountReady(false);
       }
     },
     [resetForNewFile],
@@ -207,7 +267,8 @@ function App() {
     setFilePath(null);
     setHeaders([]);
     setTotalRows(0);
-    setData(new Map());
+    dataRef.current = new Map();
+    setDataVersion((prev) => prev + 1);
     setSearchTerm("");
     setSearchResults(null);
     setError(null);
@@ -215,16 +276,28 @@ function App() {
     setSortState(null);
     setSortLoading(false);
     setSortedIndexLookup(null);
-    setRowIndexMap(new Map());
+    rowIndexMapRef.current = new Map();
+    setRowIndexVersion((prev) => prev + 1);
+    setRowCountReady(false);
     invoke("clear_sort").catch(() => {});
   }, []);
 
   useEffect(() => {
-    if (!filePath || totalRows === 0 || loadingRows || sortLoading) {
+    if (!filePath || loadingRows || sortLoading || totalRows === 0) {
       return;
     }
     if (virtualItems.length === 0) {
       return;
+    }
+    if (sortState && !sortedIndexLookup) {
+      return;
+    }
+
+    if (!rowCountReady) {
+      const lastIndex = virtualItems[virtualItems.length - 1].index;
+      if (lastIndex >= totalRows - PREFETCH - 1) {
+        setTotalRows((prev) => prev + CHUNK_SIZE);
+      }
     }
 
     const startIndex = Math.max(0, virtualItems[0].index - PREFETCH);
@@ -238,7 +311,9 @@ function App() {
       return;
     }
 
-    const needsLoading = virtualItems.some((item) => !data.has(item.index));
+    const needsLoading = virtualItems.some(
+      (item) => !dataRef.current.has(item.index),
+    );
 
     if (!needsLoading) {
       return;
@@ -264,43 +339,51 @@ function App() {
         if (sortKey !== currentSortKey) {
           return;
         }
+        setError(null);
         if (sortState) {
           const sortedChunk = chunk as SortedRow[];
-          setData((prev) => {
-            const next = new Map(prev);
-            sortedChunk.forEach((row, idx) => {
-              next.set(startIndex + idx, row.row);
-            });
-            return next;
+          const dataMap = dataRef.current;
+          const indexMap = rowIndexMapRef.current;
+          sortedChunk.forEach((row, idx) => {
+            dataMap.set(startIndex + idx, row.row);
+            indexMap.set(startIndex + idx, row.index);
           });
-          setRowIndexMap((prev) => {
-            const next = new Map(prev);
-            sortedChunk.forEach((row, idx) => {
-              next.set(startIndex + idx, row.index);
-            });
-            return next;
-          });
+          setDataVersion((prev) => prev + 1);
+          setRowIndexVersion((prev) => prev + 1);
+          if (!rowCountReady && sortedChunk.length < requestedCount) {
+            setTotalRows(startIndex + sortedChunk.length);
+            setRowCountReady(true);
+          }
         } else {
           const rows = chunk as string[][];
-          setData((prev) => {
-            const next = new Map(prev);
-            rows.forEach((row, idx) => {
-              next.set(startIndex + idx, row);
-            });
-            return next;
+          const dataMap = dataRef.current;
+          rows.forEach((row, idx) => {
+            dataMap.set(startIndex + idx, row);
           });
+          setDataVersion((prev) => prev + 1);
+          if (!rowCountReady && rows.length < requestedCount) {
+            setTotalRows(startIndex + rows.length);
+            setRowCountReady(true);
+          }
         }
       })
       .catch((err) => {
+        const currentSortKey = sortState
+          ? `${sortState.column}:${sortState.direction}`
+          : null;
+        if (sortKey !== currentSortKey) {
+          return;
+        }
         setError(typeof err === "string" ? err : "Failed to load CSV rows.");
       })
       .finally(() => setLoadingRows(false));
   }, [
-    data,
     filePath,
     loadingRows,
+    rowCountReady,
     sortLoading,
     sortState,
+    sortedIndexLookup,
     totalRows,
     virtualItems,
   ]);
@@ -308,6 +391,54 @@ function App() {
   useEffect(() => {
     rowVirtualizer.measure();
   }, [rowHeight, rowVirtualizer]);
+
+  useEffect(() => {
+    if (virtualItems.length === 0) {
+      return;
+    }
+    const dataMap = dataRef.current;
+    if (dataMap.size <= MAX_CACHED_ROWS) {
+      return;
+    }
+
+    const viewStart = virtualItems[0].index;
+    const viewEnd = virtualItems[virtualItems.length - 1].index;
+    const center = Math.floor((viewStart + viewEnd) / 2);
+    const halfWindow = Math.floor(MAX_CACHED_ROWS / 2);
+
+    let windowStart = Math.max(0, center - halfWindow);
+    let windowEnd = windowStart + MAX_CACHED_ROWS;
+
+    if (rowCountReady && windowEnd > totalRows) {
+      windowEnd = totalRows;
+      windowStart = Math.max(0, windowEnd - MAX_CACHED_ROWS);
+    }
+
+    let removed = false;
+    for (const key of dataMap.keys()) {
+      if (key < windowStart || key >= windowEnd) {
+        dataMap.delete(key);
+        removed = true;
+      }
+    }
+
+    if (sortState) {
+      const indexMap = rowIndexMapRef.current;
+      for (const key of indexMap.keys()) {
+        if (key < windowStart || key >= windowEnd) {
+          indexMap.delete(key);
+          removed = true;
+        }
+      }
+    }
+
+    if (removed) {
+      setDataVersion((prev) => prev + 1);
+      if (sortState) {
+        setRowIndexVersion((prev) => prev + 1);
+      }
+    }
+  }, [rowCountReady, sortState, totalRows, virtualItems]);
 
   useEffect(() => {
     if (showFind) {
@@ -334,7 +465,8 @@ function App() {
   }, [filePath]);
 
   useEffect(() => {
-    if (!filePath) {
+    if (!filePath || !rowCountReady) {
+      setSearching(false);
       return;
     }
     if (!debouncedSearch) {
@@ -352,7 +484,7 @@ function App() {
         setError(typeof err === "string" ? err : "Search failed to complete.");
       })
       .finally(() => setSearching(false));
-  }, [debouncedSearch, filePath, searchColumn]);
+  }, [debouncedSearch, filePath, rowCountReady, searchColumn]);
 
   const scrollToMatch = useCallback(
     (matchIndex: number) => {
@@ -409,16 +541,20 @@ function App() {
 
     if (!sortState) {
       setSortedIndexLookup(null);
-      setRowIndexMap(new Map());
-      setData(new Map());
+      rowIndexMapRef.current = new Map();
+      setRowIndexVersion((prev) => prev + 1);
+      dataRef.current = new Map();
+      setDataVersion((prev) => prev + 1);
       invoke("clear_sort").catch(() => {});
       return;
     }
 
     const sortKey = `${sortState.column}:${sortState.direction}`;
     setSortLoading(true);
-    setRowIndexMap(new Map());
-    setData(new Map());
+    rowIndexMapRef.current = new Map();
+    setRowIndexVersion((prev) => prev + 1);
+    dataRef.current = new Map();
+    setDataVersion((prev) => prev + 1);
     invoke<number[]>("sort_csv", {
       columnIdx: sortState.column,
       ascending: sortState.direction === "asc",
@@ -467,11 +603,6 @@ function App() {
         listen<number>("menu-row-height", (event) => {
           setRowHeight(event.payload);
         }),
-        listen<number>("menu-column-width", (event) => {
-          const nextWidth = clampColumnWidth(event.payload);
-          setColumnWidth(nextWidth);
-          setColumnWidths((prev) => prev.map(() => nextWidth));
-        }),
         listen<boolean>("menu-show-index", (event) => {
           setShowIndex(event.payload);
         }),
@@ -483,6 +614,13 @@ function App() {
         }),
         listen("menu-close-find", () => {
           setShowFind(false);
+        }),
+        listen("menu-toggle-theme", () => {
+          toggleTheme();
+        }),
+        listen<number>("row-count", (event) => {
+          setTotalRows(event.payload);
+          setRowCountReady(true);
         }),
       ]);
 
@@ -500,7 +638,13 @@ function App() {
       active = false;
       unlistenFns.forEach((fn) => fn());
     };
-  }, [goToNextMatch, goToPrevMatch, handleClearFile, handlePickFile]);
+  }, [
+    goToNextMatch,
+    goToPrevMatch,
+    handleClearFile,
+    handlePickFile,
+    toggleTheme,
+  ]);
 
   useEffect(() => {
     let active = true;
@@ -573,6 +717,11 @@ function App() {
     [columnWidth, columnWidths, headerLabels],
   );
 
+  const indexWidth = useMemo(() => {
+    const digits = Math.max(1, String(Math.max(totalRows, 1)).length);
+    return Math.max(64, digits * 10 + 28);
+  }, [totalRows]);
+
   const handleResizeStart = useCallback(
     (event: React.MouseEvent<HTMLDivElement>, columnIndex: number) => {
       if (event.button !== 0) {
@@ -587,6 +736,7 @@ function App() {
         startX: event.clientX,
         startWidth,
       };
+      pendingWidthRef.current = startWidth;
 
       const handleMove = (moveEvent: MouseEvent) => {
         const current = resizeRef.current;
@@ -595,17 +745,45 @@ function App() {
         }
         const delta = moveEvent.clientX - current.startX;
         const nextWidth = clampColumnWidth(current.startWidth + delta);
-        setColumnWidths((prev) => {
-          const next = prev.length
-            ? [...prev]
-            : headerLabels.map(() => columnWidth);
-          next[current.columnIndex] = nextWidth;
-          return next;
+        pendingWidthRef.current = nextWidth;
+        if (resizeFrameRef.current !== null) {
+          return;
+        }
+        resizeFrameRef.current = window.requestAnimationFrame(() => {
+          resizeFrameRef.current = null;
+          const latest = resizeRef.current;
+          const pending = pendingWidthRef.current;
+          if (!latest || pending === null) {
+            return;
+          }
+          setColumnWidths((prev) => {
+            const next = prev.length
+              ? [...prev]
+              : headerLabels.map(() => columnWidth);
+            next[latest.columnIndex] = pending;
+            return next;
+          });
         });
       };
 
       const handleUp = () => {
+        if (resizeFrameRef.current !== null) {
+          cancelAnimationFrame(resizeFrameRef.current);
+          resizeFrameRef.current = null;
+        }
+        const latest = resizeRef.current;
+        const pending = pendingWidthRef.current;
+        if (latest && pending !== null) {
+          setColumnWidths((prev) => {
+            const next = prev.length
+              ? [...prev]
+              : headerLabels.map(() => columnWidth);
+            next[latest.columnIndex] = pending;
+            return next;
+          });
+        }
         resizeRef.current = null;
+        pendingWidthRef.current = null;
         window.removeEventListener("mousemove", handleMove);
         window.removeEventListener("mouseup", handleUp);
       };
@@ -617,7 +795,7 @@ function App() {
   );
 
   const handleHeaderClick = (columnIndex: number) => {
-    if (sortLoading) {
+    if (sortLoading || !rowCountReady) {
       return;
     }
     setSortState((prev) => {
@@ -638,12 +816,13 @@ function App() {
         {
           "--cell-min": `${columnWidth}px`,
           "--row-height": `${rowHeight}px`,
+          "--index-width": `${indexWidth}px`,
         } as CSSProperties
       }
     >
       {error ? <div className="status">{error}</div> : null}
 
-      <section className="table-shell">
+      <section className={`table-shell${filePath ? "" : " is-empty"}`}>
         {showFind ? (
           <div className={`find-panel${showIndex ? " with-index" : ""}`}>
             <div className="find-controls">
@@ -652,7 +831,7 @@ function App() {
                 onChange={(event) =>
                   setSearchColumn(Number(event.target.value))
                 }
-                disabled={!headers.length}
+                disabled={!headers.length || !rowCountReady}
               >
                 {headerLabels.map((header, idx) => (
                   <option value={idx} key={`${header}-${idx}`}>
@@ -665,7 +844,7 @@ function App() {
                 value={searchTerm}
                 onChange={(event) => setSearchTerm(event.target.value)}
                 placeholder="Search selected column"
-                disabled={!filePath}
+                disabled={!filePath || !rowCountReady}
                 ref={searchInputRef}
                 onKeyDown={(event) => {
                   if (event.key === "Escape") {
@@ -718,11 +897,13 @@ function App() {
             <div className="find-meta">
               {searching
                 ? "Searching..."
-                : searchResults
-                  ? `${searchResults.length.toLocaleString()} matches`
-                  : filePath
-                    ? "Ready"
-                    : "No file loaded"}
+                : !rowCountReady && filePath
+                  ? "Counting rows..."
+                  : searchResults
+                    ? `${searchResults.length.toLocaleString()} matches`
+                    : filePath
+                      ? "Ready"
+                      : "No file loaded"}
             </div>
           </div>
         ) : null}
@@ -735,8 +916,10 @@ function App() {
           ) : (
             <div className="empty-state">
               <h2>Open a CSV to start</h2>
-              <p>Streaming keeps the table responsive for large files.</p>
-              <button className="btn primary" onClick={handlePickFile}>
+              <button
+                className="btn primary empty-cta"
+                onClick={handlePickFile}
+              >
                 Open CSV
               </button>
             </div>
@@ -784,9 +967,9 @@ function App() {
                 }}
               >
                 {virtualItems.map((virtualRow) => {
-                  const rowData = data.get(virtualRow.index);
+                  const rowData = dataRef.current.get(virtualRow.index);
                   const originalIndex = sortState
-                    ? rowIndexMap.get(virtualRow.index)
+                    ? rowIndexMapRef.current.get(virtualRow.index)
                     : virtualRow.index;
                   const rowNumber = (originalIndex ?? virtualRow.index) + 1;
                   const currentIndex = searchResults?.[currentMatch];

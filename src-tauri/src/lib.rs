@@ -1,11 +1,21 @@
 mod csv_cache;
 mod csv_handler;
-mod csv_ops;
-
+mod csv_mmap;
+mod disk_cache;
 use csv_cache::CsvCache;
-use csv_handler::{count_rows_fast, get_headers, read_chunk};
-use csv_ops::search_parallel;
-use std::sync::Mutex;
+use csv_handler::{
+    build_row_offsets, build_row_offsets_mmap, get_headers, read_chunk, read_chunk_mmap,
+    read_chunk_with_offsets, read_chunk_with_offsets_mmap, read_rows_by_index,
+    read_rows_by_index_mmap, search_range_with_offsets, search_range_with_offsets_mmap,
+};
+use csv_mmap::open_mmap_if_large;
+use disk_cache::{
+    cache_key, ensure_cache_dir, offsets_cache_path, order_cache_path, prune_cache_dir,
+    read_offsets_cache, read_order_cache, write_offsets_cache, write_order_cache,
+};
+use memmap2::Mmap;
+use rayon::prelude::*;
+use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
 
 #[cfg(desktop)]
@@ -22,9 +32,13 @@ struct AppState {
     total_rows: Mutex<usize>,
     headers: Mutex<Vec<String>>,
     cache: CsvCache,
-    sorted_rows: Mutex<Option<Vec<SortedRow>>>,
+    sorted_order: Mutex<Option<Vec<usize>>>,
     pending_open: Mutex<Option<String>>,
+    row_offsets: Mutex<Option<Vec<u64>>>,
+    mmap: Mutex<Option<Arc<Mmap>>>,
 }
+
+const SEARCH_CHUNK_SIZE: usize = 25_000;
 
 fn initial_open_path() -> Option<String> {
     std::env::args_os().skip(1).find_map(|arg| {
@@ -42,17 +56,67 @@ fn initial_open_path() -> Option<String> {
 async fn load_csv_metadata(
     path: String,
     state: State<'_, AppState>,
-) -> Result<(Vec<String>, usize), String> {
+    app: tauri::AppHandle,
+) -> Result<Vec<String>, String> {
     let headers = get_headers(&path).map_err(|err| err.to_string())?;
-    let count = count_rows_fast(&path).map_err(|err| err.to_string())?;
 
-    *state.file_path.lock().unwrap() = Some(path);
-    *state.total_rows.lock().unwrap() = count;
+    *state.file_path.lock().unwrap() = Some(path.clone());
+    *state.total_rows.lock().unwrap() = 0;
     *state.headers.lock().unwrap() = headers.clone();
-    *state.sorted_rows.lock().unwrap() = None;
+    *state.sorted_order.lock().unwrap() = None;
+    *state.row_offsets.lock().unwrap() = None;
+    *state.mmap.lock().unwrap() = None;
     state.cache.clear();
 
-    Ok((headers, count))
+    tauri::async_runtime::spawn_blocking(move || {
+        let cache_dir = match ensure_cache_dir(&app) {
+            Ok(dir) => dir,
+            Err(_) => return,
+        };
+        prune_cache_dir(&cache_dir);
+
+        let key = match cache_key(&path) {
+            Ok(key) => key,
+            Err(_) => return,
+        };
+        let cache_path = offsets_cache_path(&cache_dir, key);
+
+        let mmap = match open_mmap_if_large(&path) {
+            Ok(mmap) => mmap,
+            Err(_) => None,
+        };
+
+        let offsets = match read_offsets_cache(&cache_path, key) {
+            Ok(Some(offsets)) => offsets,
+            _ => {
+                let offsets = match mmap.as_deref() {
+                    Some(mmap) => match build_row_offsets_mmap(&mmap[..]) {
+                        Ok(offsets) => offsets,
+                        Err(_) => return,
+                    },
+                    None => match build_row_offsets(&path) {
+                        Ok(offsets) => offsets,
+                        Err(_) => return,
+                    },
+                };
+                let _ = write_offsets_cache(&cache_path, key, &offsets);
+                offsets
+            }
+        };
+
+        let count = offsets.len();
+        let state = app.state::<AppState>();
+        let current_path = state.file_path.lock().unwrap().clone();
+        if current_path.as_deref() != Some(path.as_str()) {
+            return;
+        }
+        *state.row_offsets.lock().unwrap() = Some(offsets);
+        *state.total_rows.lock().unwrap() = count;
+        *state.mmap.lock().unwrap() = mmap;
+        let _ = app.emit("row-count", count);
+    });
+
+    Ok(headers)
 }
 
 #[tauri::command]
@@ -72,7 +136,26 @@ async fn get_csv_chunk(
         .clone()
         .ok_or("No file loaded")?;
 
-    let data = read_chunk(&path, start, count).map_err(|err| err.to_string())?;
+    let mmap = state.mmap.lock().unwrap().clone();
+    let offsets_guard = state.row_offsets.lock().unwrap();
+    let data = match offsets_guard.as_ref() {
+        Some(offsets) => {
+            if let Some(mmap) = mmap.as_ref() {
+                read_chunk_with_offsets_mmap(&mmap[..], offsets, start, count)
+                    .map_err(|err| err.to_string())?
+            } else {
+                read_chunk_with_offsets(&path, offsets, start, count)
+                    .map_err(|err| err.to_string())?
+            }
+        }
+        None => {
+            if let Some(mmap) = mmap.as_ref() {
+                read_chunk_mmap(&mmap[..], start, count).map_err(|err| err.to_string())?
+            } else {
+                read_chunk(&path, start, count).map_err(|err| err.to_string())?
+            }
+        }
+    };
     state.cache.put(start, count, data.clone());
 
     Ok(data)
@@ -90,10 +173,81 @@ async fn search_csv(
         .unwrap()
         .clone()
         .ok_or("No file loaded")?;
+    let query_lower = query.to_lowercase();
 
-    let total = *state.total_rows.lock().unwrap();
-    let data = read_chunk(&path, 0, total).map_err(|err| err.to_string())?;
-    Ok(search_parallel(&data, column_idx, &query))
+    let mmap = state.mmap.lock().unwrap().clone();
+    let offsets_guard = state.row_offsets.lock().unwrap();
+    if let Some(offsets) = offsets_guard.as_ref() {
+        let total = offsets.len();
+        let ranges = (0..total)
+            .step_by(SEARCH_CHUNK_SIZE)
+            .map(|start| (start, usize::min(start + SEARCH_CHUNK_SIZE, total)))
+            .collect::<Vec<_>>();
+
+        let mut matches = ranges
+            .par_iter()
+            .try_fold(Vec::new, |mut acc, (start, end)| {
+                let mut found = if let Some(mmap) = mmap.as_ref() {
+                    search_range_with_offsets_mmap(
+                        &mmap[..],
+                        offsets,
+                        *start,
+                        *end,
+                        column_idx,
+                        &query_lower,
+                    )
+                } else {
+                    search_range_with_offsets(
+                        &path,
+                        offsets,
+                        *start,
+                        *end,
+                        column_idx,
+                        &query_lower,
+                    )
+                }
+                .map_err(|err| err.to_string())?;
+                acc.append(&mut found);
+                Ok::<Vec<usize>, String>(acc)
+            })
+            .try_reduce(Vec::new, |mut left, mut right| {
+                left.append(&mut right);
+                Ok::<Vec<usize>, String>(left)
+            })?;
+
+        matches.sort_unstable();
+        return Ok(matches);
+    }
+    drop(offsets_guard);
+
+    let mut matches = Vec::new();
+    if let Some(mmap) = mmap.as_ref() {
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(&mmap[..]);
+        for (idx, result) in rdr.records().enumerate() {
+            let record = result.map_err(|err| err.to_string())?;
+            let cell = record.get(column_idx).unwrap_or("");
+            if cell.to_lowercase().contains(&query_lower) {
+                matches.push(idx);
+            }
+        }
+    } else {
+        let file = std::fs::File::open(&path).map_err(|err| err.to_string())?;
+        let reader = std::io::BufReader::new(file);
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(reader);
+        for (idx, result) in rdr.records().enumerate() {
+            let record = result.map_err(|err| err.to_string())?;
+            let cell = record.get(column_idx).unwrap_or("");
+            if cell.to_lowercase().contains(&query_lower) {
+                matches.push(idx);
+            }
+        }
+    }
+
+    Ok(matches)
 }
 
 #[tauri::command]
@@ -101,6 +255,7 @@ async fn sort_csv(
     column_idx: usize,
     ascending: bool,
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<Vec<usize>, String> {
     let path = state
         .file_path
@@ -109,28 +264,56 @@ async fn sort_csv(
         .clone()
         .ok_or("No file loaded")?;
 
-    let total = *state.total_rows.lock().unwrap();
-    let data = read_chunk(&path, 0, total).map_err(|err| err.to_string())?;
-    let mut rows: Vec<(usize, Vec<String>)> = data.into_iter().enumerate().collect();
-
-    rows.sort_by(|a, b| {
-        let a_value = a.1.get(column_idx).map(String::as_str).unwrap_or("");
-        let b_value = b.1.get(column_idx).map(String::as_str).unwrap_or("");
-        let cmp = a_value.cmp(b_value);
-        if ascending {
-            cmp
-        } else {
-            cmp.reverse()
+    let cache_dir = ensure_cache_dir(&app)?;
+    let key = cache_key(&path)?;
+    let order_path = order_cache_path(&cache_dir, key, column_idx, ascending);
+    if let Ok(Some(order)) = read_order_cache(&order_path, key, column_idx, ascending) {
+        *state.sorted_order.lock().unwrap() = Some(order.clone());
+        return Ok(order);
+    }
+    if !ascending {
+        let asc_path = order_cache_path(&cache_dir, key, column_idx, true);
+        if let Ok(Some(mut order)) = read_order_cache(&asc_path, key, column_idx, true) {
+            order.reverse();
+            *state.sorted_order.lock().unwrap() = Some(order.clone());
+            return Ok(order);
         }
-    });
+    }
+
+    let mmap = state.mmap.lock().unwrap().clone();
+    let mut rows: Vec<(usize, String)> = Vec::new();
+
+    if let Some(mmap) = mmap.as_ref() {
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(&mmap[..]);
+        for (idx, result) in rdr.records().enumerate() {
+            let record = result.map_err(|err| err.to_string())?;
+            let value = record.get(column_idx).unwrap_or("").to_string();
+            rows.push((idx, value));
+        }
+    } else {
+        let file = std::fs::File::open(&path).map_err(|err| err.to_string())?;
+        let reader = std::io::BufReader::new(file);
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(reader);
+        for (idx, result) in rdr.records().enumerate() {
+            let record = result.map_err(|err| err.to_string())?;
+            let value = record.get(column_idx).unwrap_or("").to_string();
+            rows.push((idx, value));
+        }
+    }
+
+    if ascending {
+        rows.par_sort_unstable_by(|a, b| a.1.cmp(&b.1));
+    } else {
+        rows.par_sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    }
 
     let order = rows.iter().map(|(idx, _)| *idx).collect::<Vec<_>>();
-    let sorted = rows
-        .into_iter()
-        .map(|(idx, row)| SortedRow { index: idx, row })
-        .collect::<Vec<_>>();
-
-    *state.sorted_rows.lock().unwrap() = Some(sorted);
+    *state.sorted_order.lock().unwrap() = Some(order.clone());
+    let _ = write_order_cache(&order_path, key, column_idx, ascending, &order);
 
     Ok(order)
 }
@@ -141,15 +324,35 @@ async fn get_sorted_chunk(
     count: usize,
     state: State<'_, AppState>,
 ) -> Result<Vec<SortedRow>, String> {
-    let sorted = state.sorted_rows.lock().unwrap();
-    let rows = sorted.as_ref().ok_or("No sorted data")?;
-    let end = usize::min(start + count, rows.len());
-    Ok(rows[start..end].to_vec())
+    let sorted = state.sorted_order.lock().unwrap();
+    let order = sorted.as_ref().ok_or("No sorted data")?;
+    let end = usize::min(start + count, order.len());
+    let slice = &order[start..end];
+    let path = state
+        .file_path
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("No file loaded")?;
+    let mmap = state.mmap.lock().unwrap().clone();
+    let offsets_guard = state.row_offsets.lock().unwrap();
+    let offsets = offsets_guard.as_ref().ok_or("Row index not ready")?;
+    let rows = if let Some(mmap) = mmap.as_ref() {
+        read_rows_by_index_mmap(&mmap[..], offsets, slice).map_err(|err| err.to_string())?
+    } else {
+        read_rows_by_index(&path, offsets, slice).map_err(|err| err.to_string())?
+    };
+    let sorted_rows = slice
+        .iter()
+        .zip(rows.into_iter())
+        .map(|(idx, row)| SortedRow { index: *idx, row })
+        .collect::<Vec<_>>();
+    Ok(sorted_rows)
 }
 
 #[tauri::command]
 async fn clear_sort(state: State<'_, AppState>) -> Result<(), String> {
-    *state.sorted_rows.lock().unwrap() = None;
+    *state.sorted_order.lock().unwrap() = None;
     Ok(())
 }
 
@@ -184,8 +387,10 @@ pub fn run() {
             total_rows: Mutex::new(0),
             headers: Mutex::new(Vec::new()),
             cache: CsvCache::new(64),
-            sorted_rows: Mutex::new(None),
+            sorted_order: Mutex::new(None),
             pending_open: Mutex::new(initial_open_path()),
+            row_offsets: Mutex::new(None),
+            mmap: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             load_csv_metadata,
@@ -222,6 +427,9 @@ pub fn run() {
             }
             "close-find" => {
                 let _ = app.emit("menu-close-find", ());
+            }
+            "toggle-theme" => {
+                let _ = app.emit("menu-toggle-theme", ());
             }
             "show-index" => {
                 if let Some(menu) = app.menu() {
@@ -281,6 +489,7 @@ fn build_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
     let reload_item = MenuItemBuilder::with_id("reload", "Reload")
         .accelerator("CmdOrCtrl+R")
         .build(app)?;
+    let toggle_theme_item = MenuItemBuilder::with_id("toggle-theme", "Toggle Theme").build(app)?;
     let no_tools = MenuItemBuilder::new("No tools available")
         .enabled(false)
         .build(app)?;
@@ -319,6 +528,8 @@ fn build_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
         .build()?;
     let view_menu = SubmenuBuilder::with_id(app, "view", "View")
         .item(&reload_item)
+        .separator()
+        .item(&toggle_theme_item)
         .separator()
         .item(&row_menu)
         .separator()

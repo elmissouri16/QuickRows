@@ -22,8 +22,72 @@
     --accent-soft: #dbeafe;
     --border: rgba(15, 23, 42, 0.12);
     --shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+    --input-bg: #ffffff;
+    --input-border: rgba(15, 23, 42, 0.16);
+    --input-text: #0f172a;
+    --input-placeholder: #94a3b8;
+    --table-body-bg: #ffffff;
+    --row-even: #f7f9fd;
+    --row-odd: #ffffff;
+    --row-hover: #e8f0ff;
+    --row-current: #cfe3ff;
+    --row-divider: rgba(15, 23, 42, 0.06);
+    --cell-divider: rgba(15, 23, 42, 0.06);
+    --find-bg: #f7f9fc;
+    --find-border: #d9e0ea;
+    --find-meta: #7b8798;
+    --status-bg: rgba(239, 68, 68, 0.12);
+    --status-ink: #b91c1c;
+    --resizer: rgba(15, 23, 42, 0.2);
+    --resizer-hover: rgba(59, 130, 246, 0.6);
+    --empty-accent: rgba(59, 130, 246, 0.2);
+    --empty-accent-strong: rgba(14, 165, 233, 0.18);
+    --empty-grid: rgba(15, 23, 42, 0.05);
+    --empty-card: #ffffff;
+    --empty-card-border: rgba(15, 23, 42, 0.1);
+    --empty-card-shadow: 0 30px 60px rgba(15, 23, 42, 0.12);
+    --control-height: 32px;
     --cell-min: 160px;
     --row-height: 36px;
+}
+
+:root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0f131a;
+    --panel: #151a22;
+    --panel-muted: #1c2230;
+    --panel-strong: #222a3a;
+    --ink: #e2e8f0;
+    --ink-muted: #9aa3b2;
+    --accent: #60a5fa;
+    --accent-strong: #3b82f6;
+    --accent-soft: #1d2c4a;
+    --border: rgba(148, 163, 184, 0.2);
+    --shadow: 0 14px 28px rgba(4, 8, 14, 0.45);
+    --input-bg: #10151d;
+    --input-border: rgba(148, 163, 184, 0.35);
+    --input-text: #e2e8f0;
+    --input-placeholder: #7c8699;
+    --table-body-bg: #0f131a;
+    --row-even: #151b24;
+    --row-odd: #11161e;
+    --row-hover: #1c2434;
+    --row-current: #27324a;
+    --row-divider: rgba(148, 163, 184, 0.12);
+    --cell-divider: rgba(148, 163, 184, 0.12);
+    --find-bg: #141b26;
+    --find-border: rgba(148, 163, 184, 0.2);
+    --find-meta: #8b97ac;
+    --status-bg: rgba(239, 68, 68, 0.2);
+    --status-ink: #fca5a5;
+    --resizer: rgba(148, 163, 184, 0.4);
+    --resizer-hover: rgba(96, 165, 250, 0.8);
+    --empty-accent: rgba(96, 165, 250, 0.25);
+    --empty-accent-strong: rgba(56, 189, 248, 0.18);
+    --empty-grid: rgba(148, 163, 184, 0.06);
+    --empty-card: #161e2a;
+    --empty-card-border: rgba(148, 163, 184, 0.18);
+    --empty-card-shadow: 0 30px 60px rgba(2, 6, 14, 0.55);
 }
 
 * {
@@ -41,13 +105,13 @@ body {
 input,
 select {
     border-radius: 8px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     padding: 0.45rem 0.6rem;
     font-family: inherit;
     font-size: 0.85rem;
-    background: #fff;
-    color: var(--ink);
-    -webkit-text-fill-color: var(--ink);
+    background: var(--input-bg);
+    color: var(--input-text);
+    -webkit-text-fill-color: var(--input-text);
     min-width: 140px;
     outline: none;
 }
@@ -61,6 +125,10 @@ select:focus {
 select:disabled {
     color: var(--ink-muted);
     -webkit-text-fill-color: var(--ink-muted);
+}
+
+input::placeholder {
+    color: var(--input-placeholder);
 }
 
 option {
@@ -317,8 +385,8 @@ option {
     padding: 8px 16px;
     font-size: 0.82rem;
     border-bottom: 1px solid var(--border);
-    background: rgba(239, 68, 68, 0.12);
-    color: #b91c1c;
+    background: var(--status-bg);
+    color: var(--status-ink);
 }
 
 .table-shell {
@@ -334,10 +402,38 @@ option {
     overflow: hidden;
 }
 
+.table-shell.is-empty {
+    position: relative;
+    background:
+        radial-gradient(
+            700px 420px at 12% -10%,
+            var(--empty-accent),
+            transparent 62%
+        ),
+        radial-gradient(
+            520px 380px at 85% 12%,
+            var(--empty-accent-strong),
+            transparent 60%
+        ),
+        var(--panel);
+}
+
+.table-shell.is-empty::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background:
+        linear-gradient(var(--empty-grid) 1px, transparent 1px),
+        linear-gradient(90deg, var(--empty-grid) 1px, transparent 1px);
+    background-size: 36px 36px;
+    opacity: 0.7;
+    pointer-events: none;
+}
+
 .find-panel {
     padding: 6px 12px;
-    border-bottom: 1px solid #d9e0ea;
-    background: #f7f9fc;
+    border-bottom: 1px solid var(--find-border);
+    background: var(--find-bg);
     display: flex;
     flex-direction: column;
     gap: 6px;
@@ -352,27 +448,28 @@ option {
 
 .find-panel.with-index .find-controls,
 .find-panel.with-index .find-meta {
-    padding-left: 64px;
+    padding-left: var(--index-width);
 }
 
 .find-controls input {
     flex: 1 1 220px;
-    min-height: 30px;
+    height: var(--control-height);
     line-height: 1.2;
-    padding: 0.35rem 0.6rem;
+    padding: 0 0.75rem;
 }
 
 .find-controls select {
     min-width: 140px;
-    min-height: 30px;
+    height: var(--control-height);
     line-height: 1.2;
-    padding: 0.35rem 0.6rem;
-    background: #fff;
-    color: var(--ink);
+    padding: 0 0.75rem;
+    background: var(--input-bg);
+    color: var(--input-text);
 }
 
 .find-controls .btn {
-    padding: 0.32rem 0.7rem;
+    height: var(--control-height);
+    padding: 0 0.85rem;
     font-size: 0.78rem;
 }
 
@@ -381,13 +478,14 @@ option {
     color: var(--ink-muted);
     min-width: 60px;
     text-align: center;
+    line-height: var(--control-height);
 }
 
 .find-meta {
     font-size: 0.72rem;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: #7b8798;
+    color: var(--find-meta);
 }
 
 .table-wrapper {
@@ -410,7 +508,7 @@ option {
     flex: 1;
     min-height: 0;
     overflow: auto;
-    background: #fff;
+    background: var(--table-body-bg);
 }
 
 .table-spacer {
@@ -424,19 +522,19 @@ option {
     right: 0;
     display: flex;
     align-items: center;
-    border-bottom: 1px solid rgba(15, 23, 42, 0.06);
+    border-bottom: 1px solid var(--row-divider);
 }
 
 .table-row.even {
-    background: #f7f9fd;
+    background: var(--row-even);
 }
 
 .table-row.odd {
-    background: #ffffff;
+    background: var(--row-odd);
 }
 
 .table-row:hover {
-    background: #e8f0ff;
+    background: var(--row-hover);
 }
 
 .table-row.match {
@@ -445,7 +543,7 @@ option {
 }
 
 .table-row.current {
-    background: #cfe3ff;
+    background: var(--row-current);
     box-shadow: inset 0 0 0 2px rgba(59, 130, 246, 0.4);
 }
 
@@ -455,7 +553,7 @@ option {
     max-width: var(--cell-min);
     flex: 0 0 var(--cell-min);
     padding: 6px 10px;
-    border-right: 1px solid rgba(15, 23, 42, 0.06);
+    border-right: 1px solid var(--cell-divider);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -464,9 +562,9 @@ option {
 }
 
 .table-cell.index {
-    min-width: 64px;
-    width: 64px;
-    flex: 0 0 64px;
+    min-width: var(--index-width);
+    width: var(--index-width);
+    flex: 0 0 var(--index-width);
     text-align: right;
     color: var(--ink-muted);
 }
@@ -518,12 +616,12 @@ option {
     bottom: 6px;
     left: 50%;
     width: 1px;
-    background: rgba(15, 23, 42, 0.2);
+    background: var(--resizer);
     transform: translateX(-50%);
 }
 
 .table-cell.header.sortable:hover .col-resizer::after {
-    background: rgba(59, 130, 246, 0.6);
+    background: var(--resizer-hover);
 }
 
 .header-label {
@@ -602,16 +700,45 @@ option {
     flex-direction: column;
     gap: 10px;
     align-items: center;
+    position: relative;
+    z-index: 1;
+    padding: 28px 36px;
+    border-radius: 18px;
+    background: var(--empty-card);
+    border: 1px solid var(--empty-card-border);
+    box-shadow: var(--empty-card-shadow);
 }
 
 .empty-state h2 {
     margin: 0;
-    font-size: 1.4rem;
+    font-size: 1.45rem;
+    letter-spacing: 0.02em;
 }
 
 .empty-state p {
     margin: 0;
     color: var(--ink-muted);
+}
+
+.empty-state::before {
+    content: "";
+    position: absolute;
+    inset: -18px;
+    border-radius: 22px;
+    background: radial-gradient(
+        120px 80px at 15% 15%,
+        var(--empty-accent),
+        transparent 70%
+    );
+    opacity: 0.7;
+    z-index: -1;
+}
+
+.btn.primary.empty-cta {
+    padding: 0.6rem 1.4rem;
+    border-radius: 12px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+    box-shadow: 0 12px 22px rgba(59, 130, 246, 0.25);
 }
 
 @media (max-width: 1200px) {
@@ -641,5 +768,10 @@ option {
     .table-shell {
         min-height: 70vh;
         margin: 12px;
+    }
+
+    .empty-state {
+        padding: 22px 24px;
+        max-width: 320px;
     }
 }
