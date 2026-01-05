@@ -451,6 +451,9 @@ option {
 
 .table-cell {
     min-width: var(--cell-min);
+    width: var(--cell-min);
+    max-width: var(--cell-min);
+    flex: 0 0 var(--cell-min);
     padding: 6px 10px;
     border-right: 1px solid rgba(15, 23, 42, 0.06);
     white-space: nowrap;
@@ -474,6 +477,8 @@ option {
     letter-spacing: 0.18em;
     color: var(--ink-muted);
     font-weight: 600;
+    position: relative;
+    padding-right: 18px;
 }
 
 .table-cell.header.index {
@@ -494,6 +499,31 @@ option {
 
 .table-cell.header.sortable.active {
     color: var(--ink);
+}
+
+.col-resizer {
+    position: absolute;
+    top: 0;
+    right: -4px;
+    width: 10px;
+    height: 100%;
+    cursor: col-resize;
+    z-index: 2;
+}
+
+.col-resizer::after {
+    content: "";
+    position: absolute;
+    top: 6px;
+    bottom: 6px;
+    left: 50%;
+    width: 1px;
+    background: rgba(15, 23, 42, 0.2);
+    transform: translateX(-50%);
+}
+
+.table-cell.header.sortable:hover .col-resizer::after {
+    background: rgba(59, 130, 246, 0.6);
 }
 
 .header-label {

@@ -10,6 +10,7 @@ import "./App.css";
 const DEFAULT_ROW_HEIGHT = 36;
 const PREFETCH = 20;
 const CHUNK_SIZE = 800;
+const COLUMN_WIDTH_MIN = 120;
 const SETTINGS_KEY = "csv-viewer.settings";
 const ROW_HEIGHT_OPTIONS = new Set([28, 36, 44]);
 
@@ -17,8 +18,11 @@ type SortDirection = "asc" | "desc";
 type SortState = { column: number; direction: SortDirection };
 type SortedRow = { index: number; row: string[] };
 
+const clampColumnWidth = (value: number) => Math.max(COLUMN_WIDTH_MIN, value);
+
 function App() {
   const [filePath, setFilePath] = useState<string | null>(null);
+  const [checkingInitialOpen, setCheckingInitialOpen] = useState(true);
   const [headers, setHeaders] = useState<string[]>([]);
   const [totalRows, setTotalRows] = useState(0);
   const [data, setData] = useState<Map<number, string[]>>(new Map());
@@ -41,11 +45,17 @@ function App() {
   );
   const [rowHeight, setRowHeight] = useState(DEFAULT_ROW_HEIGHT);
   const [columnWidth, setColumnWidth] = useState(160);
+  const [columnWidths, setColumnWidths] = useState<number[]>([]);
 
   const debouncedSearch = useDebounce(searchTerm, 450);
   const parentRef = useRef<HTMLDivElement>(null);
   const headerRef = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const resizeRef = useRef<{
+    columnIndex: number;
+    startX: number;
+    startWidth: number;
+  } | null>(null);
 
   const rowVirtualizer = useVirtualizer({
     count: totalRows,
@@ -79,6 +89,7 @@ function App() {
         showIndex?: boolean;
         rowHeight?: number;
         columnWidth?: number;
+        columnWidths?: number[];
       };
       if (typeof parsed.showIndex === "boolean") {
         setShowIndex(parsed.showIndex);
@@ -89,8 +100,16 @@ function App() {
         }
       }
       if (typeof parsed.columnWidth === "number") {
-        const nextWidth = Math.min(320, Math.max(120, parsed.columnWidth));
+        const nextWidth = clampColumnWidth(parsed.columnWidth);
         setColumnWidth(nextWidth);
+      }
+      if (Array.isArray(parsed.columnWidths)) {
+        const nextWidths = parsed.columnWidths
+          .filter((value) => typeof value === "number")
+          .map((value) => clampColumnWidth(value));
+        if (nextWidths.length) {
+          setColumnWidths(nextWidths);
+        }
       }
     } catch {
       // Ignore malformed settings.
@@ -102,17 +121,33 @@ function App() {
       showIndex,
       rowHeight,
       columnWidth,
+      columnWidths,
     };
     try {
       localStorage.setItem(SETTINGS_KEY, JSON.stringify(payload));
     } catch {
       // Ignore storage failures.
     }
-  }, [showIndex, rowHeight, columnWidth]);
+  }, [showIndex, rowHeight, columnWidth, columnWidths]);
 
   useEffect(() => {
     invoke("set_show_index_checked", { checked: showIndex }).catch(() => {});
   }, [showIndex]);
+
+  useEffect(() => {
+    if (!headers.length) {
+      setColumnWidths([]);
+      return;
+    }
+
+    setColumnWidths((prev) => {
+      const next = prev.slice(0, headers.length);
+      while (next.length < headers.length) {
+        next.push(columnWidth);
+      }
+      return next;
+    });
+  }, [columnWidth, headers]);
 
   const resetForNewFile = useCallback(() => {
     setError(null);
@@ -433,7 +468,9 @@ function App() {
           setRowHeight(event.payload);
         }),
         listen<number>("menu-column-width", (event) => {
-          setColumnWidth(event.payload);
+          const nextWidth = clampColumnWidth(event.payload);
+          setColumnWidth(nextWidth);
+          setColumnWidths((prev) => prev.map(() => nextWidth));
         }),
         listen<boolean>("menu-show-index", (event) => {
           setShowIndex(event.payload);
@@ -466,13 +503,27 @@ function App() {
   }, [goToNextMatch, goToPrevMatch, handleClearFile, handlePickFile]);
 
   useEffect(() => {
+    let active = true;
+
     invoke<string | null>("take_pending_open")
       .then((path) => {
+        if (!active) {
+          return;
+        }
         if (path) {
-          handleOpenPath(path);
+          return handleOpenPath(path);
         }
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        if (active) {
+          setCheckingInitialOpen(false);
+        }
+      });
+
+    return () => {
+      active = false;
+    };
   }, [handleOpenPath]);
 
   useEffect(() => {
@@ -496,6 +547,74 @@ function App() {
       window.removeEventListener("keydown", handleKeydown);
     };
   }, []);
+
+  const defaultColumnStyle = useMemo(() => {
+    const width = `${columnWidth}px`;
+    return {
+      width,
+      minWidth: width,
+      maxWidth: width,
+      flex: `0 0 ${width}`,
+    } as CSSProperties;
+  }, [columnWidth]);
+
+  const columnStyles = useMemo(
+    () =>
+      headerLabels.map((_, idx) => {
+        const widthValue = columnWidths[idx] ?? columnWidth;
+        const width = `${widthValue}px`;
+        return {
+          width,
+          minWidth: width,
+          maxWidth: width,
+          flex: `0 0 ${width}`,
+        } as CSSProperties;
+      }),
+    [columnWidth, columnWidths, headerLabels],
+  );
+
+  const handleResizeStart = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>, columnIndex: number) => {
+      if (event.button !== 0) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+
+      const startWidth = columnWidths[columnIndex] ?? columnWidth;
+      resizeRef.current = {
+        columnIndex,
+        startX: event.clientX,
+        startWidth,
+      };
+
+      const handleMove = (moveEvent: MouseEvent) => {
+        const current = resizeRef.current;
+        if (!current) {
+          return;
+        }
+        const delta = moveEvent.clientX - current.startX;
+        const nextWidth = clampColumnWidth(current.startWidth + delta);
+        setColumnWidths((prev) => {
+          const next = prev.length
+            ? [...prev]
+            : headerLabels.map(() => columnWidth);
+          next[current.columnIndex] = nextWidth;
+          return next;
+        });
+      };
+
+      const handleUp = () => {
+        resizeRef.current = null;
+        window.removeEventListener("mousemove", handleMove);
+        window.removeEventListener("mouseup", handleUp);
+      };
+
+      window.addEventListener("mousemove", handleMove);
+      window.addEventListener("mouseup", handleUp);
+    },
+    [columnWidth, columnWidths, headerLabels],
+  );
 
   const handleHeaderClick = (columnIndex: number) => {
     if (sortLoading) {
@@ -608,13 +727,20 @@ function App() {
           </div>
         ) : null}
         {!filePath ? (
-          <div className="empty-state">
-            <h2>Open a CSV to start</h2>
-            <p>Streaming keeps the table responsive for large files.</p>
-            <button className="btn primary" onClick={handlePickFile}>
-              Open CSV
-            </button>
-          </div>
+          checkingInitialOpen ? (
+            <div className="empty-state loading">
+              <h2>Opening file...</h2>
+              <p>Preparing the CSV viewer.</p>
+            </div>
+          ) : (
+            <div className="empty-state">
+              <h2>Open a CSV to start</h2>
+              <p>Streaming keeps the table responsive for large files.</p>
+              <button className="btn primary" onClick={handlePickFile}>
+                Open CSV
+              </button>
+            </div>
+          )
         ) : (
           <div className="table-wrapper">
             <div className="table-header" ref={headerRef}>
@@ -628,6 +754,7 @@ function App() {
                   onClick={() => handleHeaderClick(idx)}
                   role="button"
                   tabIndex={0}
+                  style={columnStyles[idx] ?? defaultColumnStyle}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" || event.key === " ") {
                       event.preventDefault();
@@ -641,6 +768,11 @@ function App() {
                       {sortState.direction === "asc" ? "▲" : "▼"}
                     </span>
                   ) : null}
+                  <div
+                    className="col-resizer"
+                    onMouseDown={(event) => handleResizeStart(event, idx)}
+                    onClick={(event) => event.stopPropagation()}
+                  />
                 </div>
               ))}
             </div>
@@ -682,7 +814,12 @@ function App() {
                       ) : null}
                       {rowData ? (
                         rowData.map((cell, cellIdx) => (
-                          <div key={cellIdx} className="table-cell">
+                          <div
+                            key={cellIdx}
+                            className="table-cell"
+                            style={columnStyles[cellIdx] ?? defaultColumnStyle}
+                            title={cell}
+                          >
                             {cell}
                           </div>
                         ))

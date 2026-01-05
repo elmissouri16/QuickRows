@@ -246,24 +246,6 @@ pub fn run() {
             "row-spacious" => {
                 let _ = app.emit("menu-row-height", 44);
             }
-            "width-120" => {
-                let _ = app.emit("menu-column-width", 120);
-            }
-            "width-160" => {
-                let _ = app.emit("menu-column-width", 160);
-            }
-            "width-200" => {
-                let _ = app.emit("menu-column-width", 200);
-            }
-            "width-240" => {
-                let _ = app.emit("menu-column-width", 240);
-            }
-            "width-280" => {
-                let _ = app.emit("menu-column-width", 280);
-            }
-            "width-320" => {
-                let _ = app.emit("menu-column-width", 320);
-            }
             "reload" => {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.eval("window.location.reload()");
@@ -313,12 +295,6 @@ fn build_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
     let row_compact = MenuItemBuilder::with_id("row-compact", "Compact").build(app)?;
     let row_default = MenuItemBuilder::with_id("row-default", "Default").build(app)?;
     let row_spacious = MenuItemBuilder::with_id("row-spacious", "Spacious").build(app)?;
-    let width_120 = MenuItemBuilder::with_id("width-120", "120 px").build(app)?;
-    let width_160 = MenuItemBuilder::with_id("width-160", "160 px").build(app)?;
-    let width_200 = MenuItemBuilder::with_id("width-200", "200 px").build(app)?;
-    let width_240 = MenuItemBuilder::with_id("width-240", "240 px").build(app)?;
-    let width_280 = MenuItemBuilder::with_id("width-280", "280 px").build(app)?;
-    let width_320 = MenuItemBuilder::with_id("width-320", "320 px").build(app)?;
 
     let file_menu = SubmenuBuilder::new(app, "File")
         .item(&open_item)
@@ -341,19 +317,10 @@ fn build_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
         .item(&row_default)
         .item(&row_spacious)
         .build()?;
-    let width_menu = SubmenuBuilder::new(app, "Column Width")
-        .item(&width_120)
-        .item(&width_160)
-        .item(&width_200)
-        .item(&width_240)
-        .item(&width_280)
-        .item(&width_320)
-        .build()?;
     let view_menu = SubmenuBuilder::with_id(app, "view", "View")
         .item(&reload_item)
         .separator()
         .item(&row_menu)
-        .item(&width_menu)
         .separator()
         .item(&show_index_item)
         .build()?;
