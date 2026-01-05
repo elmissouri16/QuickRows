@@ -23,6 +23,19 @@ struct AppState {
     headers: Mutex<Vec<String>>,
     cache: CsvCache,
     sorted_rows: Mutex<Option<Vec<SortedRow>>>,
+    pending_open: Mutex<Option<String>>,
+}
+
+fn initial_open_path() -> Option<String> {
+    std::env::args_os().skip(1).find_map(|arg| {
+        let path = std::path::PathBuf::from(arg);
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some(ext) if ext.eq_ignore_ascii_case("csv") => {
+                Some(path.to_string_lossy().to_string())
+            }
+            _ => None,
+        }
+    })
 }
 
 #[tauri::command]
@@ -37,6 +50,7 @@ async fn load_csv_metadata(
     *state.total_rows.lock().unwrap() = count;
     *state.headers.lock().unwrap() = headers.clone();
     *state.sorted_rows.lock().unwrap() = None;
+    state.cache.clear();
 
     Ok((headers, count))
 }
@@ -140,6 +154,11 @@ async fn clear_sort(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn take_pending_open(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    Ok(state.pending_open.lock().unwrap().take())
+}
+
+#[tauri::command]
 async fn set_show_index_checked(checked: bool, app: tauri::AppHandle) -> Result<(), String> {
     if let Some(menu) = app.menu() {
         if let Some(item) = menu.get("view") {
@@ -166,6 +185,7 @@ pub fn run() {
             headers: Mutex::new(Vec::new()),
             cache: CsvCache::new(64),
             sorted_rows: Mutex::new(None),
+            pending_open: Mutex::new(initial_open_path()),
         })
         .invoke_handler(tauri::generate_handler![
             load_csv_metadata,
@@ -174,6 +194,7 @@ pub fn run() {
             sort_csv,
             get_sorted_chunk,
             clear_sort,
+            take_pending_open,
             set_show_index_checked
         ]);
 
@@ -386,7 +407,30 @@ fn build_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
         .item(&shortcuts_shift_enter)
         .item(&shortcuts_esc)
         .build()?;
-    let help_menu = SubmenuBuilder::new(app, "Help").about(None).build()?;
+    let package = app.package_info();
+    let authors = package
+        .authors
+        .split(',')
+        .map(|author| author.trim().to_string())
+        .filter(|author| !author.is_empty())
+        .collect::<Vec<_>>();
+    let authors = if authors.is_empty() {
+        None
+    } else {
+        Some(authors)
+    };
+    let about = tauri::menu::AboutMetadataBuilder::new()
+        .name(Some(package.name.clone()))
+        .version(Some(package.version.to_string()))
+        .short_version(Some(package.version.to_string()))
+        .authors(authors)
+        .comments(Some(package.description.to_string()))
+        .credits(Some("Built with Tauri, Rust, and React.".to_string()))
+        .icon(app.default_window_icon().cloned())
+        .build();
+    let help_menu = SubmenuBuilder::new(app, "Help")
+        .about(Some(about))
+        .build()?;
 
     MenuBuilder::new(app)
         .item(&file_menu)

@@ -54,6 +54,15 @@ function App() {
     overscan: 12,
   });
 
+  const headerLabels = useMemo(
+    () =>
+      headers.map((header, idx) => {
+        const trimmed = header.trim();
+        return trimmed.length ? trimmed : `Column ${idx + 1}`;
+      }),
+    [headers],
+  );
+
   const virtualItems = rowVirtualizer.getVirtualItems();
   const searchSet = useMemo(() => {
     if (!searchResults) return null;
@@ -105,13 +114,48 @@ function App() {
     invoke("set_show_index_checked", { checked: showIndex }).catch(() => {});
   }, [showIndex]);
 
-  const handlePickFile = useCallback(async () => {
+  const resetForNewFile = useCallback(() => {
     setError(null);
     setSortState(null);
     setSortLoading(false);
     setSortedIndexLookup(null);
     setRowIndexMap(new Map());
     setShowFind(false);
+    setSearchTerm("");
+    setSearchResults(null);
+    setCurrentMatch(0);
+    setData(new Map());
+    invoke("clear_sort").catch(() => {});
+  }, []);
+
+  const handleOpenPath = useCallback(
+    async (path: string) => {
+      resetForNewFile();
+      setFilePath(path);
+      setHeaders([]);
+      setTotalRows(0);
+
+      try {
+        const [csvHeaders, rowCount] = await invoke<[string[], number]>(
+          "load_csv_metadata",
+          { path },
+        );
+        setHeaders(csvHeaders);
+        setTotalRows(rowCount);
+        setSearchColumn(0);
+      } catch (err) {
+        setError(
+          typeof err === "string" ? err : "Unable to load CSV metadata.",
+        );
+        setFilePath(null);
+        setHeaders([]);
+        setTotalRows(0);
+      }
+    },
+    [resetForNewFile],
+  );
+
+  const handlePickFile = useCallback(async () => {
     const selected = await open({
       multiple: false,
       filters: [{ name: "CSV", extensions: ["csv"] }],
@@ -121,27 +165,8 @@ function App() {
       return;
     }
 
-    setFilePath(selected);
-    setData(new Map());
-    setSearchTerm("");
-    setSearchResults(null);
-
-    try {
-      const [csvHeaders, rowCount] = await invoke<[string[], number]>(
-        "load_csv_metadata",
-        { path: selected },
-      );
-      setHeaders(csvHeaders);
-      setTotalRows(rowCount);
-      setSearchColumn(0);
-    } catch (err) {
-      setError(typeof err === "string" ? err : "Unable to load CSV metadata.");
-      setFilePath(null);
-      setHeaders([]);
-      setTotalRows(0);
-    } finally {
-    }
-  }, []);
+    handleOpenPath(selected);
+  }, [handleOpenPath]);
 
   const handleClearFile = useCallback(() => {
     setFilePath(null);
@@ -294,14 +319,6 @@ function App() {
       .finally(() => setSearching(false));
   }, [debouncedSearch, filePath, searchColumn]);
 
-  useEffect(() => {
-    if (!searchResults?.length) {
-      setCurrentMatch(0);
-      return;
-    }
-    setCurrentMatch((prev) => Math.min(prev, searchResults.length - 1));
-  }, [searchResults]);
-
   const scrollToMatch = useCallback(
     (matchIndex: number) => {
       if (!searchResults?.length) {
@@ -318,6 +335,15 @@ function App() {
     },
     [rowVirtualizer, searchResults, sortState, sortedIndexLookup],
   );
+
+  useEffect(() => {
+    if (!searchResults?.length) {
+      setCurrentMatch(0);
+      return;
+    }
+    setCurrentMatch(0);
+    scrollToMatch(0);
+  }, [scrollToMatch, searchResults]);
 
   const goToNextMatch = useCallback(() => {
     if (!searchResults?.length) {
@@ -439,6 +465,38 @@ function App() {
     };
   }, [goToNextMatch, goToPrevMatch, handleClearFile, handlePickFile]);
 
+  useEffect(() => {
+    invoke<string | null>("take_pending_open")
+      .then((path) => {
+        if (path) {
+          handleOpenPath(path);
+        }
+      })
+      .catch(() => {});
+  }, [handleOpenPath]);
+
+  useEffect(() => {
+    const handleKeydown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey && !event.metaKey) {
+        return;
+      }
+      const key = event.key.toLowerCase();
+      if (key === "f") {
+        event.preventDefault();
+        setShowFind(true);
+        return;
+      }
+      if (key === "o" || key === "r") {
+        event.preventDefault();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeydown);
+    return () => {
+      window.removeEventListener("keydown", handleKeydown);
+    };
+  }, []);
+
   const handleHeaderClick = (columnIndex: number) => {
     if (sortLoading) {
       return;
@@ -477,7 +535,7 @@ function App() {
                 }
                 disabled={!headers.length}
               >
-                {headers.map((header, idx) => (
+                {headerLabels.map((header, idx) => (
                   <option value={idx} key={`${header}-${idx}`}>
                     {header}
                   </option>
@@ -563,7 +621,7 @@ function App() {
               {showIndex ? (
                 <div className="table-cell header index">#</div>
               ) : null}
-              {headers.map((header, idx) => (
+              {headerLabels.map((header, idx) => (
                 <div
                   key={`${header}-${idx}`}
                   className={`table-cell header sortable${sortState?.column === idx ? " active" : ""}`}
@@ -598,25 +656,29 @@ function App() {
                   const originalIndex = sortState
                     ? rowIndexMap.get(virtualRow.index)
                     : virtualRow.index;
+                  const rowNumber = (originalIndex ?? virtualRow.index) + 1;
+                  const currentIndex = searchResults?.[currentMatch];
                   const isMatch =
                     originalIndex !== undefined
                       ? searchSet?.has(originalIndex)
                       : false;
+                  const isCurrent =
+                    originalIndex !== undefined &&
+                    currentIndex !== undefined &&
+                    originalIndex === currentIndex;
                   const isEven = virtualRow.index % 2 === 0;
 
                   return (
                     <div
                       key={virtualRow.index}
-                      className={`table-row${isMatch ? " match" : ""}${isEven ? " even" : " odd"}`}
+                      className={`table-row${isMatch ? " match" : ""}${isCurrent ? " current" : ""}${isEven ? " even" : " odd"}`}
                       style={{
                         height: `${virtualRow.size}px`,
                         transform: `translateY(${virtualRow.start}px)`,
                       }}
                     >
                       {showIndex ? (
-                        <div className="table-cell index">
-                          {originalIndex !== undefined ? originalIndex + 1 : ""}
-                        </div>
+                        <div className="table-cell index">{rowNumber}</div>
                       ) : null}
                       {rowData ? (
                         rowData.map((cell, cellIdx) => (

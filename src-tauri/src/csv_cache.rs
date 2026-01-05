@@ -21,4 +21,8 @@ impl CsvCache {
     pub fn put(&self, start: usize, count: usize, data: Vec<Vec<String>>) {
         self.cache.lock().unwrap().put((start, count), data);
     }
+
+    pub fn clear(&self) {
+        self.cache.lock().unwrap().clear();
+    }
 }

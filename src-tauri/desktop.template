@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name={{name}}
+Exec={{exec}} %u
+Icon={{icon}}
+Terminal=false
+Categories={{categories}}
+StartupWMClass={{name}}
+{{#if comment}}Comment={{comment}}{{/if}}
+MimeType=text/csv;text/plain;application/csv;application/vnd.ms-excel;
