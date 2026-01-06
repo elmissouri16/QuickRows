@@ -433,6 +433,11 @@ async fn take_pending_open(state: State<'_, AppState>) -> Result<Option<String>,
 }
 
 #[tauri::command]
+async fn get_row_count(state: State<'_, AppState>) -> Result<usize, String> {
+    Ok(*state.total_rows.lock().unwrap())
+}
+
+#[tauri::command]
 async fn set_show_index_checked(checked: bool, app: tauri::AppHandle) -> Result<(), String> {
     if let Some(menu) = app.menu() {
         if let Some(item) = menu.get("view") {
@@ -472,6 +477,7 @@ pub fn run() {
             get_sorted_chunk,
             clear_sort,
             take_pending_open,
+            get_row_count,
             set_show_index_checked
         ]);
 

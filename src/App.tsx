@@ -3,14 +3,18 @@ import { listen } from "@tauri-apps/api/event";
 import type { CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useDebounce } from "./hooks/useDebounce";
 import "./App.css";
 
+const BASE_TITLE = "csv-viewer";
 const DEFAULT_ROW_HEIGHT = 36;
 const PREFETCH = 12;
 const CHUNK_SIZE = 800;
 const MAX_CACHED_ROWS = CHUNK_SIZE * 12;
+const ROW_COUNT_POLL_INTERVAL = 250;
+const ROW_COUNT_POLL_MAX = 60;
 const COLUMN_WIDTH_MIN = 120;
 const SETTINGS_KEY = "csv-viewer.settings";
 const ROW_HEIGHT_OPTIONS = new Set([28, 36, 44]);
@@ -44,6 +48,22 @@ const getDirFromPath = (path: string) => {
     return path.slice(0, lastIndex + 1);
   }
   return path.slice(0, lastIndex);
+};
+const getFileNameFromPath = (path: string) => {
+  const slashIndex = path.lastIndexOf("/");
+  const backslashIndex = path.lastIndexOf("\\");
+  const lastIndex = Math.max(slashIndex, backslashIndex);
+  if (lastIndex < 0 || lastIndex === path.length - 1) {
+    return path;
+  }
+  return path.slice(lastIndex + 1);
+};
+const setWindowTitle = (path: string | null) => {
+  const name = path ? getFileNameFromPath(path) : "";
+  const title = name ? `${name} - ${BASE_TITLE}` : BASE_TITLE;
+  getCurrentWindow()
+    .setTitle(title)
+    .catch(() => {});
 };
 
 function App() {
@@ -294,6 +314,7 @@ function App() {
     async (path: string) => {
       resetForNewFile();
       setFilePath(path);
+      setWindowTitle(path);
       setHeaders([]);
       setTotalRows(0);
       setRowCountReady(false);
@@ -317,6 +338,7 @@ function App() {
         setHeaders([]);
         setTotalRows(0);
         setRowCountReady(false);
+        setWindowTitle(null);
       }
     },
     [resetForNewFile],
@@ -338,6 +360,7 @@ function App() {
 
   const handleClearFile = useCallback(() => {
     setFilePath(null);
+    setWindowTitle(null);
     setHeaders([]);
     setTotalRows(0);
     dataRef.current = new Map();
@@ -360,6 +383,10 @@ function App() {
     setActiveHighlight(null);
     invoke("clear_sort").catch(() => {});
   }, []);
+
+  useEffect(() => {
+    setWindowTitle(filePath);
+  }, [filePath]);
 
   const handleCheckDuplicates = useCallback(() => {
     if (!filePath) {
@@ -839,6 +866,47 @@ function App() {
       active = false;
     };
   }, [handleOpenPath]);
+
+  useEffect(() => {
+    if (!filePath || rowCountReady) {
+      return;
+    }
+
+    let active = true;
+    let attempts = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const poll = async () => {
+      try {
+        const count = await invoke<number>("get_row_count");
+        if (!active) {
+          return;
+        }
+        if (count > 0) {
+          setTotalRows(count);
+          setRowCountReady(true);
+          return;
+        }
+      } catch {
+        // Ignore row count polling failures.
+      }
+
+      attempts += 1;
+      if (!active || attempts >= ROW_COUNT_POLL_MAX) {
+        return;
+      }
+      timer = setTimeout(poll, ROW_COUNT_POLL_INTERVAL);
+    };
+
+    poll();
+
+    return () => {
+      active = false;
+      if (timer) {
+        clearTimeout(timer);
+      }
+    };
+  }, [filePath, rowCountReady]);
 
   useEffect(() => {
     const handleKeydown = (event: KeyboardEvent) => {
