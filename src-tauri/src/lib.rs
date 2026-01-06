@@ -15,6 +15,7 @@ use disk_cache::{
 };
 use memmap2::Mmap;
 use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
 
@@ -251,6 +252,73 @@ async fn search_csv(
 }
 
 #[tauri::command]
+async fn find_duplicates(
+    column_idx: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<Vec<usize>, String> {
+    let path = state
+        .file_path
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("No file loaded")?;
+
+    let mmap = state.mmap.lock().unwrap().clone();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut duplicates: Vec<usize> = Vec::new();
+    let mut duplicate_set: HashSet<usize> = HashSet::new();
+
+    if let Some(mmap) = mmap.as_ref() {
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(&mmap[..]);
+        for (idx, result) in rdr.records().enumerate() {
+            let record = result.map_err(|err| err.to_string())?;
+            let key = match column_idx {
+                Some(index) => record.get(index).unwrap_or("").to_string(),
+                None => record.iter().collect::<Vec<_>>().join("\u{1f}"),
+            };
+            if let Some(first_idx) = seen.get(&key).copied() {
+                if duplicate_set.insert(first_idx) {
+                    duplicates.push(first_idx);
+                }
+                if duplicate_set.insert(idx) {
+                    duplicates.push(idx);
+                }
+            } else {
+                seen.insert(key, idx);
+            }
+        }
+    } else {
+        let file = std::fs::File::open(&path).map_err(|err| err.to_string())?;
+        let reader = std::io::BufReader::new(file);
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(reader);
+        for (idx, result) in rdr.records().enumerate() {
+            let record = result.map_err(|err| err.to_string())?;
+            let key = match column_idx {
+                Some(index) => record.get(index).unwrap_or("").to_string(),
+                None => record.iter().collect::<Vec<_>>().join("\u{1f}"),
+            };
+            if let Some(first_idx) = seen.get(&key).copied() {
+                if duplicate_set.insert(first_idx) {
+                    duplicates.push(first_idx);
+                }
+                if duplicate_set.insert(idx) {
+                    duplicates.push(idx);
+                }
+            } else {
+                seen.insert(key, idx);
+            }
+        }
+    }
+
+    duplicates.sort_unstable();
+    Ok(duplicates)
+}
+
+#[tauri::command]
 async fn sort_csv(
     column_idx: usize,
     ascending: bool,
@@ -399,6 +467,7 @@ pub fn run() {
             load_csv_metadata,
             get_csv_chunk,
             search_csv,
+            find_duplicates,
             sort_csv,
             get_sorted_chunk,
             clear_sort,
@@ -421,6 +490,9 @@ pub fn run() {
             }
             "clear-search" => {
                 let _ = app.emit("menu-clear-search", ());
+            }
+            "check-duplicates" => {
+                let _ = app.emit("menu-check-duplicates", ());
             }
             "next-match" => {
                 let _ = app.emit("menu-next-match", ());
@@ -493,9 +565,8 @@ fn build_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
         .accelerator("CmdOrCtrl+R")
         .build(app)?;
     let toggle_theme_item = MenuItemBuilder::with_id("toggle-theme", "Toggle Theme").build(app)?;
-    let no_tools = MenuItemBuilder::new("No tools available")
-        .enabled(false)
-        .build(app)?;
+    let check_duplicates_item =
+        MenuItemBuilder::with_id("check-duplicates", "Check Duplicates...").build(app)?;
     let show_index_item = CheckMenuItem::with_id(
         app,
         "show-index",
@@ -546,7 +617,9 @@ fn build_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
         .item(&prev_match_item)
         .item(&close_find_item)
         .build()?;
-    let tools_menu = SubmenuBuilder::new(app, "Tools").item(&no_tools).build()?;
+    let tools_menu = SubmenuBuilder::new(app, "Tools")
+        .item(&check_duplicates_item)
+        .build()?;
     let shortcuts_open = MenuItemBuilder::new("Open File")
         .accelerator("CmdOrCtrl+O")
         .enabled(false)

@@ -60,6 +60,16 @@ function App() {
   const [searching, setSearching] = useState(false);
   const [showFind, setShowFind] = useState(false);
   const [currentMatch, setCurrentMatch] = useState(0);
+  const [showDuplicates, setShowDuplicates] = useState(false);
+  const [duplicateColumn, setDuplicateColumn] = useState<number | null>(null);
+  const [duplicateResults, setDuplicateResults] = useState<number[] | null>(
+    null,
+  );
+  const [duplicateChecking, setDuplicateChecking] = useState(false);
+  const [currentDuplicateMatch, setCurrentDuplicateMatch] = useState(0);
+  const [activeHighlight, setActiveHighlight] = useState<
+    "search" | "duplicates" | null
+  >(null);
   const [showIndex, setShowIndex] = useState(false);
   const [sortState, setSortState] = useState<SortState | null>(null);
   const [sortLoading, setSortLoading] = useState(false);
@@ -107,10 +117,25 @@ function App() {
   );
 
   const virtualItems = rowVirtualizer.getVirtualItems();
-  const searchSet = useMemo(() => {
-    if (!searchResults) return null;
-    return new Set(searchResults);
-  }, [searchResults]);
+  const activeResults = useMemo(() => {
+    if (activeHighlight === "search") {
+      return searchResults;
+    }
+    if (activeHighlight === "duplicates") {
+      return duplicateResults;
+    }
+    return null;
+  }, [activeHighlight, duplicateResults, searchResults]);
+  const activeMatchSet = useMemo(() => {
+    if (!activeResults) return null;
+    return new Set(activeResults);
+  }, [activeResults]);
+  const activeCurrentMatch =
+    activeHighlight === "search"
+      ? currentMatch
+      : activeHighlight === "duplicates"
+        ? currentDuplicateMatch
+        : 0;
 
   useEffect(() => {
     try {
@@ -226,6 +251,15 @@ function App() {
     });
   }, [columnWidth, headers]);
 
+  useEffect(() => {
+    if (duplicateColumn === null) {
+      return;
+    }
+    if (duplicateColumn >= headers.length) {
+      setDuplicateColumn(null);
+    }
+  }, [duplicateColumn, headers.length]);
+
   const resetForNewFile = useCallback(() => {
     setError(null);
     setSortState(null);
@@ -234,9 +268,15 @@ function App() {
     rowIndexMapRef.current = new Map();
     setRowIndexVersion((prev) => prev + 1);
     setShowFind(false);
+    setShowDuplicates(false);
     setSearchTerm("");
     setSearchResults(null);
     setCurrentMatch(0);
+    setDuplicateResults(null);
+    setDuplicateChecking(false);
+    setCurrentDuplicateMatch(0);
+    setDuplicateColumn(null);
+    setActiveHighlight(null);
     dataRef.current = new Map();
     setDataVersion((prev) => prev + 1);
     setRowCountReady(false);
@@ -306,14 +346,41 @@ function App() {
     setSearchResults(null);
     setError(null);
     setShowFind(false);
+    setShowDuplicates(false);
     setSortState(null);
     setSortLoading(false);
     setSortedIndexLookup(null);
     rowIndexMapRef.current = new Map();
     setRowIndexVersion((prev) => prev + 1);
     setRowCountReady(false);
+    setDuplicateResults(null);
+    setDuplicateChecking(false);
+    setCurrentDuplicateMatch(0);
+    setDuplicateColumn(null);
+    setActiveHighlight(null);
     invoke("clear_sort").catch(() => {});
   }, []);
+
+  const handleCheckDuplicates = useCallback(() => {
+    if (!filePath) {
+      return;
+    }
+    setDuplicateChecking(true);
+    invoke<number[]>("find_duplicates", {
+      columnIdx: duplicateColumn,
+    })
+      .then((results) => {
+        setError(null);
+        setDuplicateResults(results);
+        setActiveHighlight("duplicates");
+      })
+      .catch((err) => {
+        setError(
+          typeof err === "string" ? err : "Duplicate check failed to complete.",
+        );
+      })
+      .finally(() => setDuplicateChecking(false));
+  }, [duplicateColumn, filePath]);
 
   useEffect(() => {
     if (!filePath || loadingRows || sortLoading || totalRows === 0) {
@@ -519,39 +586,75 @@ function App() {
       .finally(() => setSearching(false));
   }, [debouncedSearch, filePath, rowCountReady, searchColumn]);
 
+  const getDisplayIndex = useCallback(
+    (originalIndex: number) => {
+      if (!sortState) {
+        return originalIndex;
+      }
+      return sortedIndexLookup?.[originalIndex];
+    },
+    [sortState, sortedIndexLookup],
+  );
+
   const scrollToMatch = useCallback(
-    (matchIndex: number) => {
-      if (!searchResults?.length) {
+    (matches: number[] | null, matchIndex: number) => {
+      if (!matches?.length) {
         return;
       }
-      const originalIndex = searchResults[matchIndex];
-      const displayIndex = sortState
-        ? sortedIndexLookup?.[originalIndex]
-        : originalIndex;
+      const originalIndex = matches[matchIndex];
+      const displayIndex = getDisplayIndex(originalIndex);
       if (displayIndex === undefined) {
         return;
       }
       rowVirtualizer.scrollToIndex(displayIndex, { align: "center" });
     },
-    [rowVirtualizer, searchResults, sortState, sortedIndexLookup],
+    [getDisplayIndex, rowVirtualizer],
   );
 
   useEffect(() => {
-    if (!searchResults?.length) {
+    if (searchResults === null) {
+      setCurrentMatch(0);
+      if (activeHighlight === "search") {
+        setActiveHighlight(null);
+      }
+      return;
+    }
+    if (!searchResults.length) {
       setCurrentMatch(0);
       return;
     }
     setCurrentMatch(0);
-    scrollToMatch(0);
-  }, [scrollToMatch, searchResults]);
+    if (activeHighlight === "search") {
+      scrollToMatch(searchResults, 0);
+    }
+  }, [activeHighlight, scrollToMatch, searchResults]);
+
+  useEffect(() => {
+    if (duplicateResults === null) {
+      setCurrentDuplicateMatch(0);
+      if (activeHighlight === "duplicates") {
+        setActiveHighlight(null);
+      }
+      return;
+    }
+    if (!duplicateResults.length) {
+      setCurrentDuplicateMatch(0);
+      return;
+    }
+    setCurrentDuplicateMatch(0);
+    if (activeHighlight === "duplicates") {
+      scrollToMatch(duplicateResults, 0);
+    }
+  }, [activeHighlight, duplicateResults, scrollToMatch]);
 
   const goToNextMatch = useCallback(() => {
     if (!searchResults?.length) {
       return;
     }
+    setActiveHighlight("search");
     setCurrentMatch((prev) => {
       const next = (prev + 1) % searchResults.length;
-      scrollToMatch(next);
+      scrollToMatch(searchResults, next);
       return next;
     });
   }, [scrollToMatch, searchResults]);
@@ -560,12 +663,38 @@ function App() {
     if (!searchResults?.length) {
       return;
     }
+    setActiveHighlight("search");
     setCurrentMatch((prev) => {
       const next = (prev - 1 + searchResults.length) % searchResults.length;
-      scrollToMatch(next);
+      scrollToMatch(searchResults, next);
       return next;
     });
   }, [scrollToMatch, searchResults]);
+
+  const goToNextDuplicate = useCallback(() => {
+    if (!duplicateResults?.length) {
+      return;
+    }
+    setActiveHighlight("duplicates");
+    setCurrentDuplicateMatch((prev) => {
+      const next = (prev + 1) % duplicateResults.length;
+      scrollToMatch(duplicateResults, next);
+      return next;
+    });
+  }, [duplicateResults, scrollToMatch]);
+
+  const goToPrevDuplicate = useCallback(() => {
+    if (!duplicateResults?.length) {
+      return;
+    }
+    setActiveHighlight("duplicates");
+    setCurrentDuplicateMatch((prev) => {
+      const next =
+        (prev - 1 + duplicateResults.length) % duplicateResults.length;
+      scrollToMatch(duplicateResults, next);
+      return next;
+    });
+  }, [duplicateResults, scrollToMatch]);
 
   useEffect(() => {
     if (!filePath) {
@@ -627,11 +756,19 @@ function App() {
         }),
         listen("menu-find", () => {
           setShowFind(true);
+          setShowDuplicates(false);
+          setActiveHighlight("search");
         }),
         listen("menu-clear-search", () => {
           setSearchTerm("");
           setSearchResults(null);
           setCurrentMatch(0);
+          setActiveHighlight((prev) => (prev === "search" ? null : prev));
+        }),
+        listen("menu-check-duplicates", () => {
+          setShowDuplicates(true);
+          setShowFind(false);
+          setActiveHighlight("duplicates");
         }),
         listen<number>("menu-row-height", (event) => {
           setRowHeight(event.payload);
@@ -712,6 +849,8 @@ function App() {
       if (key === "f") {
         event.preventDefault();
         setShowFind(true);
+        setShowDuplicates(false);
+        setActiveHighlight("search");
         return;
       }
       if (key === "o" || key === "r") {
@@ -754,6 +893,8 @@ function App() {
     const digits = Math.max(1, String(Math.max(totalRows, 1)).length);
     return Math.max(64, digits * 10 + 28);
   }, [totalRows]);
+  const duplicateSelectionValue =
+    duplicateColumn === null ? "row" : String(duplicateColumn);
 
   const handleResizeStart = useCallback(
     (event: React.MouseEvent<HTMLDivElement>, columnIndex: number) => {
@@ -875,7 +1016,10 @@ function App() {
               <input
                 type="text"
                 value={searchTerm}
-                onChange={(event) => setSearchTerm(event.target.value)}
+                onChange={(event) => {
+                  setSearchTerm(event.target.value);
+                  setActiveHighlight("search");
+                }}
                 placeholder="Search selected column"
                 disabled={!filePath || !rowCountReady}
                 ref={searchInputRef}
@@ -899,6 +1043,9 @@ function App() {
                   setSearchTerm("");
                   setSearchResults(null);
                   setCurrentMatch(0);
+                  if (activeHighlight === "search") {
+                    setActiveHighlight(null);
+                  }
                 }}
                 disabled={!searchTerm}
               >
@@ -937,6 +1084,82 @@ function App() {
                     : filePath
                       ? "Ready"
                       : "No file loaded"}
+            </div>
+          </div>
+        ) : null}
+        {showDuplicates ? (
+          <div className={`find-panel${showIndex ? " with-index" : ""}`}>
+            <div className="find-controls">
+              <span className="find-label">Match on</span>
+              <select
+                value={duplicateSelectionValue}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  setDuplicateColumn(value === "row" ? null : Number(value));
+                }}
+                disabled={!filePath}
+              >
+                <option value="row">Entire row</option>
+                {headerLabels.map((header, idx) => (
+                  <option value={idx} key={`duplicates-${header}-${idx}`}>
+                    {header}
+                  </option>
+                ))}
+              </select>
+              <button
+                className="btn subtle"
+                onClick={handleCheckDuplicates}
+                disabled={!filePath || duplicateChecking}
+              >
+                {duplicateChecking ? "Checking..." : "Check"}
+              </button>
+              <button
+                className="btn subtle"
+                onClick={() => {
+                  setDuplicateResults(null);
+                  setCurrentDuplicateMatch(0);
+                  setActiveHighlight((prev) =>
+                    prev === "duplicates" ? null : prev,
+                  );
+                }}
+                disabled={duplicateResults === null}
+              >
+                Clear
+              </button>
+              <button
+                className="btn subtle"
+                onClick={goToPrevDuplicate}
+                disabled={!duplicateResults?.length}
+              >
+                Prev
+              </button>
+              <button
+                className="btn subtle"
+                onClick={goToNextDuplicate}
+                disabled={!duplicateResults?.length}
+              >
+                Next
+              </button>
+              <span className="find-count">
+                {duplicateResults?.length
+                  ? `${currentDuplicateMatch + 1}/${duplicateResults.length}`
+                  : "0/0"}
+              </span>
+              <button
+                className="btn subtle"
+                onClick={() => setShowDuplicates(false)}
+              >
+                Close
+              </button>
+            </div>
+            <div className="find-meta">
+              {duplicateChecking
+                ? "Checking duplicates..."
+                : duplicateResults
+                  ? `${duplicateResults.length.toLocaleString()} duplicate rows`
+                  : filePath
+                    ? "Ready"
+                    : "No file loaded"}
             </div>
           </div>
         ) : null}
@@ -1005,10 +1228,10 @@ function App() {
                     ? rowIndexMapRef.current.get(virtualRow.index)
                     : virtualRow.index;
                   const rowNumber = (originalIndex ?? virtualRow.index) + 1;
-                  const currentIndex = searchResults?.[currentMatch];
+                  const currentIndex = activeResults?.[activeCurrentMatch];
                   const isMatch =
                     originalIndex !== undefined
-                      ? searchSet?.has(originalIndex)
+                      ? activeMatchSet?.has(originalIndex)
                       : false;
                   const isCurrent =
                     originalIndex !== undefined &&

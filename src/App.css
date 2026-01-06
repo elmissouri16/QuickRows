@@ -446,6 +446,13 @@ option {
     align-items: center;
 }
 
+.find-label {
+    font-size: 0.72rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--find-meta);
+}
+
 .find-panel.with-index .find-controls,
 .find-panel.with-index .find-meta {
     padding-left: var(--index-width);
