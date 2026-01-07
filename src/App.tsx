@@ -1090,7 +1090,7 @@ function App() {
       {error ? <div className="status">{error}</div> : null}
 
       <section className={`table-shell${filePath ? "" : " is-empty"}`}>
-        {showFind ? (
+        {showFind && filePath ? (
           <div className={`find-panel${showIndex ? " with-index" : ""}`}>
             <div className="find-controls">
               <select
@@ -1174,13 +1174,11 @@ function App() {
                   ? "Counting rows..."
                   : searchResults
                     ? `${searchResults.length.toLocaleString()} matches`
-                    : filePath
-                      ? "Ready"
-                      : "No file loaded"}
+                    : null}
             </div>
           </div>
         ) : null}
-        {showDuplicates ? (
+        {showDuplicates && filePath ? (
           <div className={`find-panel${showIndex ? " with-index" : ""}`}>
             <div className="find-controls">
               <span className="find-label">Match on</span>
@@ -1250,9 +1248,7 @@ function App() {
                 ? "Checking duplicates..."
                 : duplicateResults
                   ? `${duplicateResults.length.toLocaleString()} duplicate rows`
-                  : filePath
-                    ? "Ready"
-                    : "No file loaded"}
+                  : null}
             </div>
           </div>
         ) : null}
