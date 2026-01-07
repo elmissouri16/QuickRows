@@ -748,6 +748,74 @@ option {
     box-shadow: 0 12px 22px rgba(59, 130, 246, 0.25);
 }
 
+.empty-recent {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 6px;
+}
+
+.recent-title {
+    font-size: 0.65rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--ink-muted);
+    align-self: flex-start;
+}
+
+.recent-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: 100%;
+}
+
+.recent-item {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 8px 12px;
+    text-align: left;
+    background: var(--panel);
+    color: var(--ink);
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    transition:
+        background 0.2s ease,
+        border-color 0.2s ease,
+        transform 0.2s ease;
+}
+
+.recent-item:hover {
+    transform: translateY(-1px);
+    background: var(--panel-muted);
+    border-color: rgba(59, 130, 246, 0.3);
+}
+
+.recent-item:focus {
+    outline: none;
+    border-color: rgba(59, 130, 246, 0.6);
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.18);
+}
+
+.recent-name {
+    font-size: 0.85rem;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.recent-path {
+    font-size: 0.72rem;
+    color: var(--ink-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
 @media (max-width: 1200px) {
     .tool-bar {
         grid-template-columns: 1fr;

@@ -17,6 +17,7 @@ const ROW_COUNT_POLL_INTERVAL = 250;
 const ROW_COUNT_POLL_MAX = 60;
 const COLUMN_WIDTH_MIN = 120;
 const SETTINGS_KEY = "csv-viewer.settings";
+const MAX_RECENT_FILES = 6;
 const ROW_HEIGHT_OPTIONS = new Set([28, 36, 44]);
 
 type SortDirection = "asc" | "desc";
@@ -103,6 +104,7 @@ function App() {
     useState<ThemePreference>("system");
   const [resolvedTheme, setResolvedTheme] = useState<ThemeMode>(getSystemTheme);
   const [lastOpenDir, setLastOpenDir] = useState<string | null>(null);
+  const [recentFiles, setRecentFiles] = useState<string[]>([]);
   const dataRef = useRef<Map<number, string[]>>(new Map());
   const rowIndexMapRef = useRef<Map<number, number>>(new Map());
   const [, setDataVersion] = useState(0);
@@ -170,6 +172,7 @@ function App() {
         columnWidths?: number[];
         theme?: ThemePreference;
         lastOpenDir?: string;
+        recentFiles?: string[];
       };
       if (typeof parsed.showIndex === "boolean") {
         setShowIndex(parsed.showIndex);
@@ -201,6 +204,22 @@ function App() {
       if (typeof parsed.lastOpenDir === "string") {
         setLastOpenDir(parsed.lastOpenDir);
       }
+      if (Array.isArray(parsed.recentFiles)) {
+        const seen = new Set<string>();
+        const nextRecent = parsed.recentFiles
+          .filter((value): value is string => typeof value === "string")
+          .filter((value) => {
+            if (seen.has(value)) {
+              return false;
+            }
+            seen.add(value);
+            return true;
+          })
+          .slice(0, MAX_RECENT_FILES);
+        if (nextRecent.length) {
+          setRecentFiles(nextRecent);
+        }
+      }
     } catch {
       // Ignore malformed settings.
     }
@@ -214,6 +233,7 @@ function App() {
       columnWidths,
       theme: themePreference,
       lastOpenDir,
+      recentFiles,
     };
     try {
       localStorage.setItem(SETTINGS_KEY, JSON.stringify(payload));
@@ -227,6 +247,7 @@ function App() {
     columnWidths,
     themePreference,
     lastOpenDir,
+    recentFiles,
   ]);
 
   useEffect(() => {
@@ -330,6 +351,10 @@ function App() {
         if (nextDir) {
           setLastOpenDir(nextDir);
         }
+        setRecentFiles((prev) => {
+          const next = [path, ...prev.filter((item) => item !== path)];
+          return next.slice(0, MAX_RECENT_FILES);
+        });
       } catch (err) {
         setError(
           typeof err === "string" ? err : "Unable to load CSV metadata.",
@@ -1246,6 +1271,31 @@ function App() {
               >
                 Open CSV
               </button>
+              {recentFiles.length ? (
+                <div className="empty-recent">
+                  <div className="recent-title">Recent files</div>
+                  <div className="recent-list">
+                    {recentFiles.map((path) => {
+                      const name = getFileNameFromPath(path);
+                      const dir = getDirFromPath(path);
+                      return (
+                        <button
+                          key={path}
+                          type="button"
+                          className="recent-item"
+                          onClick={() => handleOpenPath(path)}
+                          title={path}
+                        >
+                          <span className="recent-name">{name}</span>
+                          <span className="recent-path">
+                            {dir ?? path}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : null}
             </div>
           )
         ) : (
