@@ -19,7 +19,7 @@ use disk_cache::{
 };
 use memmap2::Mmap;
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+// use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
 
@@ -465,103 +465,28 @@ async fn find_duplicates(
 
     let mmap = state.mmap.lock().unwrap().clone();
     let offsets = state.row_offsets.lock().unwrap().clone();
-    let expected_columns = {
-        let len = state.headers.lock().unwrap().len();
-        if len == 0 { None } else { Some(len) }
+    // Offsets are required for random access verification
+    let offsets = offsets.ok_or("File not fully indexed yet")?;
+
+    // Use hashed approach for memory efficiency
+    let duplicates = if let Some(mmap) = mmap.as_ref() {
+        csv_handler::find_duplicates_hashed_mmap(
+            &mmap[..],
+            &offsets,
+            &settings,
+            column_idx,
+        )
+        .map_err(|err| err.to_string())?
+    } else {
+        csv_handler::find_duplicates_hashed(
+            &path,
+            &offsets,
+            &settings,
+            column_idx,
+        )
+        .map_err(|err| err.to_string())?
     };
-    let mut warnings = Vec::new();
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    let mut duplicates: Vec<usize> = Vec::new();
-    let mut duplicate_set: HashSet<usize> = HashSet::new();
-    let mut start = 0usize;
 
-    loop {
-        let rows = match offsets.as_ref() {
-            Some(offsets) => {
-                if let Some(mmap) = mmap.as_ref() {
-                    read_chunk_with_offsets_mmap(
-                        &mmap[..],
-                        offsets,
-                        start,
-                        BULK_CHUNK_SIZE,
-                        &settings,
-                        expected_columns,
-                        &mut warnings,
-                    )
-                    .map_err(|err| err.to_string())?
-                } else {
-                    read_chunk_with_offsets(
-                        &path,
-                        offsets,
-                        start,
-                        BULK_CHUNK_SIZE,
-                        &settings,
-                        expected_columns,
-                        &mut warnings,
-                    )
-                    .map_err(|err| err.to_string())?
-                }
-            }
-            None => {
-                if let Some(mmap) = mmap.as_ref() {
-                    read_chunk_mmap(
-                        &mmap[..],
-                        start,
-                        BULK_CHUNK_SIZE,
-                        &settings,
-                        expected_columns,
-                        &mut warnings,
-                    )
-                    .map_err(|err| err.to_string())?
-                } else {
-                    read_chunk(
-                        &path,
-                        start,
-                        BULK_CHUNK_SIZE,
-                        &settings,
-                        expected_columns,
-                        &mut warnings,
-                    )
-                    .map_err(|err| err.to_string())?
-                }
-            }
-        };
-
-        if rows.is_empty() {
-            break;
-        }
-
-        for (idx, row) in rows.iter().enumerate() {
-            let row_index = start + idx;
-            let key = match column_idx {
-                Some(index) => row.get(index).cloned().unwrap_or_default(),
-                None => row.join("\u{1f}"),
-            };
-            if let Some(first_idx) = seen.get(&key).copied() {
-                if duplicate_set.insert(first_idx) {
-                    duplicates.push(first_idx);
-                }
-                if duplicate_set.insert(row_index) {
-                    duplicates.push(row_index);
-                }
-            } else {
-                seen.insert(key, row_index);
-            }
-        }
-
-        if rows.len() < BULK_CHUNK_SIZE {
-            break;
-        }
-        start += rows.len();
-    }
-
-    if !warnings.is_empty() {
-        let mut stored = state.parse_warnings.lock().unwrap();
-        stored.extend(warnings);
-        stored.truncate(MAX_WARNING_COUNT);
-    }
-
-    duplicates.sort_unstable();
     Ok(duplicates)
 }
 

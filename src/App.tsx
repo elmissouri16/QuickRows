@@ -1327,10 +1327,10 @@ function App() {
     const digits = Math.max(1, String(Math.max(totalRows, 1)).length);
     return Math.max(64, digits * 10 + 28);
   }, [totalRows]);
-  const duplicateSelectionValue =
-    duplicateColumn === null ? "row" : String(duplicateColumn);
-  const searchSelectionValue =
-    searchColumn === null ? "row" : String(searchColumn);
+  // const duplicateSelectionValue =
+  //   duplicateColumn === null ? "row" : String(duplicateColumn);
+  // const searchSelectionValue =
+  //   searchColumn === null ? "row" : String(searchColumn);
   const parseWarningCount = parseWarnings.length;
 
   const handleResizeStart = useCallback(
