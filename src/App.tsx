@@ -134,14 +134,7 @@ const formatCsvCell = (value: string) => {
 };
 const formatCsvRow = (row: string[]) =>
   row.map((cell) => formatCsvCell(cell)).join(",");
-const formatDelimiterLabel = (value: string) => {
-  if (value === "\t") return "Tab";
-  if (value === " ") return "Space";
-  if (value === ",") return "Comma";
-  if (value === ";") return "Semicolon";
-  if (value === "|") return "Pipe";
-  return value;
-};
+
 const copyToClipboard = async (value: string) => {
   if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
     try {
@@ -222,13 +215,19 @@ function App() {
   const [parseDetected, setParseDetected] = useState<ParseInfo | null>(null);
   const [parseEffective, setParseEffective] = useState<ParseInfo | null>(null);
   const [parseWarnings, setParseWarnings] = useState<ParseWarning[]>([]);
-  const [showParseSettings, setShowParseSettings] = useState(false);
+  /* const [showParseSettings, setShowParseSettings] = useState(false); */
+
   const [showHeaderPrompt, setShowHeaderPrompt] = useState(false);
   const [parseOverrides, setParseOverrides] = useState<ParseOverridesState>(
     DEFAULT_PARSE_OVERRIDES,
   );
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [loadingProgress, setLoadingProgress] = useState<number | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [enableIndexing, setEnableIndexing] = useState(() => {
+    const saved = localStorage.getItem("csv-viewer-enable-indexing");
+    return saved !== null ? saved === "true" : true; // Default enabled
+  });
   const dataRef = useRef<Map<number, string[]>>(new Map());
   const rowIndexMapRef = useRef<Map<number, number>>(new Map());
   const [, setDataVersion] = useState(0);
@@ -503,7 +502,6 @@ function App() {
     setParseDetected(null);
     setParseEffective(null);
     setParseWarnings([]);
-    setShowParseSettings(false);
     setShowHeaderPrompt(false);
     setContextMenu(null);
     dataRef.current = new Map();
@@ -699,7 +697,6 @@ function App() {
     setParseDetected(null);
     setParseEffective(null);
     setParseWarnings([]);
-    setShowParseSettings(false);
     setShowHeaderPrompt(false);
     setContextMenu(null);
     invoke("clear_sort").catch(() => { });
@@ -1107,6 +1104,9 @@ function App() {
         listen("menu-clear", () => {
           handleClearFile();
         }),
+        listen("open-settings", () => {
+          setShowSettings(true);
+        }),
         listen("menu-find", () => {
           setShowFind(true);
           setShowDuplicates(false);
@@ -1142,7 +1142,7 @@ function App() {
           toggleTheme();
         }),
         listen("menu-parse-settings", () => {
-          setShowParseSettings(true);
+          setShowSettings(true);
         }),
         listen<number>("row-count", (event) => {
           setTotalRows(event.payload);
@@ -1510,271 +1510,7 @@ function App() {
             </div>
           </div>
         ) : null}
-        {showParseSettings && filePath ? (
-          <div className={`parse-panel${showIndex ? " with-index" : ""}`}>
-            <div className="parse-grid">
-              <label className="parse-field">
-                <span>Delimiter</span>
-                <select
-                  value={parseOverrides.delimiter}
-                  onChange={(event) => {
-                    const value = event.target
-                      .value as ParseOverridesState["delimiter"];
-                    setParseOverrides((prev) => ({
-                      ...prev,
-                      delimiter: value,
-                    }));
-                  }}
-                >
-                  <option value="auto">Auto</option>
-                  <option value="comma">Comma</option>
-                  <option value="tab">Tab</option>
-                  <option value="semicolon">Semicolon</option>
-                  <option value="pipe">Pipe</option>
-                  <option value="space">Space</option>
-                  <option value="custom">Custom</option>
-                </select>
-                {parseOverrides.delimiter === "custom" ? (
-                  <input
-                    type="text"
-                    value={parseOverrides.delimiterCustom}
-                    onChange={(event) =>
-                      setParseOverrides((prev) => ({
-                        ...prev,
-                        delimiterCustom: event.target.value,
-                      }))
-                    }
-                    placeholder="Delimiter"
-                  />
-                ) : null}
-              </label>
-              <label className="parse-field">
-                <span>Quote</span>
-                <select
-                  value={parseOverrides.quote}
-                  onChange={(event) => {
-                    const value = event.target
-                      .value as ParseOverridesState["quote"];
-                    setParseOverrides((prev) => ({
-                      ...prev,
-                      quote: value,
-                    }));
-                  }}
-                >
-                  <option value="auto">Auto</option>
-                  <option value="double">Double</option>
-                  <option value="single">Single</option>
-                </select>
-              </label>
-              <label className="parse-field">
-                <span>Escape</span>
-                <select
-                  value={parseOverrides.escape}
-                  onChange={(event) => {
-                    const value = event.target
-                      .value as ParseOverridesState["escape"];
-                    setParseOverrides((prev) => ({
-                      ...prev,
-                      escape: value,
-                    }));
-                  }}
-                >
-                  <option value="auto">Auto</option>
-                  <option value="none">None</option>
-                  <option value="backslash">Backslash</option>
-                </select>
-              </label>
-              <label className="parse-field">
-                <span>Line ending</span>
-                <select
-                  value={parseOverrides.lineEnding}
-                  onChange={(event) => {
-                    const value = event.target
-                      .value as ParseOverridesState["lineEnding"];
-                    setParseOverrides((prev) => ({
-                      ...prev,
-                      lineEnding: value,
-                    }));
-                  }}
-                >
-                  <option value="auto">Auto</option>
-                  <option value="lf">LF</option>
-                  <option value="crlf">CRLF</option>
-                  <option value="cr">CR</option>
-                </select>
-              </label>
-              <label className="parse-field">
-                <span>Encoding</span>
-                <select
-                  value={parseOverrides.encoding}
-                  onChange={(event) => {
-                    const value = event.target
-                      .value as ParseOverridesState["encoding"];
-                    setParseOverrides((prev) => ({
-                      ...prev,
-                      encoding: value,
-                    }));
-                  }}
-                >
-                  <option value="auto">Auto</option>
-                  <option value="utf-8">UTF-8</option>
-                  <option value="windows-1252">Windows-1252</option>
-                  <option value="iso-8859-1">ISO-8859-1</option>
-                  <option value="utf-16le">UTF-16 LE</option>
-                  <option value="utf-16be">UTF-16 BE</option>
-                </select>
-              </label>
-            </div>
-            <div className="parse-grid">
-              <label className="parse-field">
-                <span>Headers</span>
-                <select
-                  value={parseOverrides.hasHeaders}
-                  onChange={(event) => {
-                    const value = event.target
-                      .value as ParseOverridesState["hasHeaders"];
-                    setParseOverrides((prev) => ({
-                      ...prev,
-                      hasHeaders: value,
-                    }));
-                    setShowHeaderPrompt(false);
-                  }}
-                >
-                  <option value="auto">Auto</option>
-                  <option value="yes">Use first row</option>
-                  <option value="no">No headers</option>
-                </select>
-              </label>
-              <label className="parse-field">
-                <span>Malformed rows</span>
-                <select
-                  value={parseOverrides.malformed}
-                  onChange={(event) => {
-                    const value = event.target
-                      .value as ParseOverridesState["malformed"];
-                    setParseOverrides((prev) => ({
-                      ...prev,
-                      malformed: value,
-                    }));
-                  }}
-                >
-                  <option value="strict">Strict</option>
-                  <option value="skip">Skip</option>
-                  <option value="repair">Repair</option>
-                </select>
-              </label>
-              <label className="parse-field">
-                <span>Max field (bytes)</span>
-                <input
-                  type="number"
-                  min={1024}
-                  value={parseOverrides.maxFieldSize}
-                  onChange={(event) => {
-                    const value = Number(event.target.value);
-                    if (!Number.isFinite(value)) {
-                      return;
-                    }
-                    setParseOverrides((prev) => ({
-                      ...prev,
-                      maxFieldSize: value,
-                    }));
-                  }}
-                />
-              </label>
-              <label className="parse-field">
-                <span>Max row (bytes)</span>
-                <input
-                  type="number"
-                  min={4096}
-                  value={parseOverrides.maxRecordSize}
-                  onChange={(event) => {
-                    const value = Number(event.target.value);
-                    if (!Number.isFinite(value)) {
-                      return;
-                    }
-                    setParseOverrides((prev) => ({
-                      ...prev,
-                      maxRecordSize: value,
-                    }));
-                  }}
-                />
-              </label>
-            </div>
-            <div className="parse-actions">
-              <div className="parse-meta">
-                {parseDetected ? (
-                  <>
-                    Detected: {formatDelimiterLabel(parseDetected.delimiter)}{" "}
-                    delimiter, {parseDetected.encoding} encoding,{" "}
-                    {parseDetected.line_ending.toUpperCase()} line ending
-                    {parseEffective ? (
-                      <>
-                        {" "}
-                        · Effective:{" "}
-                        {formatDelimiterLabel(parseEffective.delimiter)}{" "}
-                        delimiter, {parseEffective.encoding} encoding
-                      </>
-                    ) : null}
-                  </>
-                ) : (
-                  "No detection info yet."
-                )}
-              </div>
-              <div className="parse-buttons">
-                <button className="btn subtle" onClick={handleApplyParse}>
-                  Apply
-                </button>
-                <button
-                  className="btn subtle"
-                  onClick={() => applyParseOverrides(DEFAULT_PARSE_OVERRIDES)}
-                >
-                  Reset
-                </button>
-                <button
-                  className="btn subtle"
-                  onClick={() => setShowParseSettings(false)}
-                >
-                  Close
-                </button>
-              </div>
-            </div>
-            {parseWarnings.length ? (
-              <div className="parse-warnings">
-                <div className="parse-warnings-title">Latest warnings</div>
-                <div className="parse-warnings-list">
-                  {parseWarnings.slice(-12).map((warning, idx) => (
-                    <div
-                      className="parse-warning"
-                      key={`${warning.kind}-${idx}`}
-                    >
-                      <span className="parse-warning-id">
-                        Row{" "}
-                        {warning.record !== undefined
-                          ? warning.record + 1
-                          : "?"}
-                      </span>
-                      <span className="parse-warning-text">
-                        {warning.message}
-                        {warning.field !== undefined
-                          ? ` (col ${warning.field + 1})`
-                          : ""}
-                        {warning.expected_len !== undefined &&
-                          warning.len !== undefined
-                          ? ` (${warning.len}/${warning.expected_len} fields)`
-                          : ""}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-                {parseWarnings.length > 12 ? (
-                  <div className="parse-warnings-meta">
-                    Showing 12 of {parseWarnings.length} warnings.
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
-          </div>
-        ) : null}
+
         {showFind && filePath ? (
           <div className="find-widget">
             <div className="find-scope-select-wrapper">
@@ -2162,6 +1898,273 @@ function App() {
           </div>
         )}
       </section>
+      {showSettings ? (
+        <div className="modal-overlay" onClick={() => setShowSettings(false)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Settings</h2>
+              <button
+                className="close-button"
+                onClick={() => setShowSettings(false)}
+              >
+                &times;
+              </button>
+            </div>
+            <div className="modal-body">
+              <div className="setting-group">
+                <h3>Appearance</h3>
+                <div className="setting-item">
+                  <div className="setting-item-row">
+                    <span className="setting-label">Theme</span>
+                    <select
+                      className="setting-select"
+                      value={themePreference}
+                      onChange={(e) => {
+                        const val = e.target.value as ThemePreference;
+                        setThemePreference(val);
+                      }}
+                    >
+                      <option value="system">System</option>
+                      <option value="light">Light</option>
+                      <option value="dark">Dark</option>
+                    </select>
+                  </div>
+                </div>
+                <div className="setting-item">
+                  <div className="setting-item-row">
+                    <span className="setting-label">Row Height</span>
+                    <select
+                      className="setting-select"
+                      value={
+                        rowHeight === DEFAULT_ROW_HEIGHT
+                          ? "default"
+                          : rowHeight < DEFAULT_ROW_HEIGHT
+                            ? "compact"
+                            : "spacious"
+                      }
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        if (val === "compact") setRowHeight(24);
+                        else if (val === "spacious") setRowHeight(48);
+                        else setRowHeight(DEFAULT_ROW_HEIGHT);
+                      }}
+                    >
+                      <option value="compact">Compact</option>
+                      <option value="default">Default</option>
+                      <option value="spacious">Spacious</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              <div className="setting-group">
+                <h3>View</h3>
+                <div className="setting-item">
+                  <div className="setting-item-row">
+                    <span className="setting-label">Show Line Numbers</span>
+                    <label className="toggle-switch">
+                      <input
+                        type="checkbox"
+                        checked={showIndex}
+                        onChange={(e) => {
+                          const checked = e.target.checked;
+                          setShowIndex(checked);
+                          invoke("set_show_index_checked", {
+                            checked,
+                          }).catch(console.error);
+                        }}
+                      />
+                      <span className="slider"></span>
+                    </label>
+                  </div>
+                </div>
+              </div>
+
+              <div className="setting-group">
+                <h3>Search & Parsing</h3>
+                <div className="setting-item">
+                  <div className="setting-item-row">
+                    <span className="setting-label">Enable Search Indexing</span>
+                    <label className="toggle-switch">
+                      <input
+                        type="checkbox"
+                        checked={enableIndexing}
+                        onChange={(e) => {
+                          const checked = e.target.checked;
+                          setEnableIndexing(checked);
+                          localStorage.setItem(
+                            "csv-viewer-enable-indexing",
+                            String(checked),
+                          );
+                          invoke("set_enable_indexing", {
+                            enabled: checked,
+                          }).catch(console.error);
+                        }}
+                      />
+                      <span className="slider"></span>
+                    </label>
+                  </div>
+                  <p className="setting-description">
+                    Speeds up search by building an in-memory index. Uses significantly more RAM
+                    (~500MB per 10M rows).
+                    <br />
+                    <em>Change requires reopening the file.</em>
+                  </p>
+                </div>
+                <div className="setting-item">
+                  <div className="setting-item-row">
+                    <span className="setting-label">Delimiter</span>
+                    <select
+                      className="setting-select"
+                      value={parseOverrides.delimiter}
+                      onChange={(event) => {
+                        const value = event.target
+                          .value as ParseOverridesState["delimiter"];
+                        setParseOverrides((prev) => ({
+                          ...prev,
+                          delimiter: value,
+                        }));
+                      }}
+                    >
+                      <option value="auto">Auto</option>
+                      <option value="comma">Comma</option>
+                      <option value="tab">Tab</option>
+                      <option value="semicolon">Semicolon</option>
+                      <option value="pipe">Pipe</option>
+                      <option value="space">Space</option>
+                      <option value="custom">Custom</option>
+                    </select>
+                  </div>
+                  {parseOverrides.delimiter === "custom" ? (
+                    <div className="setting-item-row" style={{ marginTop: 8, justifyContent: "flex-end" }}>
+                      <input
+                        type="text"
+                        className="setting-select"
+                        style={{ width: 120 }}
+                        value={parseOverrides.delimiterCustom}
+                        onChange={(event) =>
+                          setParseOverrides((prev) => ({
+                            ...prev,
+                            delimiterCustom: event.target.value,
+                          }))
+                        }
+                        placeholder="Char"
+                      />
+                    </div>
+                  ) : null}
+                </div>
+                <div className="setting-item">
+                  <div className="setting-item-row">
+                    <span className="setting-label">Quote Char</span>
+                    <select
+                      className="setting-select"
+                      value={parseOverrides.quote}
+                      onChange={(event) => {
+                        const value = event.target
+                          .value as ParseOverridesState["quote"];
+                        setParseOverrides((prev) => ({
+                          ...prev,
+                          quote: value,
+                        }));
+                      }}
+                    >
+                      <option value="auto">Auto</option>
+                      <option value="double">Double</option>
+                      <option value="single">Single</option>
+                    </select>
+                  </div>
+                </div>
+                <div className="setting-item">
+                  <div className="setting-item-row">
+                    <span className="setting-label">Escape Char</span>
+                    <select
+                      className="setting-select"
+                      value={parseOverrides.escape}
+                      onChange={(event) => {
+                        const value = event.target
+                          .value as ParseOverridesState["escape"];
+                        setParseOverrides((prev) => ({
+                          ...prev,
+                          escape: value,
+                        }));
+                      }}
+                    >
+                      <option value="auto">Auto</option>
+                      <option value="none">None</option>
+                      <option value="backslash">Backslash</option>
+                    </select>
+                  </div>
+                </div>
+                <div className="setting-item">
+                  <div className="setting-item-row">
+                    <span className="setting-label">Encoding</span>
+                    <select
+                      className="setting-select"
+                      value={parseOverrides.encoding}
+                      onChange={(event) => {
+                        const value = event.target
+                          .value as ParseOverridesState["encoding"];
+                        setParseOverrides((prev) => ({
+                          ...prev,
+                          encoding: value,
+                        }));
+                      }}
+                    >
+                      <option value="auto">Auto</option>
+                      <option value="utf-8">UTF-8</option>
+                      <option value="windows-1252">Windows-1252</option>
+                      <option value="iso-8859-1">ISO-8859-1</option>
+                      <option value="utf-16le">UTF-16 LE</option>
+                      <option value="utf-16be">UTF-16 BE</option>
+                    </select>
+                  </div>
+                </div>
+                <div className="setting-item">
+                  <div className="setting-item-row">
+                    <span className="setting-label">Headers</span>
+                    <select
+                      className="setting-select"
+                      value={parseOverrides.hasHeaders}
+                      onChange={(event) => {
+                        const value = event.target
+                          .value as ParseOverridesState["hasHeaders"];
+                        setParseOverrides((prev) => ({
+                          ...prev,
+                          hasHeaders: value,
+                        }));
+                        setShowHeaderPrompt(false);
+                      }}
+                    >
+                      <option value="auto">Auto</option>
+                      <option value="yes">Use first row</option>
+                      <option value="no">No headers</option>
+                    </select>
+                  </div>
+                </div>
+                <div className="setting-item" style={{ justifyContent: "flex-end", gap: 12, marginTop: 16 }}>
+                  <button
+                    className="btn subtle"
+                    onClick={() => applyParseOverrides(DEFAULT_PARSE_OVERRIDES)}
+                  >
+                    Reset Defaults
+                  </button>
+                  <button className="btn secondary" onClick={handleApplyParse}>
+                    Reload File
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button
+                className="btn primary"
+                onClick={() => setShowSettings(false)}
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {contextMenu ? (
         <div
           className="context-menu"

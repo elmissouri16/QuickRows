@@ -55,6 +55,7 @@
     --radius-lg: 10px;
     --cell-min: 160px;
     --row-height: 36px;
+    --surface: #ffffff;
 }
 
 :root[data-theme="dark"] {
@@ -103,6 +104,7 @@
     --resizer-hover: rgba(255, 255, 255, 0.5);
     --empty-card: #242424;
     --empty-card-border: #3b3b3b;
+    --surface: #1e1e1e;
 }
 
 * {
@@ -1478,4 +1480,258 @@ option {
     animation: spin 1s linear infinite;
     color: var(--accent);
     opacity: 1;
+}
+
+/* Settings Modal */
+.modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 9999;
+}
+
+.modal-content {
+    background: #1e1e1e;
+    /* Solid background, no variable in case variable is transparent */
+    background: var(--surface);
+    /* Ensure surface variable is opaque or fallback */
+    background-color: #1a1a1a;
+    width: 500px;
+    max-width: 90vw;
+    border-radius: 8px;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
+    border: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    z-index: 10000;
+}
+
+.modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+}
+
+.modal-header h2 {
+    margin: 0;
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--ink);
+}
+
+.close-button {
+    background: transparent;
+    border: none;
+    color: var(--ink-muted);
+    font-size: 1.5rem;
+    cursor: pointer;
+    padding: 0;
+    line-height: 1;
+}
+
+.close-button:hover {
+    color: var(--ink);
+}
+
+.modal-body {
+    padding: 20px;
+    flex: 1;
+}
+
+.setting-group {
+    margin-bottom: 24px;
+}
+
+/* Settings Modal Refinement */
+.modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.6);
+    backdrop-filter: blur(2px);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 9999;
+}
+
+.modal-content {
+    background: var(--surface);
+    background-color: var(--surface);
+    width: 480px;
+    max-width: 90vw;
+    border-radius: 12px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.7);
+    border: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    z-index: 10000;
+}
+
+.modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+}
+
+.modal-header h2 {
+    margin: 0;
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--ink);
+    letter-spacing: -0.01em;
+}
+
+.close-button {
+    background: transparent;
+    border: none;
+    color: var(--ink-muted);
+    font-size: 1.5rem;
+    cursor: pointer;
+    padding: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    transition: color 0.1s;
+}
+
+.close-button:hover {
+    color: var(--ink);
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.modal-body {
+    padding: 24px;
+    flex: 1;
+}
+
+.setting-group {
+    margin-bottom: 24px;
+}
+
+.setting-group h3 {
+    margin: 0 0 16px 0;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    color: var(--ink-muted);
+    letter-spacing: 0.05em;
+    font-weight: 600;
+}
+
+/* Toggle Switch Layout */
+.setting-item-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.setting-label {
+    font-size: 1rem;
+    font-weight: 500;
+    color: var(--ink);
+}
+
+.toggle-switch {
+    position: relative;
+    display: inline-block;
+    width: 44px;
+    height: 24px;
+}
+
+.toggle-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: #3a3a3a;
+    transition: .3s;
+    border-radius: 24px;
+}
+
+.slider:before {
+    position: absolute;
+    content: "";
+    height: 18px;
+    width: 18px;
+    left: 3px;
+    bottom: 3px;
+    background-color: white;
+    transition: .3s;
+    border-radius: 50%;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+}
+
+input:checked+.slider {
+    background-color: var(--accent);
+}
+
+input:checked+.slider:before {
+    transform: translateX(20px);
+}
+
+.setting-description {
+    margin: 4px 0 0 0;
+    font-size: 0.9rem;
+    color: var(--ink-muted);
+    line-height: 1.5;
+    max-width: 90%;
+}
+
+.setting-description em {
+    color: var(--accent);
+    font-style: normal;
+    font-weight: 500;
+}
+
+/* Select styling for settings */
+.setting-select {
+    padding: 6px 12px;
+    border-radius: 4px;
+    background: var(--bg-input);
+    color: var(--ink);
+    border: 1px solid var(--border);
+    font-size: 0.9rem;
+    cursor: pointer;
+    min-width: 120px;
+}
+
+.setting-select:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.btn.secondary.small {
+    padding: 6px 12px;
+    font-size: 0.85rem;
+}
+
+.modal-footer {
+    padding: 16px 24px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    justify-content: flex-end;
 }

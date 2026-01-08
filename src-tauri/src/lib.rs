@@ -41,6 +41,37 @@ pub struct CsvMetadata {
     pub estimated_count: Option<usize>,
 }
 
+/// Inverted index for fast search: maps lowercase value → row indices
+/// Key: lowercase cell value (truncated to 256 chars for memory efficiency)
+/// Value: sorted list of row indices containing that value
+type ColumnIndex = std::collections::HashMap<Box<str>, Vec<u32>>;
+
+/// Search index for all columns
+struct SearchIndex {
+    /// Per-column inverted index (column_idx → ColumnIndex)
+    columns: Vec<Option<ColumnIndex>>,
+    /// Whether index is ready for use
+    ready: bool,
+    /// Columns skipped due to high cardinality (>500K unique values)
+    skipped_columns: Vec<usize>,
+}
+
+impl SearchIndex {
+    fn new() -> Self {
+        SearchIndex {
+            columns: Vec::new(),
+            ready: false,
+            skipped_columns: Vec::new(),
+        }
+    }
+    
+    fn clear(&mut self) {
+        self.columns.clear();
+        self.ready = false;
+        self.skipped_columns.clear();
+    }
+}
+
 struct AppState {
     file_path: Mutex<Option<String>>,
     total_rows: Mutex<usize>,
@@ -54,10 +85,110 @@ struct AppState {
     parse_info_detected: Mutex<ParseInfo>,
     parse_info_effective: Mutex<ParseInfo>,
     parse_warnings: Mutex<Vec<ParseWarning>>,
+    search_index: Mutex<SearchIndex>,
+    enable_indexing: Mutex<bool>,
 }
 
 const SEARCH_CHUNK_SIZE: usize = 25_000;
 const BULK_CHUNK_SIZE: usize = 10_000;
+const INDEX_VALUE_MAX_LEN: usize = 256;
+const INDEX_MAX_CARDINALITY: usize = 2_000_000; // Skip column if >2M unique values
+
+/// Build search index for all columns in background
+fn build_search_index(
+    path: &str,
+    settings: &ParseSettings,
+    offsets: &[u64],
+    mmap: Option<&Mmap>,
+    num_columns: usize,
+) -> SearchIndex {
+    let mut index = SearchIndex::new();
+    if num_columns == 0 {
+        return index;
+    }
+    
+    // Initialize column indexes
+    index.columns = (0..num_columns).map(|_| Some(std::collections::HashMap::new())).collect();
+    
+    let mut start = 0usize;
+    let mut warnings = Vec::new();
+    
+    loop {
+        let chunk: Vec<Vec<String>> = if let Some(mmap) = mmap {
+            match read_chunk_with_offsets_mmap(
+                mmap,
+                offsets,
+                start,
+                BULK_CHUNK_SIZE,
+                settings,
+                Some(num_columns),
+                &mut warnings,
+            ) {
+                Ok(c) => c,
+                Err(_) => break,
+            }
+        } else {
+            match read_chunk_with_offsets(
+                path,
+                offsets,
+                start,
+                BULK_CHUNK_SIZE,
+                settings,
+                Some(num_columns),
+                &mut warnings,
+            ) {
+                Ok(c) => c,
+                Err(_) => break,
+            }
+        };
+        
+        if chunk.is_empty() {
+            break;
+        }
+        
+        // Index each row
+        for (idx, row) in chunk.iter().enumerate() {
+            let row_index = (start + idx) as u32;
+            
+            for (col_idx, cell) in row.iter().enumerate() {
+                if col_idx >= index.columns.len() {
+                    continue;
+                }
+                
+                // Skip columns already marked as too high cardinality
+                if index.columns[col_idx].is_none() {
+                    continue;
+                }
+                
+                let col_index = index.columns[col_idx].as_mut().unwrap();
+                
+                // Create lowercase key, truncated for memory efficiency
+                let key: Box<str> = if cell.len() > INDEX_VALUE_MAX_LEN {
+                    cell[..INDEX_VALUE_MAX_LEN].to_lowercase().into()
+                } else {
+                    cell.to_lowercase().into()
+                };
+                
+                col_index.entry(key).or_insert_with(Vec::new).push(row_index);
+                
+                // Check cardinality limit
+                if col_index.len() > INDEX_MAX_CARDINALITY {
+                    println!("[INDEX] Skipping column {} (too many unique values: {})", col_idx, col_index.len());
+                    index.skipped_columns.push(col_idx);
+                    index.columns[col_idx] = None;
+                }
+            }
+        }
+        
+        if chunk.len() < BULK_CHUNK_SIZE {
+            break;
+        }
+        start += chunk.len();
+    }
+    
+    index.ready = true;
+    index
+}
 
 fn initial_open_path() -> Option<String> {
     std::env::args_os().skip(1).find_map(|arg| {
@@ -97,6 +228,7 @@ async fn load_csv_metadata(
     *state.parse_info_detected.lock().unwrap() = detected_info.clone();
     *state.parse_info_effective.lock().unwrap() = effective_info.clone();
     *state.parse_warnings.lock().unwrap() = warnings.clone();
+    state.search_index.lock().unwrap().clear();
     state.cache.clear();
 
     let expected_columns = if headers.is_empty() {
@@ -198,10 +330,43 @@ async fn load_csv_metadata(
             warnings.extend(offset_warnings);
             warnings.truncate(MAX_WARNING_COUNT);
         }
-        *state.row_offsets.lock().unwrap() = Some(offsets);
+        *state.row_offsets.lock().unwrap() = Some(offsets.clone());
         *state.total_rows.lock().unwrap() = count;
-        *state.mmap.lock().unwrap() = mmap;
+        *state.mmap.lock().unwrap() = mmap.clone();
         let _ = app.emit("row-count", count);
+        
+        // Build search index in background
+        let enable_indexing = *state.enable_indexing.lock().unwrap();
+        if enable_indexing {
+            let num_columns = state.headers.lock().unwrap().len();
+            println!("[INDEX] Starting index build: path={}, num_columns={}, offsets_len={}", path, num_columns, offsets.len());
+            let index_path = path.clone();
+            let index_settings = settings.clone();
+            let index_offsets = offsets;
+            let index_mmap = mmap;
+            let app_for_index = app.clone();
+            
+            std::thread::spawn(move || {
+            println!("[INDEX] Thread started, building index...");
+            let index = if let Some(ref mmap) = index_mmap {
+                build_search_index(&index_path, &index_settings, &index_offsets, Some(mmap.as_ref()), num_columns)
+            } else {
+                build_search_index(&index_path, &index_settings, &index_offsets, None, num_columns)
+            };
+            println!("[INDEX] Index built: ready={}, columns={}", index.ready, index.columns.len());
+            
+            let state = app_for_index.state::<AppState>();
+            // Check if same file is still loaded
+            let current_path = state.file_path.lock().unwrap().clone();
+            if current_path.as_deref() == Some(index_path.as_str()) {
+                *state.search_index.lock().unwrap() = index;
+                println!("[INDEX] Index stored in state");
+                let _ = app_for_index.emit("index-ready", true);
+            } else {
+                println!("[INDEX] File changed, discarding index");
+            }
+        });
+     }
     });
 
 
@@ -325,6 +490,51 @@ async fn search_csv(
     };
     
     let settings = state.parse_settings.lock().unwrap().clone();
+
+    // Try index-based search first (for exact or contains matches)
+    let search_index = state.search_index.lock().unwrap();
+    println!("[SEARCH] index.ready={} match_case={} column_idx={:?} columns_len={}", 
+             search_index.ready, match_case, column_idx, search_index.columns.len());
+    if search_index.ready && !match_case {
+        if let Some(col_idx) = column_idx {
+            // Search specific column using index
+            if col_idx < search_index.columns.len() {
+                let has_index = search_index.columns[col_idx].is_some();
+                println!("[SEARCH] Using index for column {}, has_index={}", col_idx, has_index);
+                if let Some(ref col_index) = search_index.columns[col_idx] {
+                    // Truncate query key like we did during indexing
+                    let query_key: Box<str> = if query_processed.len() > INDEX_VALUE_MAX_LEN {
+                        query_processed[..INDEX_VALUE_MAX_LEN].into()
+                    } else {
+                        query_processed.clone().into()
+                    };
+                    
+                    // For whole_word, do exact match
+                    if whole_word {
+                        if let Some(rows) = col_index.get(&query_key) {
+                            let mut result: Vec<usize> = rows.iter().map(|&r| r as usize).collect();
+                            result.sort_unstable();
+                            return Ok(result);
+                        } else {
+                            return Ok(Vec::new());
+                        }
+                    } else {
+                        // Contains search: parallel scan of index keys
+                        let matches: Vec<usize> = col_index
+                            .par_iter()
+                            .filter(|(key, _)| key.contains(&*query_key))
+                            .flat_map(|(_, rows)| rows.par_iter().map(|&r| r as usize))
+                            .collect();
+                        let mut matches: Vec<usize> = matches.into_iter().collect();
+                        matches.par_sort_unstable();
+                        matches.dedup();
+                        return Ok(matches);
+                    }
+                }
+            }
+        }
+    }
+    drop(search_index); // Release lock before sequential scan
 
     let mmap = state.mmap.lock().unwrap().clone();
     let offsets_guard = state.row_offsets.lock().unwrap();
@@ -739,6 +949,15 @@ async fn set_show_index_checked(checked: bool, app: tauri::AppHandle) -> Result<
     Ok(())
 }
 
+#[tauri::command]
+async fn set_enable_indexing(enabled: bool, state: State<'_, AppState>) -> Result<(), String> {
+    *state.enable_indexing.lock().unwrap() = enabled;
+    if !enabled {
+        state.search_index.lock().unwrap().clear();
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let default_settings = default_parse_settings();
@@ -759,6 +978,8 @@ pub fn run() {
             parse_info_detected: Mutex::new(default_info.clone()),
             parse_info_effective: Mutex::new(default_info),
             parse_warnings: Mutex::new(Vec::new()),
+            search_index: Mutex::new(SearchIndex::new()),
+            enable_indexing: Mutex::new(true),
         })
         .invoke_handler(tauri::generate_handler![
             load_csv_metadata,
@@ -771,7 +992,8 @@ pub fn run() {
             take_pending_open,
             get_row_count,
             get_parse_warnings,
-            set_show_index_checked
+            set_show_index_checked,
+            set_enable_indexing
         ]);
 
     #[cfg(desktop)]
@@ -783,6 +1005,9 @@ pub fn run() {
             }
             "clear" => {
                 let _ = app.emit("menu-clear", ());
+            }
+            "open-settings" => {
+                let _ = app.emit("open-settings", ());
             }
             "find" => {
                 let _ = app.emit("menu-find", ());
@@ -866,22 +1091,11 @@ fn build_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
     let reload_item = MenuItemBuilder::with_id("reload", "Reload")
         .accelerator("CmdOrCtrl+R")
         .build(app)?;
-    let toggle_theme_item = MenuItemBuilder::with_id("toggle-theme", "Toggle Theme").build(app)?;
     let check_duplicates_item =
         MenuItemBuilder::with_id("check-duplicates", "Check Duplicates...").build(app)?;
     let parse_settings_item =
         MenuItemBuilder::with_id("parse-settings", "Parse Settings...").build(app)?;
-    let show_index_item = CheckMenuItem::with_id(
-        app,
-        "show-index",
-        "Show Row Numbers",
-        true,
-        false,
-        None::<&str>,
-    )?;
-    let row_compact = MenuItemBuilder::with_id("row-compact", "Compact").build(app)?;
-    let row_default = MenuItemBuilder::with_id("row-default", "Default").build(app)?;
-    let row_spacious = MenuItemBuilder::with_id("row-spacious", "Spacious").build(app)?;
+
 
     let file_menu = SubmenuBuilder::new(app, "File")
         .item(&open_item)
@@ -890,28 +1104,13 @@ fn build_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
         .close_window()
         .quit()
         .build()?;
-    let edit_menu = SubmenuBuilder::new(app, "Edit")
-        .undo()
-        .redo()
-        .separator()
-        .cut()
-        .copy()
-        .paste()
-        .select_all()
+    let settings_item = MenuItemBuilder::with_id("open-settings", "Open Settings...").build(app)?;
+    let edit_menu = SubmenuBuilder::new(app, "Settings")
+        .item(&settings_item)
         .build()?;
-    let row_menu = SubmenuBuilder::new(app, "Row Height")
-        .item(&row_compact)
-        .item(&row_default)
-        .item(&row_spacious)
-        .build()?;
+
     let view_menu = SubmenuBuilder::with_id(app, "view", "View")
         .item(&reload_item)
-        .separator()
-        .item(&toggle_theme_item)
-        .separator()
-        .item(&row_menu)
-        .separator()
-        .item(&show_index_item)
         .build()?;
     let search_menu = SubmenuBuilder::new(app, "Search")
         .item(&find_item)
