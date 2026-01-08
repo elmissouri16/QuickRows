@@ -164,7 +164,7 @@ async fn get_csv_chunk(
 
 #[tauri::command]
 async fn search_csv(
-    column_idx: usize,
+    column_idx: Option<usize>,
     query: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<usize>, String> {
@@ -228,8 +228,17 @@ async fn search_csv(
             .from_reader(&mmap[..]);
         for (idx, result) in rdr.records().enumerate() {
             let record = result.map_err(|err| err.to_string())?;
-            let cell = record.get(column_idx).unwrap_or("");
-            if cell.to_lowercase().contains(&query_lower) {
+            let is_match = match column_idx {
+                Some(index) => record
+                    .get(index)
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains(&query_lower),
+                None => record
+                    .iter()
+                    .any(|cell| cell.to_lowercase().contains(&query_lower)),
+            };
+            if is_match {
                 matches.push(idx);
             }
         }
@@ -241,8 +250,17 @@ async fn search_csv(
             .from_reader(reader);
         for (idx, result) in rdr.records().enumerate() {
             let record = result.map_err(|err| err.to_string())?;
-            let cell = record.get(column_idx).unwrap_or("");
-            if cell.to_lowercase().contains(&query_lower) {
+            let is_match = match column_idx {
+                Some(index) => record
+                    .get(index)
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains(&query_lower),
+                None => record
+                    .iter()
+                    .any(|cell| cell.to_lowercase().contains(&query_lower)),
+            };
+            if is_match {
                 matches.push(idx);
             }
         }

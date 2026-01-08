@@ -25,6 +25,12 @@ type SortState = { column: number; direction: SortDirection };
 type SortedRow = { index: number; row: string[] };
 type ThemeMode = "light" | "dark";
 type ThemePreference = ThemeMode | "system";
+type ContextMenuState = {
+  x: number;
+  y: number;
+  cellText: string | null;
+  rowText: string;
+};
 
 const clampColumnWidth = (value: number) => Math.max(COLUMN_WIDTH_MIN, value);
 const getSystemTheme = (): ThemeMode => {
@@ -66,6 +72,38 @@ const setWindowTitle = (path: string | null) => {
     .setTitle(title)
     .catch(() => {});
 };
+const formatCsvCell = (value: string) => {
+  if (!/[",\n\r]/.test(value)) {
+    return value;
+  }
+  return `"${value.replace(/"/g, '""')}"`;
+};
+const formatCsvRow = (row: string[]) =>
+  row.map((cell) => formatCsvCell(cell)).join(",");
+const copyToClipboard = async (value: string) => {
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch {
+      // Fall through to the legacy path.
+    }
+  }
+  if (typeof document === "undefined") {
+    return false;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "absolute";
+  textarea.style.left = "-9999px";
+  document.body.appendChild(textarea);
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+  const ok = document.execCommand("copy");
+  document.body.removeChild(textarea);
+  return ok;
+};
 
 function App() {
   const [filePath, setFilePath] = useState<string | null>(null);
@@ -76,7 +114,7 @@ function App() {
   const [loadingRows, setLoadingRows] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
-  const [searchColumn, setSearchColumn] = useState(0);
+  const [searchColumn, setSearchColumn] = useState<number | null>(0);
   const [searchResults, setSearchResults] = useState<number[] | null>(null);
   const [searching, setSearching] = useState(false);
   const [showFind, setShowFind] = useState(false);
@@ -105,6 +143,7 @@ function App() {
   const [resolvedTheme, setResolvedTheme] = useState<ThemeMode>(getSystemTheme);
   const [lastOpenDir, setLastOpenDir] = useState<string | null>(null);
   const [recentFiles, setRecentFiles] = useState<string[]>([]);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const dataRef = useRef<Map<number, string[]>>(new Map());
   const rowIndexMapRef = useRef<Map<number, number>>(new Map());
   const [, setDataVersion] = useState(0);
@@ -152,6 +191,12 @@ function App() {
     if (!activeResults) return null;
     return new Set(activeResults);
   }, [activeResults]);
+  const searchQueryLower = useMemo(
+    () => debouncedSearch.trim().toLowerCase(),
+    [debouncedSearch],
+  );
+  const searchHighlightActive =
+    activeHighlight === "search" && searchQueryLower.length > 0;
   const activeCurrentMatch =
     activeHighlight === "search"
       ? currentMatch
@@ -318,6 +363,7 @@ function App() {
     setCurrentDuplicateMatch(0);
     setDuplicateColumn(null);
     setActiveHighlight(null);
+    setContextMenu(null);
     dataRef.current = new Map();
     setDataVersion((prev) => prev + 1);
     setRowCountReady(false);
@@ -406,6 +452,7 @@ function App() {
     setCurrentDuplicateMatch(0);
     setDuplicateColumn(null);
     setActiveHighlight(null);
+    setContextMenu(null);
     invoke("clear_sort").catch(() => {});
   }, []);
 
@@ -934,6 +981,32 @@ function App() {
   }, [filePath, rowCountReady]);
 
   useEffect(() => {
+    if (!contextMenu) {
+      return;
+    }
+    const handleClick = () => setContextMenu(null);
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setContextMenu(null);
+      }
+    };
+    const handleScroll = () => setContextMenu(null);
+    const scrollTarget = parentRef.current;
+    window.addEventListener("click", handleClick);
+    window.addEventListener("contextmenu", handleClick);
+    window.addEventListener("keydown", handleKey);
+    window.addEventListener("resize", handleScroll);
+    scrollTarget?.addEventListener("scroll", handleScroll);
+    return () => {
+      window.removeEventListener("click", handleClick);
+      window.removeEventListener("contextmenu", handleClick);
+      window.removeEventListener("keydown", handleKey);
+      window.removeEventListener("resize", handleScroll);
+      scrollTarget?.removeEventListener("scroll", handleScroll);
+    };
+  }, [contextMenu]);
+
+  useEffect(() => {
     const handleKeydown = (event: KeyboardEvent) => {
       if (!event.ctrlKey && !event.metaKey) {
         return;
@@ -988,6 +1061,8 @@ function App() {
   }, [totalRows]);
   const duplicateSelectionValue =
     duplicateColumn === null ? "row" : String(duplicateColumn);
+  const searchSelectionValue =
+    searchColumn === null ? "row" : String(searchColumn);
 
   const handleResizeStart = useCallback(
     (event: React.MouseEvent<HTMLDivElement>, columnIndex: number) => {
@@ -1075,6 +1150,25 @@ function App() {
       return null;
     });
   };
+  const openContextMenu = useCallback(
+    (event: React.MouseEvent, cellText: string | null, rowText: string) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const menuWidth = 200;
+      const menuHeight = cellText === null ? 56 : 88;
+      const padding = 12;
+      const maxX = window.innerWidth - menuWidth - padding;
+      const maxY = window.innerHeight - menuHeight - padding;
+      const x = Math.max(padding, Math.min(event.clientX, maxX));
+      const y = Math.max(padding, Math.min(event.clientY, maxY));
+      setContextMenu({ x, y, cellText, rowText });
+    },
+    [],
+  );
+  const handleCopy = useCallback(async (value: string) => {
+    await copyToClipboard(value);
+    setContextMenu(null);
+  }, []);
 
   return (
     <main
@@ -1094,12 +1188,14 @@ function App() {
           <div className={`find-panel${showIndex ? " with-index" : ""}`}>
             <div className="find-controls">
               <select
-                value={searchColumn}
-                onChange={(event) =>
-                  setSearchColumn(Number(event.target.value))
-                }
+                value={searchSelectionValue}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  setSearchColumn(value === "row" ? null : Number(value));
+                }}
                 disabled={!headers.length || !rowCountReady}
               >
+                <option value="row">Entire row</option>
                 {headerLabels.map((header, idx) => (
                   <option value={idx} key={`${header}-${idx}`}>
                     {header}
@@ -1113,7 +1209,7 @@ function App() {
                   setSearchTerm(event.target.value);
                   setActiveHighlight("search");
                 }}
-                placeholder="Search selected column"
+                placeholder="Search column or row"
                 disabled={!filePath || !rowCountReady}
                 ref={searchInputRef}
                 onKeyDown={(event) => {
@@ -1283,9 +1379,7 @@ function App() {
                           title={path}
                         >
                           <span className="recent-name">{name}</span>
-                          <span className="recent-path">
-                            {dir ?? path}
-                          </span>
+                          <span className="recent-path">{dir ?? path}</span>
                         </button>
                       );
                     })}
@@ -1342,6 +1436,7 @@ function App() {
                     ? rowIndexMapRef.current.get(virtualRow.index)
                     : virtualRow.index;
                   const rowNumber = (originalIndex ?? virtualRow.index) + 1;
+                  const rowText = rowData ? formatCsvRow(rowData) : "";
                   const currentIndex = activeResults?.[activeCurrentMatch];
                   const isMatch =
                     originalIndex !== undefined
@@ -1363,19 +1458,46 @@ function App() {
                       }}
                     >
                       {showIndex ? (
-                        <div className="table-cell index">{rowNumber}</div>
+                        <div
+                          className="table-cell index"
+                          onContextMenu={(event) => {
+                            if (!rowData) {
+                              return;
+                            }
+                            openContextMenu(event, null, rowText);
+                          }}
+                        >
+                          {rowNumber}
+                        </div>
                       ) : null}
                       {rowData ? (
-                        rowData.map((cell, cellIdx) => (
-                          <div
-                            key={cellIdx}
-                            className="table-cell"
-                            style={columnStyles[cellIdx] ?? defaultColumnStyle}
-                            title={cell}
-                          >
-                            {cell}
-                          </div>
-                        ))
+                        rowData.map((cell, cellIdx) => {
+                          const cellValue = cell ?? "";
+                          let isCellMatch = false;
+                          if (
+                            searchHighlightActive &&
+                            (searchColumn === null || cellIdx === searchColumn)
+                          ) {
+                            isCellMatch = cellValue
+                              .toLowerCase()
+                              .includes(searchQueryLower);
+                          }
+                          return (
+                            <div
+                              key={cellIdx}
+                              className={`table-cell${isCellMatch ? " cell-match" : ""}`}
+                              style={
+                                columnStyles[cellIdx] ?? defaultColumnStyle
+                              }
+                              title={cellValue}
+                              onContextMenu={(event) =>
+                                openContextMenu(event, cellValue, rowText)
+                              }
+                            >
+                              {cellValue}
+                            </div>
+                          );
+                        })
                       ) : (
                         <div className="table-cell loading">Loading...</div>
                       )}
@@ -1390,6 +1512,37 @@ function App() {
           </div>
         )}
       </section>
+      {contextMenu ? (
+        <div
+          className="context-menu"
+          style={{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }}
+          onClick={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <button
+            type="button"
+            className="context-menu-item"
+            onClick={() => {
+              if (contextMenu.cellText === null) {
+                return;
+              }
+              void handleCopy(contextMenu.cellText);
+            }}
+            disabled={contextMenu.cellText === null}
+          >
+            Copy cell
+          </button>
+          <button
+            type="button"
+            className="context-menu-item"
+            onClick={() => {
+              void handleCopy(contextMenu.rowText);
+            }}
+          >
+            Copy row
+          </button>
+        </div>
+      ) : null}
     </main>
   );
 }

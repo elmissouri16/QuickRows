@@ -120,7 +120,7 @@ fn search_range_with_offsets_from_reader<R: Read + Seek>(
     offsets: &[u64],
     start: usize,
     end: usize,
-    column_idx: usize,
+    column_idx: Option<usize>,
     query_lower: &str,
 ) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
     if start >= offsets.len() {
@@ -138,8 +138,17 @@ fn search_range_with_offsets_from_reader<R: Read + Seek>(
         if !rdr.read_record(&mut record)? {
             break;
         }
-        let cell = record.get(column_idx).unwrap_or("");
-        if cell.to_lowercase().contains(query_lower) {
+        let is_match = match column_idx {
+            Some(index) => record
+                .get(index)
+                .unwrap_or("")
+                .to_lowercase()
+                .contains(query_lower),
+            None => record
+                .iter()
+                .any(|cell| cell.to_lowercase().contains(query_lower)),
+        };
+        if is_match {
             matches.push(row_index);
         }
     }
@@ -228,7 +237,7 @@ pub fn search_range_with_offsets(
     offsets: &[u64],
     start: usize,
     end: usize,
-    column_idx: usize,
+    column_idx: Option<usize>,
     query_lower: &str,
 ) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
@@ -242,7 +251,7 @@ pub fn search_range_with_offsets_mmap(
     offsets: &[u64],
     start: usize,
     end: usize,
-    column_idx: usize,
+    column_idx: Option<usize>,
     query_lower: &str,
 ) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
     let cursor = Cursor::new(data);

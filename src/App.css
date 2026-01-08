@@ -33,7 +33,12 @@
     --row-even: #f9f8f7;
     --row-odd: #ffffff;
     --row-hover: #ecebea;
-    --row-current: #e1dfdd;
+    --row-match: #efe0b4;
+    --row-match-outline: rgba(150, 112, 20, 0.45);
+    --row-current: #e6bd70;
+    --row-current-outline: rgba(120, 80, 10, 0.65);
+    --cell-match-bg: rgba(244, 215, 144, 0.6);
+    --cell-match-outline: rgba(120, 80, 10, 0.55);
     --row-divider: rgba(46, 52, 54, 0.08);
     --cell-divider: rgba(46, 52, 54, 0.08);
     --find-bg: #f2f1ef;
@@ -81,7 +86,12 @@
     --row-even: #252525;
     --row-odd: #222222;
     --row-hover: #2e2e2e;
-    --row-current: #333333;
+    --row-match: #3b3420;
+    --row-match-outline: rgba(255, 200, 80, 0.5);
+    --row-current: #554216;
+    --row-current-outline: rgba(255, 200, 80, 0.8);
+    --cell-match-bg: rgba(255, 200, 80, 0.2);
+    --cell-match-outline: rgba(255, 200, 80, 0.9);
     --row-divider: rgba(255, 255, 255, 0.1);
     --cell-divider: rgba(255, 255, 255, 0.1);
     --find-bg: #262626;
@@ -526,14 +536,14 @@ option {
 }
 
 .table-row.match {
-    background: var(--accent-soft);
-    outline: 1px solid var(--accent-outline);
+    background: var(--row-match);
+    outline: 1px solid var(--row-match-outline);
     outline-offset: -1px;
 }
 
 .table-row.current {
     background: var(--row-current);
-    outline: 2px solid var(--accent-outline-strong);
+    outline: 2px solid var(--row-current-outline);
     outline-offset: -2px;
 }
 
@@ -633,11 +643,49 @@ option {
     font-style: italic;
 }
 
+.table-cell.cell-match {
+    background: var(--cell-match-bg);
+    box-shadow: inset 0 0 0 1px var(--cell-match-outline);
+}
+
 .loading-strip {
     padding: 6px 12px;
     border-top: 1px solid var(--border);
     background: var(--panel-muted);
     font-size: 0.78rem;
+    color: var(--ink-muted);
+}
+
+.context-menu {
+    position: fixed;
+    z-index: 20;
+    min-width: 180px;
+    padding: 6px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.18);
+}
+
+.context-menu-item {
+    width: 100%;
+    border: none;
+    background: transparent;
+    color: var(--ink);
+    padding: 8px 10px;
+    border-radius: calc(var(--radius) - 2px);
+    text-align: left;
+    font-size: 0.82rem;
+    font-family: inherit;
+    cursor: pointer;
+}
+
+.context-menu-item:hover:not(:disabled) {
+    background: var(--panel-muted);
+}
+
+.context-menu-item:disabled {
+    cursor: not-allowed;
     color: var(--ink-muted);
 }
 
