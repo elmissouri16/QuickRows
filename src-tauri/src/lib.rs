@@ -4,9 +4,13 @@ mod csv_mmap;
 mod disk_cache;
 use csv_cache::CsvCache;
 use csv_handler::{
-    build_row_offsets, build_row_offsets_mmap, get_headers, read_chunk, read_chunk_mmap,
-    read_chunk_with_offsets, read_chunk_with_offsets_mmap, read_rows_by_index,
+    apply_parse_overrides, build_reader, build_row_offsets, build_row_offsets_mmap,
+    default_parse_settings, detect_parse_settings, decode_record, get_headers,
+    parse_info_from_settings, read_chunk, read_chunk_mmap, read_chunk_with_offsets,
+    read_chunk_with_offsets_mmap, read_rows_by_index,
     read_rows_by_index_mmap, search_range_with_offsets, search_range_with_offsets_mmap,
+    settings_cache_hash, ParseInfo, ParseOverrides, ParseSettings, ParseWarning,
+    MAX_WARNING_COUNT,
 };
 use csv_mmap::open_mmap_if_large;
 use disk_cache::{
@@ -28,6 +32,15 @@ struct SortedRow {
     row: Vec<String>,
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CsvMetadata {
+    pub headers: Vec<String>,
+    pub detected: ParseInfo,
+    pub effective: ParseInfo,
+    pub warnings: Vec<ParseWarning>,
+    pub estimated_count: Option<usize>,
+}
+
 struct AppState {
     file_path: Mutex<Option<String>>,
     total_rows: Mutex<usize>,
@@ -37,9 +50,14 @@ struct AppState {
     pending_open: Mutex<Option<String>>,
     row_offsets: Mutex<Option<Vec<u64>>>,
     mmap: Mutex<Option<Arc<Mmap>>>,
+    parse_settings: Mutex<ParseSettings>,
+    parse_info_detected: Mutex<ParseInfo>,
+    parse_info_effective: Mutex<ParseInfo>,
+    parse_warnings: Mutex<Vec<ParseWarning>>,
 }
 
 const SEARCH_CHUNK_SIZE: usize = 25_000;
+const BULK_CHUNK_SIZE: usize = 10_000;
 
 fn initial_open_path() -> Option<String> {
     std::env::args_os().skip(1).find_map(|arg| {
@@ -56,10 +74,18 @@ fn initial_open_path() -> Option<String> {
 #[tauri::command]
 async fn load_csv_metadata(
     path: String,
+    overrides: Option<ParseOverrides>,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
-) -> Result<Vec<String>, String> {
-    let headers = get_headers(&path).map_err(|err| err.to_string())?;
+) -> Result<CsvMetadata, String> {
+    let detected = detect_parse_settings(&path).map_err(|err| err.to_string())?;
+    let settings = apply_parse_overrides(&detected, overrides);
+    let detected_settings = apply_parse_overrides(&detected, None);
+    let detected_info = parse_info_from_settings(&detected_settings);
+    let effective_info = parse_info_from_settings(&settings);
+
+    let mut warnings = Vec::new();
+    let headers = get_headers(&path, &settings, &mut warnings).map_err(|err| err.to_string())?;
 
     *state.file_path.lock().unwrap() = Some(path.clone());
     *state.total_rows.lock().unwrap() = 0;
@@ -67,7 +93,41 @@ async fn load_csv_metadata(
     *state.sorted_order.lock().unwrap() = None;
     *state.row_offsets.lock().unwrap() = None;
     *state.mmap.lock().unwrap() = None;
+    *state.parse_settings.lock().unwrap() = settings.clone();
+    *state.parse_info_detected.lock().unwrap() = detected_info.clone();
+    *state.parse_info_effective.lock().unwrap() = effective_info.clone();
+    *state.parse_warnings.lock().unwrap() = warnings.clone();
     state.cache.clear();
+
+    let expected_columns = if headers.is_empty() {
+        None
+    } else {
+        Some(headers.len())
+    };
+
+    let mut estimated_count = None;
+    if let Ok(file) = std::fs::File::open(&path) {
+        if let Ok(meta) = file.metadata() {
+            let len = meta.len();
+            if len > 0 {
+                use std::io::Read;
+                let mut sample = vec![0u8; 64 * 1024];
+                let mut take = file.take(sample.len() as u64);
+                if let Ok(read) = take.read(&mut sample) {
+                    if read > 0 {
+                         let sample_slice = &sample[..read];
+                         let newlines = sample_slice.iter().filter(|&&b| b == b'\n').count();
+                         if newlines > 0 {
+                             let avg_len = read as f64 / newlines as f64;
+                             if avg_len > 0.0 {
+                                 estimated_count = Some((len as f64 / avg_len) as usize);
+                             }
+                         }
+                    }
+                }
+            }
+        }
+    }
 
     tauri::async_runtime::spawn_blocking(move || {
         let cache_dir = match ensure_cache_dir(&app) {
@@ -76,7 +136,8 @@ async fn load_csv_metadata(
         };
         prune_cache_dir(&cache_dir);
 
-        let key = match cache_key(&path) {
+        let settings_hash = settings_cache_hash(&settings);
+        let key = match cache_key(&path, Some(settings_hash)) {
             Ok(key) => key,
             Err(_) => return,
         };
@@ -87,15 +148,36 @@ async fn load_csv_metadata(
             Err(_) => None,
         };
 
+        let mut offset_warnings = Vec::new();
+        let app_for_cb = app.clone();
+        let progress_cb = move |rows: usize| {
+            let _ = app_for_cb.emit("parse-progress", rows);
+        };
+
         let offsets = match read_offsets_cache(&cache_path, key) {
-            Ok(Some(offsets)) => offsets,
+            Ok(Some(offsets)) => {
+                let _ = app.emit("parse-progress", offsets.len());
+                offsets
+            }
             _ => {
                 let offsets = match mmap.as_deref() {
-                    Some(mmap) => match build_row_offsets_mmap(&mmap[..]) {
+                    Some(mmap) => match build_row_offsets_mmap(
+                        &mmap[..],
+                        &settings,
+                        expected_columns,
+                        &mut offset_warnings,
+                        Some(&progress_cb),
+                    ) {
                         Ok(offsets) => offsets,
                         Err(_) => return,
                     },
-                    None => match build_row_offsets(&path) {
+                    None => match build_row_offsets(
+                        &path,
+                        &settings,
+                        expected_columns,
+                        &mut offset_warnings,
+                        Some(&progress_cb),
+                    ) {
                         Ok(offsets) => offsets,
                         Err(_) => return,
                     },
@@ -111,13 +193,26 @@ async fn load_csv_metadata(
         if current_path.as_deref() != Some(path.as_str()) {
             return;
         }
+        if !offset_warnings.is_empty() {
+            let mut warnings = state.parse_warnings.lock().unwrap();
+            warnings.extend(offset_warnings);
+            warnings.truncate(MAX_WARNING_COUNT);
+        }
         *state.row_offsets.lock().unwrap() = Some(offsets);
         *state.total_rows.lock().unwrap() = count;
         *state.mmap.lock().unwrap() = mmap;
         let _ = app.emit("row-count", count);
     });
 
-    Ok(headers)
+
+
+    Ok(CsvMetadata {
+        headers,
+        detected: detected_info,
+        effective: effective_info,
+        warnings,
+        estimated_count,
+    })
 }
 
 #[tauri::command]
@@ -136,27 +231,70 @@ async fn get_csv_chunk(
         .unwrap()
         .clone()
         .ok_or("No file loaded")?;
+    let settings = state.parse_settings.lock().unwrap().clone();
+    let expected_columns = {
+        let len = state.headers.lock().unwrap().len();
+        if len == 0 { None } else { Some(len) }
+    };
+    let mut warnings = Vec::new();
 
     let mmap = state.mmap.lock().unwrap().clone();
     let offsets_guard = state.row_offsets.lock().unwrap();
     let data = match offsets_guard.as_ref() {
         Some(offsets) => {
             if let Some(mmap) = mmap.as_ref() {
-                read_chunk_with_offsets_mmap(&mmap[..], offsets, start, count)
-                    .map_err(|err| err.to_string())?
+                read_chunk_with_offsets_mmap(
+                    &mmap[..],
+                    offsets,
+                    start,
+                    count,
+                    &settings,
+                    expected_columns,
+                    &mut warnings,
+                )
+                .map_err(|err| err.to_string())?
             } else {
-                read_chunk_with_offsets(&path, offsets, start, count)
+                read_chunk_with_offsets(
+                    &path,
+                    offsets,
+                    start,
+                    count,
+                    &settings,
+                    expected_columns,
+                    &mut warnings,
+                )
                     .map_err(|err| err.to_string())?
             }
         }
         None => {
             if let Some(mmap) = mmap.as_ref() {
-                read_chunk_mmap(&mmap[..], start, count).map_err(|err| err.to_string())?
+                read_chunk_mmap(
+                    &mmap[..],
+                    start,
+                    count,
+                    &settings,
+                    expected_columns,
+                    &mut warnings,
+                )
+                .map_err(|err| err.to_string())?
             } else {
-                read_chunk(&path, start, count).map_err(|err| err.to_string())?
+                read_chunk(
+                    &path,
+                    start,
+                    count,
+                    &settings,
+                    expected_columns,
+                    &mut warnings,
+                )
+                .map_err(|err| err.to_string())?
             }
         }
     };
+    if !warnings.is_empty() {
+        let mut stored = state.parse_warnings.lock().unwrap();
+        stored.extend(warnings);
+        stored.truncate(MAX_WARNING_COUNT);
+    }
     state.cache.put(start, count, data.clone());
 
     Ok(data)
@@ -166,6 +304,8 @@ async fn get_csv_chunk(
 async fn search_csv(
     column_idx: Option<usize>,
     query: String,
+    match_case: Option<bool>,
+    whole_word: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<Vec<usize>, String> {
     let path = state
@@ -174,7 +314,17 @@ async fn search_csv(
         .unwrap()
         .clone()
         .ok_or("No file loaded")?;
-    let query_lower = query.to_lowercase();
+    
+    let match_case = match_case.unwrap_or(false);
+    let whole_word = whole_word.unwrap_or(false);
+    
+    let query_processed = if match_case {
+        query.clone()
+    } else {
+        query.to_lowercase()
+    };
+    
+    let settings = state.parse_settings.lock().unwrap().clone();
 
     let mmap = state.mmap.lock().unwrap().clone();
     let offsets_guard = state.row_offsets.lock().unwrap();
@@ -195,7 +345,10 @@ async fn search_csv(
                         *start,
                         *end,
                         column_idx,
-                        &query_lower,
+                        &query_processed,
+                        match_case,
+                        whole_word,
+                        &settings,
                     )
                 } else {
                     search_range_with_offsets(
@@ -204,7 +357,10 @@ async fn search_csv(
                         *start,
                         *end,
                         column_idx,
-                        &query_lower,
+                        &query_processed,
+                        match_case,
+                        whole_word,
+                        &settings,
                     )
                 }
                 .map_err(|err| err.to_string())?;
@@ -222,47 +378,72 @@ async fn search_csv(
     drop(offsets_guard);
 
     let mut matches = Vec::new();
+    let mut record = csv::ByteRecord::new();
+    let mut idx: usize = 0;
+    
+    // Helper closure for matching logic
+    let check_match = |cell: &str| -> bool {
+         if !match_case {
+             let val_lower = cell.to_lowercase();
+             if whole_word {
+                 val_lower == query_processed
+             } else {
+                 val_lower.contains(&query_processed)
+             }
+         } else {
+             if whole_word {
+                  cell == query_processed
+             } else {
+                  cell.contains(&query_processed)
+             }
+         }
+    };
+
     if let Some(mmap) = mmap.as_ref() {
-        let mut rdr = csv::ReaderBuilder::new()
-            .has_headers(true)
-            .from_reader(&mmap[..]);
-        for (idx, result) in rdr.records().enumerate() {
-            let record = result.map_err(|err| err.to_string())?;
+        let mut rdr = build_reader(&mmap[..], &settings, settings.has_headers);
+        while rdr
+            .read_byte_record(&mut record)
+            .map_err(|err| err.to_string())?
+        {
+            let strip_bom = !settings.has_headers && idx == 0;
+            let (decoded, _) = decode_record(&record, &settings, strip_bom);
             let is_match = match column_idx {
-                Some(index) => record
+                Some(index) => decoded
                     .get(index)
-                    .unwrap_or("")
-                    .to_lowercase()
-                    .contains(&query_lower),
-                None => record
+                    .map(|cell| check_match(cell))
+                    .unwrap_or(false),
+                None => decoded
                     .iter()
-                    .any(|cell| cell.to_lowercase().contains(&query_lower)),
+                    .any(|cell| check_match(cell)),
             };
             if is_match {
                 matches.push(idx);
             }
+            idx += 1;
         }
     } else {
         let file = std::fs::File::open(&path).map_err(|err| err.to_string())?;
         let reader = std::io::BufReader::new(file);
-        let mut rdr = csv::ReaderBuilder::new()
-            .has_headers(true)
-            .from_reader(reader);
-        for (idx, result) in rdr.records().enumerate() {
-            let record = result.map_err(|err| err.to_string())?;
+        let mut rdr = build_reader(reader, &settings, settings.has_headers);
+        while rdr
+            .read_byte_record(&mut record)
+            .map_err(|err| err.to_string())?
+        {
+            let strip_bom = !settings.has_headers && idx == 0;
+            let (decoded, _) = decode_record(&record, &settings, strip_bom);
             let is_match = match column_idx {
-                Some(index) => record
+                Some(index) => decoded
                     .get(index)
-                    .unwrap_or("")
-                    .to_lowercase()
-                    .contains(&query_lower),
-                None => record
+                    .map(|cell| check_match(cell))
+                    .unwrap_or(false),
+                None => decoded
                     .iter()
-                    .any(|cell| cell.to_lowercase().contains(&query_lower)),
+                    .any(|cell| check_match(cell)),
             };
             if is_match {
                 matches.push(idx);
             }
+            idx += 1;
         }
     }
 
@@ -280,56 +461,104 @@ async fn find_duplicates(
         .unwrap()
         .clone()
         .ok_or("No file loaded")?;
+    let settings = state.parse_settings.lock().unwrap().clone();
 
     let mmap = state.mmap.lock().unwrap().clone();
+    let offsets = state.row_offsets.lock().unwrap().clone();
+    let expected_columns = {
+        let len = state.headers.lock().unwrap().len();
+        if len == 0 { None } else { Some(len) }
+    };
+    let mut warnings = Vec::new();
     let mut seen: HashMap<String, usize> = HashMap::new();
     let mut duplicates: Vec<usize> = Vec::new();
     let mut duplicate_set: HashSet<usize> = HashSet::new();
+    let mut start = 0usize;
 
-    if let Some(mmap) = mmap.as_ref() {
-        let mut rdr = csv::ReaderBuilder::new()
-            .has_headers(true)
-            .from_reader(&mmap[..]);
-        for (idx, result) in rdr.records().enumerate() {
-            let record = result.map_err(|err| err.to_string())?;
+    loop {
+        let rows = match offsets.as_ref() {
+            Some(offsets) => {
+                if let Some(mmap) = mmap.as_ref() {
+                    read_chunk_with_offsets_mmap(
+                        &mmap[..],
+                        offsets,
+                        start,
+                        BULK_CHUNK_SIZE,
+                        &settings,
+                        expected_columns,
+                        &mut warnings,
+                    )
+                    .map_err(|err| err.to_string())?
+                } else {
+                    read_chunk_with_offsets(
+                        &path,
+                        offsets,
+                        start,
+                        BULK_CHUNK_SIZE,
+                        &settings,
+                        expected_columns,
+                        &mut warnings,
+                    )
+                    .map_err(|err| err.to_string())?
+                }
+            }
+            None => {
+                if let Some(mmap) = mmap.as_ref() {
+                    read_chunk_mmap(
+                        &mmap[..],
+                        start,
+                        BULK_CHUNK_SIZE,
+                        &settings,
+                        expected_columns,
+                        &mut warnings,
+                    )
+                    .map_err(|err| err.to_string())?
+                } else {
+                    read_chunk(
+                        &path,
+                        start,
+                        BULK_CHUNK_SIZE,
+                        &settings,
+                        expected_columns,
+                        &mut warnings,
+                    )
+                    .map_err(|err| err.to_string())?
+                }
+            }
+        };
+
+        if rows.is_empty() {
+            break;
+        }
+
+        for (idx, row) in rows.iter().enumerate() {
+            let row_index = start + idx;
             let key = match column_idx {
-                Some(index) => record.get(index).unwrap_or("").to_string(),
-                None => record.iter().collect::<Vec<_>>().join("\u{1f}"),
+                Some(index) => row.get(index).cloned().unwrap_or_default(),
+                None => row.join("\u{1f}"),
             };
             if let Some(first_idx) = seen.get(&key).copied() {
                 if duplicate_set.insert(first_idx) {
                     duplicates.push(first_idx);
                 }
-                if duplicate_set.insert(idx) {
-                    duplicates.push(idx);
+                if duplicate_set.insert(row_index) {
+                    duplicates.push(row_index);
                 }
             } else {
-                seen.insert(key, idx);
+                seen.insert(key, row_index);
             }
         }
-    } else {
-        let file = std::fs::File::open(&path).map_err(|err| err.to_string())?;
-        let reader = std::io::BufReader::new(file);
-        let mut rdr = csv::ReaderBuilder::new()
-            .has_headers(true)
-            .from_reader(reader);
-        for (idx, result) in rdr.records().enumerate() {
-            let record = result.map_err(|err| err.to_string())?;
-            let key = match column_idx {
-                Some(index) => record.get(index).unwrap_or("").to_string(),
-                None => record.iter().collect::<Vec<_>>().join("\u{1f}"),
-            };
-            if let Some(first_idx) = seen.get(&key).copied() {
-                if duplicate_set.insert(first_idx) {
-                    duplicates.push(first_idx);
-                }
-                if duplicate_set.insert(idx) {
-                    duplicates.push(idx);
-                }
-            } else {
-                seen.insert(key, idx);
-            }
+
+        if rows.len() < BULK_CHUNK_SIZE {
+            break;
         }
+        start += rows.len();
+    }
+
+    if !warnings.is_empty() {
+        let mut stored = state.parse_warnings.lock().unwrap();
+        stored.extend(warnings);
+        stored.truncate(MAX_WARNING_COUNT);
     }
 
     duplicates.sort_unstable();
@@ -349,9 +578,11 @@ async fn sort_csv(
         .unwrap()
         .clone()
         .ok_or("No file loaded")?;
+    let settings = state.parse_settings.lock().unwrap().clone();
 
     let cache_dir = ensure_cache_dir(&app)?;
-    let key = cache_key(&path)?;
+    let settings_hash = settings_cache_hash(&settings);
+    let key = cache_key(&path, Some(settings_hash))?;
     let order_path = order_cache_path(&cache_dir, key, column_idx, ascending);
     if let Ok(Some(order)) = read_order_cache(&order_path, key, column_idx, ascending) {
         *state.sorted_order.lock().unwrap() = Some(order.clone());
@@ -367,28 +598,87 @@ async fn sort_csv(
     }
 
     let mmap = state.mmap.lock().unwrap().clone();
+    let offsets = state.row_offsets.lock().unwrap().clone();
+    let expected_columns = {
+        let len = state.headers.lock().unwrap().len();
+        if len == 0 { None } else { Some(len) }
+    };
+    let mut warnings = Vec::new();
     let mut rows: Vec<(usize, String)> = Vec::new();
+    let mut start = 0usize;
 
-    if let Some(mmap) = mmap.as_ref() {
-        let mut rdr = csv::ReaderBuilder::new()
-            .has_headers(true)
-            .from_reader(&mmap[..]);
-        for (idx, result) in rdr.records().enumerate() {
-            let record = result.map_err(|err| err.to_string())?;
-            let value = record.get(column_idx).unwrap_or("").to_string();
-            rows.push((idx, value));
+    loop {
+        let chunk = match offsets.as_ref() {
+            Some(offsets) => {
+                if let Some(mmap) = mmap.as_ref() {
+                    read_chunk_with_offsets_mmap(
+                        &mmap[..],
+                        offsets,
+                        start,
+                        BULK_CHUNK_SIZE,
+                        &settings,
+                        expected_columns,
+                        &mut warnings,
+                    )
+                    .map_err(|err| err.to_string())?
+                } else {
+                    read_chunk_with_offsets(
+                        &path,
+                        offsets,
+                        start,
+                        BULK_CHUNK_SIZE,
+                        &settings,
+                        expected_columns,
+                        &mut warnings,
+                    )
+                    .map_err(|err| err.to_string())?
+                }
+            }
+            None => {
+                if let Some(mmap) = mmap.as_ref() {
+                    read_chunk_mmap(
+                        &mmap[..],
+                        start,
+                        BULK_CHUNK_SIZE,
+                        &settings,
+                        expected_columns,
+                        &mut warnings,
+                    )
+                    .map_err(|err| err.to_string())?
+                } else {
+                    read_chunk(
+                        &path,
+                        start,
+                        BULK_CHUNK_SIZE,
+                        &settings,
+                        expected_columns,
+                        &mut warnings,
+                    )
+                    .map_err(|err| err.to_string())?
+                }
+            }
+        };
+
+        if chunk.is_empty() {
+            break;
         }
-    } else {
-        let file = std::fs::File::open(&path).map_err(|err| err.to_string())?;
-        let reader = std::io::BufReader::new(file);
-        let mut rdr = csv::ReaderBuilder::new()
-            .has_headers(true)
-            .from_reader(reader);
-        for (idx, result) in rdr.records().enumerate() {
-            let record = result.map_err(|err| err.to_string())?;
-            let value = record.get(column_idx).unwrap_or("").to_string();
-            rows.push((idx, value));
+
+        for (idx, row) in chunk.iter().enumerate() {
+            let row_index = start + idx;
+            let value = row.get(column_idx).cloned().unwrap_or_default();
+            rows.push((row_index, value));
         }
+
+        if chunk.len() < BULK_CHUNK_SIZE {
+            break;
+        }
+        start += chunk.len();
+    }
+
+    if !warnings.is_empty() {
+        let mut stored = state.parse_warnings.lock().unwrap();
+        stored.extend(warnings);
+        stored.truncate(MAX_WARNING_COUNT);
     }
 
     if ascending {
@@ -423,14 +713,41 @@ async fn get_sorted_chunk(
         .unwrap()
         .clone()
         .ok_or("No file loaded")?;
+    let settings = state.parse_settings.lock().unwrap().clone();
+    let expected_columns = {
+        let len = state.headers.lock().unwrap().len();
+        if len == 0 { None } else { Some(len) }
+    };
+    let mut warnings = Vec::new();
     let mmap = state.mmap.lock().unwrap().clone();
     let offsets_guard = state.row_offsets.lock().unwrap();
     let offsets = offsets_guard.as_ref().ok_or("Row index not ready")?;
     let rows = if let Some(mmap) = mmap.as_ref() {
-        read_rows_by_index_mmap(&mmap[..], offsets, slice).map_err(|err| err.to_string())?
+        read_rows_by_index_mmap(
+            &mmap[..],
+            offsets,
+            slice,
+            &settings,
+            expected_columns,
+            &mut warnings,
+        )
+        .map_err(|err| err.to_string())?
     } else {
-        read_rows_by_index(&path, offsets, slice).map_err(|err| err.to_string())?
+        read_rows_by_index(
+            &path,
+            offsets,
+            slice,
+            &settings,
+            expected_columns,
+            &mut warnings,
+        )
+        .map_err(|err| err.to_string())?
     };
+    if !warnings.is_empty() {
+        let mut stored = state.parse_warnings.lock().unwrap();
+        stored.extend(warnings);
+        stored.truncate(MAX_WARNING_COUNT);
+    }
     let sorted_rows = slice
         .iter()
         .zip(rows.into_iter())
@@ -456,6 +773,19 @@ async fn get_row_count(state: State<'_, AppState>) -> Result<usize, String> {
 }
 
 #[tauri::command]
+async fn get_parse_warnings(
+    clear: bool,
+    state: State<'_, AppState>,
+) -> Result<Vec<ParseWarning>, String> {
+    let mut warnings = state.parse_warnings.lock().unwrap();
+    let output = warnings.clone();
+    if clear {
+        warnings.clear();
+    }
+    Ok(output)
+}
+
+#[tauri::command]
 async fn set_show_index_checked(checked: bool, app: tauri::AppHandle) -> Result<(), String> {
     if let Some(menu) = app.menu() {
         if let Some(item) = menu.get("view") {
@@ -473,6 +803,8 @@ async fn set_show_index_checked(checked: bool, app: tauri::AppHandle) -> Result<
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let default_settings = default_parse_settings();
+    let default_info = parse_info_from_settings(&default_settings);
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -485,6 +817,10 @@ pub fn run() {
             pending_open: Mutex::new(initial_open_path()),
             row_offsets: Mutex::new(None),
             mmap: Mutex::new(None),
+            parse_settings: Mutex::new(default_settings),
+            parse_info_detected: Mutex::new(default_info.clone()),
+            parse_info_effective: Mutex::new(default_info),
+            parse_warnings: Mutex::new(Vec::new()),
         })
         .invoke_handler(tauri::generate_handler![
             load_csv_metadata,
@@ -496,6 +832,7 @@ pub fn run() {
             clear_sort,
             take_pending_open,
             get_row_count,
+            get_parse_warnings,
             set_show_index_checked
         ]);
 
@@ -529,6 +866,9 @@ pub fn run() {
             }
             "toggle-theme" => {
                 let _ = app.emit("menu-toggle-theme", ());
+            }
+            "parse-settings" => {
+                let _ = app.emit("menu-parse-settings", ());
             }
             "show-index" => {
                 if let Some(menu) = app.menu() {
@@ -591,6 +931,8 @@ fn build_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
     let toggle_theme_item = MenuItemBuilder::with_id("toggle-theme", "Toggle Theme").build(app)?;
     let check_duplicates_item =
         MenuItemBuilder::with_id("check-duplicates", "Check Duplicates...").build(app)?;
+    let parse_settings_item =
+        MenuItemBuilder::with_id("parse-settings", "Parse Settings...").build(app)?;
     let show_index_item = CheckMenuItem::with_id(
         app,
         "show-index",
@@ -643,6 +985,7 @@ fn build_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
         .build()?;
     let tools_menu = SubmenuBuilder::new(app, "Tools")
         .item(&check_duplicates_item)
+        .item(&parse_settings_item)
         .build()?;
     let shortcuts_open = MenuItemBuilder::new("Open File")
         .accelerator("CmdOrCtrl+O")

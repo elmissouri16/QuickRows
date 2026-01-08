@@ -19,6 +19,7 @@ const COLUMN_WIDTH_MIN = 120;
 const SETTINGS_KEY = "csv-viewer.settings";
 const MAX_RECENT_FILES = 6;
 const ROW_HEIGHT_OPTIONS = new Set([28, 36, 44]);
+const MAX_PARSE_WARNINGS = 200;
 
 type SortDirection = "asc" | "desc";
 type SortState = { column: number; direction: SortDirection };
@@ -30,6 +31,59 @@ type ContextMenuState = {
   y: number;
   cellText: string | null;
   rowText: string;
+};
+type ParseInfo = {
+  delimiter: string;
+  quote: string;
+  escape: string | null;
+  line_ending: string;
+  encoding: string;
+  has_headers: boolean;
+  malformed: string;
+  max_field_size: number;
+  max_record_size: number;
+};
+type ParseWarning = {
+  record?: number;
+  line?: number;
+  byte?: number;
+  field?: number;
+  kind: string;
+  message: string;
+  expected_len?: number;
+  len?: number;
+};
+type CsvMetadata = {
+  headers: string[];
+  detected: ParseInfo;
+  effective: ParseInfo;
+  warnings: ParseWarning[];
+  estimated_count?: number;
+};
+type ParseOverridesState = {
+  delimiter:
+  | "auto"
+  | "comma"
+  | "tab"
+  | "semicolon"
+  | "pipe"
+  | "space"
+  | "custom";
+  delimiterCustom: string;
+  quote: "auto" | "double" | "single";
+  escape: "auto" | "none" | "backslash";
+  lineEnding: "auto" | "lf" | "crlf" | "cr";
+  encoding:
+  | "auto"
+  | "utf-8"
+  | "windows-1252"
+  | "iso-8859-1"
+  | "utf-16le"
+  | "utf-16be";
+  hasHeaders: "auto" | "yes" | "no";
+  malformed: "strict" | "skip" | "repair";
+  maxFieldSize: number;
+  maxRecordSize: number;
 };
 
 const clampColumnWidth = (value: number) => Math.max(COLUMN_WIDTH_MIN, value);
@@ -70,7 +124,7 @@ const setWindowTitle = (path: string | null) => {
   const title = name ? `${name} - ${BASE_TITLE}` : BASE_TITLE;
   getCurrentWindow()
     .setTitle(title)
-    .catch(() => {});
+    .catch(() => { });
 };
 const formatCsvCell = (value: string) => {
   if (!/[",\n\r]/.test(value)) {
@@ -80,6 +134,14 @@ const formatCsvCell = (value: string) => {
 };
 const formatCsvRow = (row: string[]) =>
   row.map((cell) => formatCsvCell(cell)).join(",");
+const formatDelimiterLabel = (value: string) => {
+  if (value === "\t") return "Tab";
+  if (value === " ") return "Space";
+  if (value === ",") return "Comma";
+  if (value === ";") return "Semicolon";
+  if (value === "|") return "Pipe";
+  return value;
+};
 const copyToClipboard = async (value: string) => {
   if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
     try {
@@ -104,6 +166,18 @@ const copyToClipboard = async (value: string) => {
   document.body.removeChild(textarea);
   return ok;
 };
+const DEFAULT_PARSE_OVERRIDES: ParseOverridesState = {
+  delimiter: "auto",
+  delimiterCustom: ",",
+  quote: "auto",
+  escape: "auto",
+  lineEnding: "auto",
+  encoding: "auto",
+  hasHeaders: "auto",
+  malformed: "skip",
+  maxFieldSize: 256 * 1024,
+  maxRecordSize: 2 * 1024 * 1024,
+};
 
 function App() {
   const [filePath, setFilePath] = useState<string | null>(null);
@@ -114,7 +188,9 @@ function App() {
   const [loadingRows, setLoadingRows] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
-  const [searchColumn, setSearchColumn] = useState<number | null>(0);
+  const [searchColumn, setSearchColumn] = useState<number | null>(null);
+  const [searchMatchCase, setSearchMatchCase] = useState(false);
+  const [searchWholeWord, setSearchWholeWord] = useState(false);
   const [searchResults, setSearchResults] = useState<number[] | null>(null);
   const [searching, setSearching] = useState(false);
   const [showFind, setShowFind] = useState(false);
@@ -143,7 +219,16 @@ function App() {
   const [resolvedTheme, setResolvedTheme] = useState<ThemeMode>(getSystemTheme);
   const [lastOpenDir, setLastOpenDir] = useState<string | null>(null);
   const [recentFiles, setRecentFiles] = useState<string[]>([]);
+  const [parseDetected, setParseDetected] = useState<ParseInfo | null>(null);
+  const [parseEffective, setParseEffective] = useState<ParseInfo | null>(null);
+  const [parseWarnings, setParseWarnings] = useState<ParseWarning[]>([]);
+  const [showParseSettings, setShowParseSettings] = useState(false);
+  const [showHeaderPrompt, setShowHeaderPrompt] = useState(false);
+  const [parseOverrides, setParseOverrides] = useState<ParseOverridesState>(
+    DEFAULT_PARSE_OVERRIDES,
+  );
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [loadingProgress, setLoadingProgress] = useState<number | null>(null);
   const dataRef = useRef<Map<number, string[]>>(new Map());
   const rowIndexMapRef = useRef<Map<number, number>>(new Map());
   const [, setDataVersion] = useState(0);
@@ -151,6 +236,7 @@ function App() {
 
   const debouncedSearch = useDebounce(searchTerm, 450);
   const parentRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const headerRef = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const resizeRef = useRef<{
@@ -161,11 +247,41 @@ function App() {
   const resizeFrameRef = useRef<number | null>(null);
   const pendingWidthRef = useRef<number | null>(null);
 
+  useEffect(() => {
+    if (error) {
+      const timer = setTimeout(() => setError(null), 3000);
+      return () => clearTimeout(timer);
+    }
+  }, [error]);
+
+  const MAX_SCROLL_PIXELS = 15_000_000;
+  const totalSize = totalRows * rowHeight;
+  const scaleFactor = totalSize > MAX_SCROLL_PIXELS ? totalSize / MAX_SCROLL_PIXELS : 1;
+
+  const scaleFactorRef = useRef(scaleFactor);
+  scaleFactorRef.current = scaleFactor;
+
   const rowVirtualizer = useVirtualizer({
     count: totalRows,
-    getScrollElement: () => parentRef.current,
+    getScrollElement: () => scrollRef.current,
     estimateSize: () => rowHeight,
     overscan: 8,
+    observeElementOffset: (instance, cb) => {
+      const el = instance.scrollElement;
+      if (!el) {
+        return () => { };
+      }
+      const onScroll = () => {
+        cb(el.scrollTop * scaleFactorRef.current, true);
+      };
+      el.addEventListener('scroll', onScroll, { passive: true });
+      return () => {
+        el.removeEventListener('scroll', onScroll);
+      };
+    },
+    scrollToFn: (offset, _options, instance) => {
+      instance.scrollElement?.scrollTo(0, offset / scaleFactorRef.current);
+    }
   });
 
   const headerLabels = useMemo(
@@ -218,6 +334,7 @@ function App() {
         theme?: ThemePreference;
         lastOpenDir?: string;
         recentFiles?: string[];
+        parseOverrides?: Partial<ParseOverridesState>;
       };
       if (typeof parsed.showIndex === "boolean") {
         setShowIndex(parsed.showIndex);
@@ -265,6 +382,12 @@ function App() {
           setRecentFiles(nextRecent);
         }
       }
+      if (parsed.parseOverrides) {
+        setParseOverrides((prev) => ({
+          ...prev,
+          ...parsed.parseOverrides,
+        }));
+      }
     } catch {
       // Ignore malformed settings.
     }
@@ -279,6 +402,7 @@ function App() {
       theme: themePreference,
       lastOpenDir,
       recentFiles,
+      parseOverrides,
     };
     try {
       localStorage.setItem(SETTINGS_KEY, JSON.stringify(payload));
@@ -293,10 +417,11 @@ function App() {
     themePreference,
     lastOpenDir,
     recentFiles,
+    parseOverrides,
   ]);
 
   useEffect(() => {
-    invoke("set_show_index_checked", { checked: showIndex }).catch(() => {});
+    invoke("set_show_index_checked", { checked: showIndex }).catch(() => { });
   }, [showIndex]);
 
   useEffect(() => {
@@ -346,6 +471,18 @@ function App() {
     }
   }, [duplicateColumn, headers.length]);
 
+  useEffect(() => {
+    if (!filePath || !parseDetected) {
+      setShowHeaderPrompt(false);
+      return;
+    }
+    if (!parseDetected.has_headers && parseOverrides.hasHeaders === "auto") {
+      setShowHeaderPrompt(true);
+    } else {
+      setShowHeaderPrompt(false);
+    }
+  }, [filePath, parseDetected, parseOverrides.hasHeaders]);
+
   const resetForNewFile = useCallback(() => {
     setError(null);
     setSortState(null);
@@ -363,11 +500,16 @@ function App() {
     setCurrentDuplicateMatch(0);
     setDuplicateColumn(null);
     setActiveHighlight(null);
+    setParseDetected(null);
+    setParseEffective(null);
+    setParseWarnings([]);
+    setShowParseSettings(false);
+    setShowHeaderPrompt(false);
     setContextMenu(null);
     dataRef.current = new Map();
     setDataVersion((prev) => prev + 1);
     setRowCountReady(false);
-    invoke("clear_sort").catch(() => {});
+    invoke("clear_sort").catch(() => { });
   }, []);
 
   const toggleTheme = useCallback(() => {
@@ -377,22 +519,94 @@ function App() {
     });
   }, []);
 
-  const handleOpenPath = useCallback(
-    async (path: string) => {
-      resetForNewFile();
-      setFilePath(path);
-      setWindowTitle(path);
-      setHeaders([]);
-      setTotalRows(0);
-      setRowCountReady(false);
+  const buildParseOverrides = useCallback(
+    (overridesState: ParseOverridesState = parseOverrides) => {
+      const overrides: {
+        delimiter?: string;
+        quote?: string;
+        escape?: string;
+        line_ending?: string;
+        encoding?: string;
+        has_headers?: boolean;
+        malformed?: "strict" | "skip" | "repair";
+        max_field_size?: number;
+        max_record_size?: number;
+      } = {
+        malformed: overridesState.malformed,
+        max_field_size: overridesState.maxFieldSize,
+        max_record_size: overridesState.maxRecordSize,
+      };
 
+      if (overridesState.delimiter !== "auto") {
+        if (overridesState.delimiter === "custom") {
+          if (overridesState.delimiterCustom.trim().length) {
+            overrides.delimiter = overridesState.delimiterCustom;
+          }
+        } else {
+          overrides.delimiter = overridesState.delimiter;
+        }
+      }
+      if (overridesState.quote !== "auto") {
+        overrides.quote = overridesState.quote;
+      }
+      if (overridesState.escape !== "auto") {
+        overrides.escape = overridesState.escape;
+      }
+      if (overridesState.lineEnding !== "auto") {
+        overrides.line_ending = overridesState.lineEnding;
+      }
+      if (overridesState.encoding !== "auto") {
+        overrides.encoding = overridesState.encoding;
+      }
+      if (overridesState.hasHeaders !== "auto") {
+        overrides.has_headers = overridesState.hasHeaders === "yes";
+      }
+
+      return overrides;
+    },
+    [parseOverrides],
+  );
+
+  const appendParseWarnings = useCallback((next: ParseWarning[]) => {
+    if (!next.length) {
+      return;
+    }
+    setParseWarnings((prev) => {
+      const merged = [...prev, ...next];
+      if (merged.length <= MAX_PARSE_WARNINGS) {
+        return merged;
+      }
+      return merged.slice(-MAX_PARSE_WARNINGS);
+    });
+  }, []);
+
+  const refreshParseWarnings = useCallback(() => {
+    invoke<ParseWarning[]>("get_parse_warnings", { clear: true })
+      .then((next) => {
+        appendParseWarnings(next);
+      })
+      .catch(() => { });
+  }, [appendParseWarnings]);
+
+  const handleOpenPath = useCallback(
+    async (path: string, overrides?: Record<string, unknown>) => {
       try {
-        const csvHeaders = await invoke<string[]>("load_csv_metadata", {
+        const csvMetadata = await invoke<CsvMetadata>("load_csv_metadata", {
           path,
+          overrides: overrides ?? buildParseOverrides(),
         });
-        setHeaders(csvHeaders);
-        setTotalRows(CHUNK_SIZE);
-        setSearchColumn(0);
+        resetForNewFile();
+        setFilePath(path);
+        setWindowTitle(path);
+        setHeaders(csvMetadata.headers);
+        setParseDetected(csvMetadata.detected);
+        setParseEffective(csvMetadata.effective);
+        setParseWarnings(csvMetadata.warnings ?? []);
+        invoke("get_parse_warnings", { clear: true }).catch(() => { });
+        setLoadingProgress(0);
+        setTotalRows(csvMetadata.estimated_count ?? CHUNK_SIZE);
+        setRowCountReady(false);
+        setSearchColumn(null);
         const nextDir = getDirFromPath(path);
         if (nextDir) {
           setLastOpenDir(nextDir);
@@ -405,14 +619,44 @@ function App() {
         setError(
           typeof err === "string" ? err : "Unable to load CSV metadata.",
         );
-        setFilePath(null);
-        setHeaders([]);
-        setTotalRows(0);
-        setRowCountReady(false);
-        setWindowTitle(null);
+        // Do not change filePath or clear state if load failed, 
+        // effectively keeping user on previous screen or file with an error message.
       }
     },
-    [resetForNewFile],
+    [buildParseOverrides, resetForNewFile],
+  );
+
+  const removeRecent = useCallback((path: string) => {
+    setRecentFiles((prev) => prev.filter((item) => item !== path));
+  }, []);
+
+  const applyParseOverrides = useCallback(
+    (nextOverrides: ParseOverridesState) => {
+      setParseOverrides(nextOverrides);
+      if (filePath) {
+        handleOpenPath(filePath, buildParseOverrides(nextOverrides));
+      }
+    },
+    [buildParseOverrides, filePath, handleOpenPath],
+  );
+
+  const handleApplyParse = useCallback(() => {
+    if (!filePath) {
+      return;
+    }
+    handleOpenPath(filePath, buildParseOverrides());
+  }, [buildParseOverrides, filePath, handleOpenPath]);
+
+  const handleHeaderPromptChoice = useCallback(
+    (useHeaders: boolean) => {
+      const nextOverrides = {
+        ...parseOverrides,
+        hasHeaders: (useHeaders ? "yes" : "no") as ParseOverridesState["hasHeaders"],
+      };
+      setShowHeaderPrompt(false);
+      applyParseOverrides(nextOverrides);
+    },
+    [applyParseOverrides, parseOverrides],
   );
 
   const handlePickFile = useCallback(async () => {
@@ -452,8 +696,13 @@ function App() {
     setCurrentDuplicateMatch(0);
     setDuplicateColumn(null);
     setActiveHighlight(null);
+    setParseDetected(null);
+    setParseEffective(null);
+    setParseWarnings([]);
+    setShowParseSettings(false);
+    setShowHeaderPrompt(false);
     setContextMenu(null);
-    invoke("clear_sort").catch(() => {});
+    invoke("clear_sort").catch(() => { });
   }, []);
 
   useEffect(() => {
@@ -553,6 +802,7 @@ function App() {
             setTotalRows(startIndex + sortedChunk.length);
             setRowCountReady(true);
           }
+          refreshParseWarnings();
         } else {
           const rows = chunk as string[][];
           const dataMap = dataRef.current;
@@ -564,6 +814,7 @@ function App() {
             setTotalRows(startIndex + rows.length);
             setRowCountReady(true);
           }
+          refreshParseWarnings();
         }
       })
       .catch((err) => {
@@ -585,6 +836,7 @@ function App() {
     sortedIndexLookup,
     totalRows,
     virtualItems,
+    refreshParseWarnings,
   ]);
 
   useEffect(() => {
@@ -677,13 +929,15 @@ function App() {
     invoke<number[]>("search_csv", {
       columnIdx: searchColumn,
       query: debouncedSearch,
+      matchCase: searchMatchCase,
+      wholeWord: searchWholeWord,
     })
       .then((results) => setSearchResults(results))
       .catch((err) => {
         setError(typeof err === "string" ? err : "Search failed to complete.");
       })
       .finally(() => setSearching(false));
-  }, [debouncedSearch, filePath, rowCountReady, searchColumn]);
+  }, [debouncedSearch, filePath, rowCountReady, searchColumn, searchMatchCase, searchWholeWord]);
 
   const getDisplayIndex = useCallback(
     (originalIndex: number) => {
@@ -806,7 +1060,7 @@ function App() {
       setRowIndexVersion((prev) => prev + 1);
       dataRef.current = new Map();
       setDataVersion((prev) => prev + 1);
-      invoke("clear_sort").catch(() => {});
+      invoke("clear_sort").catch(() => { });
       return;
     }
 
@@ -887,9 +1141,16 @@ function App() {
         listen("menu-toggle-theme", () => {
           toggleTheme();
         }),
+        listen("menu-parse-settings", () => {
+          setShowParseSettings(true);
+        }),
         listen<number>("row-count", (event) => {
           setTotalRows(event.payload);
           setRowCountReady(true);
+          setLoadingProgress(null);
+        }),
+        listen<number>("parse-progress", (event) => {
+          setLoadingProgress(event.payload);
         }),
       ]);
 
@@ -927,7 +1188,7 @@ function App() {
           return handleOpenPath(path);
         }
       })
-      .catch(() => {})
+      .catch(() => { })
       .finally(() => {
         if (active) {
           setCheckingInitialOpen(false);
@@ -979,6 +1240,13 @@ function App() {
       }
     };
   }, [filePath, rowCountReady]);
+
+  useEffect(() => {
+    if (!filePath || !rowCountReady) {
+      return;
+    }
+    refreshParseWarnings();
+  }, [filePath, refreshParseWarnings, rowCountReady]);
 
   useEffect(() => {
     if (!contextMenu) {
@@ -1063,6 +1331,7 @@ function App() {
     duplicateColumn === null ? "row" : String(duplicateColumn);
   const searchSelectionValue =
     searchColumn === null ? "row" : String(searchColumn);
+  const parseWarningCount = parseWarnings.length;
 
   const handleResizeStart = useCallback(
     (event: React.MouseEvent<HTMLDivElement>, columnIndex: number) => {
@@ -1184,24 +1453,352 @@ function App() {
       {error ? <div className="status">{error}</div> : null}
 
       <section className={`table-shell${filePath ? "" : " is-empty"}`}>
-        {showFind && filePath ? (
-          <div className={`find-panel${showIndex ? " with-index" : ""}`}>
-            <div className="find-controls">
-              <select
-                value={searchSelectionValue}
-                onChange={(event) => {
-                  const value = event.target.value;
-                  setSearchColumn(value === "row" ? null : Number(value));
-                }}
-                disabled={!headers.length || !rowCountReady}
+        {loadingProgress !== null ? (
+          <div className="loading-banner">
+            <div className="loading-banner-icon">
+              <div className="spinner-ring" />
+            </div>
+            <div className="loading-banner-text">
+              Loading {getFileNameFromPath(filePath || "")} ({loadingProgress.toLocaleString()} rows)...
+            </div>
+            {/* Optional: Cancel button if supported */}
+          </div>
+        ) : null}
+        {filePath && parseWarningCount > 0 ? (
+          <div className={`table-toolbar${showIndex ? " with-index" : ""}`}>
+            <span className="parse-warning-pill">
+              {parseWarningCount} warning
+              {parseWarningCount === 1 ? "" : "s"}
+            </span>
+          </div>
+        ) : null}
+        {showHeaderPrompt && filePath ? (
+          <div className={`parse-banner${showIndex ? " with-index" : ""}`}>
+            <div className="parse-banner-text">
+              No header row detected. How should the first row be treated?
+            </div>
+            <div className="parse-banner-actions">
+              <button
+                className="btn subtle"
+                onClick={() => handleHeaderPromptChoice(true)}
               >
-                <option value="row">Entire row</option>
-                {headerLabels.map((header, idx) => (
-                  <option value={idx} key={`${header}-${idx}`}>
-                    {header}
-                  </option>
+                Use as headers
+              </button>
+              <button
+                className="btn subtle"
+                onClick={() => handleHeaderPromptChoice(false)}
+              >
+                Treat as data
+              </button>
+              <button
+                className="btn subtle"
+                onClick={() => setShowHeaderPrompt(false)}
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        ) : null}
+        {showParseSettings && filePath ? (
+          <div className={`parse-panel${showIndex ? " with-index" : ""}`}>
+            <div className="parse-grid">
+              <label className="parse-field">
+                <span>Delimiter</span>
+                <select
+                  value={parseOverrides.delimiter}
+                  onChange={(event) => {
+                    const value = event.target
+                      .value as ParseOverridesState["delimiter"];
+                    setParseOverrides((prev) => ({
+                      ...prev,
+                      delimiter: value,
+                    }));
+                  }}
+                >
+                  <option value="auto">Auto</option>
+                  <option value="comma">Comma</option>
+                  <option value="tab">Tab</option>
+                  <option value="semicolon">Semicolon</option>
+                  <option value="pipe">Pipe</option>
+                  <option value="space">Space</option>
+                  <option value="custom">Custom</option>
+                </select>
+                {parseOverrides.delimiter === "custom" ? (
+                  <input
+                    type="text"
+                    value={parseOverrides.delimiterCustom}
+                    onChange={(event) =>
+                      setParseOverrides((prev) => ({
+                        ...prev,
+                        delimiterCustom: event.target.value,
+                      }))
+                    }
+                    placeholder="Delimiter"
+                  />
+                ) : null}
+              </label>
+              <label className="parse-field">
+                <span>Quote</span>
+                <select
+                  value={parseOverrides.quote}
+                  onChange={(event) => {
+                    const value = event.target
+                      .value as ParseOverridesState["quote"];
+                    setParseOverrides((prev) => ({
+                      ...prev,
+                      quote: value,
+                    }));
+                  }}
+                >
+                  <option value="auto">Auto</option>
+                  <option value="double">Double</option>
+                  <option value="single">Single</option>
+                </select>
+              </label>
+              <label className="parse-field">
+                <span>Escape</span>
+                <select
+                  value={parseOverrides.escape}
+                  onChange={(event) => {
+                    const value = event.target
+                      .value as ParseOverridesState["escape"];
+                    setParseOverrides((prev) => ({
+                      ...prev,
+                      escape: value,
+                    }));
+                  }}
+                >
+                  <option value="auto">Auto</option>
+                  <option value="none">None</option>
+                  <option value="backslash">Backslash</option>
+                </select>
+              </label>
+              <label className="parse-field">
+                <span>Line ending</span>
+                <select
+                  value={parseOverrides.lineEnding}
+                  onChange={(event) => {
+                    const value = event.target
+                      .value as ParseOverridesState["lineEnding"];
+                    setParseOverrides((prev) => ({
+                      ...prev,
+                      lineEnding: value,
+                    }));
+                  }}
+                >
+                  <option value="auto">Auto</option>
+                  <option value="lf">LF</option>
+                  <option value="crlf">CRLF</option>
+                  <option value="cr">CR</option>
+                </select>
+              </label>
+              <label className="parse-field">
+                <span>Encoding</span>
+                <select
+                  value={parseOverrides.encoding}
+                  onChange={(event) => {
+                    const value = event.target
+                      .value as ParseOverridesState["encoding"];
+                    setParseOverrides((prev) => ({
+                      ...prev,
+                      encoding: value,
+                    }));
+                  }}
+                >
+                  <option value="auto">Auto</option>
+                  <option value="utf-8">UTF-8</option>
+                  <option value="windows-1252">Windows-1252</option>
+                  <option value="iso-8859-1">ISO-8859-1</option>
+                  <option value="utf-16le">UTF-16 LE</option>
+                  <option value="utf-16be">UTF-16 BE</option>
+                </select>
+              </label>
+            </div>
+            <div className="parse-grid">
+              <label className="parse-field">
+                <span>Headers</span>
+                <select
+                  value={parseOverrides.hasHeaders}
+                  onChange={(event) => {
+                    const value = event.target
+                      .value as ParseOverridesState["hasHeaders"];
+                    setParseOverrides((prev) => ({
+                      ...prev,
+                      hasHeaders: value,
+                    }));
+                    setShowHeaderPrompt(false);
+                  }}
+                >
+                  <option value="auto">Auto</option>
+                  <option value="yes">Use first row</option>
+                  <option value="no">No headers</option>
+                </select>
+              </label>
+              <label className="parse-field">
+                <span>Malformed rows</span>
+                <select
+                  value={parseOverrides.malformed}
+                  onChange={(event) => {
+                    const value = event.target
+                      .value as ParseOverridesState["malformed"];
+                    setParseOverrides((prev) => ({
+                      ...prev,
+                      malformed: value,
+                    }));
+                  }}
+                >
+                  <option value="strict">Strict</option>
+                  <option value="skip">Skip</option>
+                  <option value="repair">Repair</option>
+                </select>
+              </label>
+              <label className="parse-field">
+                <span>Max field (bytes)</span>
+                <input
+                  type="number"
+                  min={1024}
+                  value={parseOverrides.maxFieldSize}
+                  onChange={(event) => {
+                    const value = Number(event.target.value);
+                    if (!Number.isFinite(value)) {
+                      return;
+                    }
+                    setParseOverrides((prev) => ({
+                      ...prev,
+                      maxFieldSize: value,
+                    }));
+                  }}
+                />
+              </label>
+              <label className="parse-field">
+                <span>Max row (bytes)</span>
+                <input
+                  type="number"
+                  min={4096}
+                  value={parseOverrides.maxRecordSize}
+                  onChange={(event) => {
+                    const value = Number(event.target.value);
+                    if (!Number.isFinite(value)) {
+                      return;
+                    }
+                    setParseOverrides((prev) => ({
+                      ...prev,
+                      maxRecordSize: value,
+                    }));
+                  }}
+                />
+              </label>
+            </div>
+            <div className="parse-actions">
+              <div className="parse-meta">
+                {parseDetected ? (
+                  <>
+                    Detected: {formatDelimiterLabel(parseDetected.delimiter)}{" "}
+                    delimiter, {parseDetected.encoding} encoding,{" "}
+                    {parseDetected.line_ending.toUpperCase()} line ending
+                    {parseEffective ? (
+                      <>
+                        {" "}
+                        · Effective:{" "}
+                        {formatDelimiterLabel(parseEffective.delimiter)}{" "}
+                        delimiter, {parseEffective.encoding} encoding
+                      </>
+                    ) : null}
+                  </>
+                ) : (
+                  "No detection info yet."
+                )}
+              </div>
+              <div className="parse-buttons">
+                <button className="btn subtle" onClick={handleApplyParse}>
+                  Apply
+                </button>
+                <button
+                  className="btn subtle"
+                  onClick={() => applyParseOverrides(DEFAULT_PARSE_OVERRIDES)}
+                >
+                  Reset
+                </button>
+                <button
+                  className="btn subtle"
+                  onClick={() => setShowParseSettings(false)}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+            {parseWarnings.length ? (
+              <div className="parse-warnings">
+                <div className="parse-warnings-title">Latest warnings</div>
+                <div className="parse-warnings-list">
+                  {parseWarnings.slice(-12).map((warning, idx) => (
+                    <div
+                      className="parse-warning"
+                      key={`${warning.kind}-${idx}`}
+                    >
+                      <span className="parse-warning-id">
+                        Row{" "}
+                        {warning.record !== undefined
+                          ? warning.record + 1
+                          : "?"}
+                      </span>
+                      <span className="parse-warning-text">
+                        {warning.message}
+                        {warning.field !== undefined
+                          ? ` (col ${warning.field + 1})`
+                          : ""}
+                        {warning.expected_len !== undefined &&
+                          warning.len !== undefined
+                          ? ` (${warning.len}/${warning.expected_len} fields)`
+                          : ""}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                {parseWarnings.length > 12 ? (
+                  <div className="parse-warnings-meta">
+                    Showing 12 of {parseWarnings.length} warnings.
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+        {showFind && filePath ? (
+          <div className="find-widget">
+            <div className="find-scope-select-wrapper">
+              <span className="find-scope-icon">
+                {searchColumn === null ? (
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3h18v18H3zM21 9H3M21 15H3M12 3v18" /></svg>
+                ) : (
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v18" /></svg>
+                )}
+              </span>
+              <select
+                className="find-scope-select"
+                value={searchColumn === null ? "row" : String(searchColumn)}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setSearchColumn(val === "row" ? null : Number(val));
+                }}
+                title="Select search scope"
+              >
+                <option value="row">Entire Row</option>
+                {headerLabels.map((lbl, idx) => (
+                  <option key={idx} value={String(idx)}>{lbl}</option>
                 ))}
               </select>
+              <span className="find-scope-arrow">▼</span>
+            </div>
+
+            <div className="find-input-container">
+              <span className={`find-search-icon${searching ? " spinning" : ""}`}>
+                {searching ? (
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
+                ) : (
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                )}
+              </span>
               <input
                 type="text"
                 value={searchTerm}
@@ -1209,7 +1806,7 @@ function App() {
                   setSearchTerm(event.target.value);
                   setActiveHighlight("search");
                 }}
-                placeholder="Search column or row"
+                placeholder="Find"
                 disabled={!filePath || !rowCountReady}
                 ref={searchInputRef}
                 onKeyDown={(event) => {
@@ -1226,126 +1823,107 @@ function App() {
                   }
                 }}
               />
-              <button
-                className="btn subtle"
-                onClick={() => {
-                  setSearchTerm("");
-                  setSearchResults(null);
-                  setCurrentMatch(0);
-                  if (activeHighlight === "search") {
-                    setActiveHighlight(null);
-                  }
-                }}
-                disabled={!searchTerm}
-              >
-                Clear
-              </button>
-              <button
-                className="btn subtle"
-                onClick={goToPrevMatch}
-                disabled={!searchResults?.length}
-              >
-                Prev
-              </button>
-              <button
-                className="btn subtle"
-                onClick={goToNextMatch}
-                disabled={!searchResults?.length}
-              >
-                Next
-              </button>
-              <span className="find-count">
-                {searchResults?.length
-                  ? `${currentMatch + 1}/${searchResults.length}`
-                  : "0/0"}
-              </span>
-              <button className="btn subtle" onClick={() => setShowFind(false)}>
-                Close
-              </button>
+              <div className="find-input-actions">
+                <button
+                  className={`find-toggle-btn${searchMatchCase ? " active" : ""}`}
+                  onClick={() => setSearchMatchCase(prev => !prev)}
+                  title="Match Case"
+                >
+                  Aa
+                </button>
+                <button
+                  className={`find-toggle-btn${searchWholeWord ? " active" : ""}`}
+                  onClick={() => setSearchWholeWord(prev => !prev)}
+                  title="Match Whole Word"
+                >
+                  ab
+                </button>
+              </div>
             </div>
-            <div className="find-meta">
-              {searching
-                ? "Searching..."
-                : !rowCountReady && filePath
-                  ? "Counting rows..."
-                  : searchResults
-                    ? `${searchResults.length.toLocaleString()} matches`
-                    : null}
-            </div>
+
+            <span className="find-results-count">
+              {searchResults?.length
+                ? `${currentMatch + 1} of ${searchResults.length}`
+                : "No results"}
+            </span>
+
+            <button className="find-icon-btn" onClick={goToPrevMatch} disabled={!searchResults?.length} title="Previous Match">
+              ↑
+            </button>
+            <button className="find-icon-btn" onClick={goToNextMatch} disabled={!searchResults?.length} title="Next Match">
+              ↓
+            </button>
+            <button className="find-icon-btn" onClick={() => setShowFind(false)} title="Close">
+              ✕
+            </button>
           </div>
         ) : null}
         {showDuplicates && filePath ? (
-          <div className={`find-panel${showIndex ? " with-index" : ""}`}>
-            <div className="find-controls">
-              <span className="find-label">Match on</span>
+          <div className="find-widget">
+            <div className="find-scope-select-wrapper">
+              <span className="find-scope-icon">
+                {duplicateColumn === null ? (
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3h18v18H3zM21 9H3M21 15H3M12 3v18" /></svg>
+                ) : (
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v18" /></svg>
+                )}
+              </span>
               <select
-                value={duplicateSelectionValue}
-                onChange={(event) => {
-                  const value = event.target.value;
-                  setDuplicateColumn(value === "row" ? null : Number(value));
+                className="find-scope-select"
+                value={duplicateColumn === null ? "row" : String(duplicateColumn)}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setDuplicateColumn(val === "row" ? null : Number(val));
                 }}
-                disabled={!filePath}
+                title="Select duplication scope"
               >
-                <option value="row">Entire row</option>
-                {headerLabels.map((header, idx) => (
-                  <option value={idx} key={`duplicates-${header}-${idx}`}>
-                    {header}
-                  </option>
+                <option value="row">Entire Row</option>
+                {headerLabels.map((lbl, idx) => (
+                  <option key={idx} value={String(idx)}>{lbl}</option>
                 ))}
               </select>
-              <button
-                className="btn subtle"
-                onClick={handleCheckDuplicates}
-                disabled={!filePath || duplicateChecking}
-              >
-                {duplicateChecking ? "Checking..." : "Check"}
-              </button>
-              <button
-                className="btn subtle"
-                onClick={() => {
-                  setDuplicateResults(null);
-                  setCurrentDuplicateMatch(0);
-                  setActiveHighlight((prev) =>
-                    prev === "duplicates" ? null : prev,
-                  );
-                }}
-                disabled={duplicateResults === null}
-              >
-                Clear
-              </button>
-              <button
-                className="btn subtle"
-                onClick={goToPrevDuplicate}
-                disabled={!duplicateResults?.length}
-              >
-                Prev
-              </button>
-              <button
-                className="btn subtle"
-                onClick={goToNextDuplicate}
-                disabled={!duplicateResults?.length}
-              >
-                Next
-              </button>
-              <span className="find-count">
-                {duplicateResults?.length
-                  ? `${currentDuplicateMatch + 1}/${duplicateResults.length}`
-                  : "0/0"}
-              </span>
-              <button
-                className="btn subtle"
-                onClick={() => setShowDuplicates(false)}
-              >
-                Close
-              </button>
+              <span className="find-scope-arrow">▼</span>
             </div>
-            <div className="find-meta">
-              {duplicateChecking
-                ? "Checking duplicates..."
-                : duplicateResults
-                  ? `${duplicateResults.length.toLocaleString()} duplicate rows`
-                  : null}
-            </div>
+
+            <button
+              className="find-toggle-btn"
+              style={{ marginLeft: 6, height: 26, alignSelf: "center", border: "1px solid var(--border)", borderRadius: 4, padding: "0 8px" }}
+              onClick={handleCheckDuplicates}
+              disabled={!filePath || duplicateChecking}
+            >
+              {duplicateChecking ? "Checking..." : "Check"}
+            </button>
+
+            <button
+              className="find-toggle-btn"
+              style={{ marginLeft: 4, height: 26, alignSelf: "center", border: "1px solid var(--border)", borderRadius: 4, padding: "0 8px" }}
+              onClick={() => {
+                setDuplicateResults(null);
+                setCurrentDuplicateMatch(0);
+                setActiveHighlight((prev) =>
+                  prev === "duplicates" ? null : prev,
+                );
+              }}
+              disabled={duplicateResults === null}
+            >
+              Clear
+            </button>
+
+            <span className="find-results-count" style={{ flexGrow: 1, justifyContent: "flex-end" }}>
+              {duplicateResults?.length
+                ? `${currentDuplicateMatch + 1} of ${duplicateResults.length}`
+                : "No duplicates"}
+            </span>
+
+            <button className="find-icon-btn" onClick={goToPrevDuplicate} disabled={!duplicateResults?.length} title="Previous Match">
+              ↑
+            </button>
+            <button className="find-icon-btn" onClick={goToNextDuplicate} disabled={!duplicateResults?.length} title="Next Match">
+              ↓
+            </button>
+            <button className="find-icon-btn" onClick={() => setShowDuplicates(false)} title="Close">
+              ✕
+            </button>
           </div>
         ) : null}
         {!filePath ? (
@@ -1371,16 +1949,28 @@ function App() {
                       const name = getFileNameFromPath(path);
                       const dir = getDirFromPath(path);
                       return (
-                        <button
-                          key={path}
-                          type="button"
-                          className="recent-item"
-                          onClick={() => handleOpenPath(path)}
-                          title={path}
-                        >
-                          <span className="recent-name">{name}</span>
-                          <span className="recent-path">{dir ?? path}</span>
-                        </button>
+                        <div key={path} className="recent-row">
+                          <button
+                            type="button"
+                            className="recent-item"
+                            onClick={() => handleOpenPath(path)}
+                            title={path}
+                          >
+                            <span className="recent-name">{name}</span>
+                            <span className="recent-path">{dir ?? path}</span>
+                          </button>
+                          <button
+                            type="button"
+                            className="recent-remove"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              removeRecent(path);
+                            }}
+                            title="Remove from recent"
+                          >
+                            ×
+                          </button>
+                        </div>
                       );
                     })}
                   </div>
@@ -1390,7 +1980,13 @@ function App() {
           )
         ) : (
           <div className="table-wrapper">
-            <div className="table-header" ref={headerRef}>
+            <div
+              className="table-header"
+              ref={headerRef}
+              style={{
+                paddingRight: scaleFactor > 1 ? 14 : 0
+              }}
+            >
               {showIndex ? (
                 <div className="table-cell header index">#</div>
               ) : null}
@@ -1423,13 +2019,42 @@ function App() {
                 </div>
               ))}
             </div>
-            <div ref={parentRef} className="table-body">
+            <div
+              ref={parentRef}
+              className="table-body"
+              style={{ overflow: 'hidden' }}
+              onWheel={(e) => {
+                if (scrollRef.current) {
+                  scrollRef.current.scrollTop += e.deltaY / scaleFactor;
+                }
+              }}
+            >
               <div
                 className="table-spacer"
                 style={{
-                  height: `${rowVirtualizer.getTotalSize()}px`,
+                  height: '100%',
+                  position: 'relative'
                 }}
               >
+                <div
+                  ref={scrollRef}
+                  className="custom-scrollbar"
+                  style={{
+                    position: 'absolute',
+                    right: 0,
+                    top: 0,
+                    bottom: 0,
+                    width: 14,
+                    overflowX: 'hidden',
+                    overflowY: 'auto',
+                    zIndex: 10
+                  }}
+                  onScroll={(e) => {
+                    e.stopPropagation();
+                  }}
+                >
+                  <div style={{ height: totalSize / scaleFactor }}></div>
+                </div>
                 {virtualItems.map((virtualRow) => {
                   const rowData = dataRef.current.get(virtualRow.index);
                   const originalIndex = sortState
@@ -1454,7 +2079,7 @@ function App() {
                       className={`table-row${isMatch ? " match" : ""}${isCurrent ? " current" : ""}${isEven ? " even" : " odd"}`}
                       style={{
                         height: `${virtualRow.size}px`,
-                        transform: `translateY(${virtualRow.start}px)`,
+                        transform: `translateY(${virtualRow.start - (rowVirtualizer.scrollOffset ?? 0)}px)`,
                       }}
                     >
                       {showIndex ? (
@@ -1478,9 +2103,24 @@ function App() {
                             searchHighlightActive &&
                             (searchColumn === null || cellIdx === searchColumn)
                           ) {
-                            isCellMatch = cellValue
-                              .toLowerCase()
-                              .includes(searchQueryLower);
+                            if (!searchMatchCase) {
+                              const scLower = cellValue.toLowerCase();
+                              if (searchWholeWord) {
+                                isCellMatch = scLower === searchQueryLower;
+                              } else {
+                                isCellMatch = scLower.includes(searchQueryLower);
+                              }
+                            } else {
+                              // Use raw debouncedSearch without trimming? Or trimmed but raw case?
+                              // searchQueryLower was computed as trimmed lower.
+                              // I should use `debouncedSearch.trim()`.
+                              const queryRaw = debouncedSearch.trim();
+                              if (searchWholeWord) {
+                                isCellMatch = cellValue === queryRaw;
+                              } else {
+                                isCellMatch = cellValue.includes(queryRaw);
+                              }
+                            }
                           }
                           return (
                             <div

@@ -19,7 +19,7 @@ pub struct CacheKey {
     pub modified: u64,
 }
 
-pub fn cache_key(path: &str) -> Result<CacheKey, String> {
+pub fn cache_key(path: &str, settings_hash: Option<u64>) -> Result<CacheKey, String> {
     let meta = fs::metadata(path).map_err(|err| err.to_string())?;
     let len = meta.len();
     let modified = meta
@@ -33,6 +33,9 @@ pub fn cache_key(path: &str) -> Result<CacheKey, String> {
     path.hash(&mut hasher);
     len.hash(&mut hasher);
     modified.hash(&mut hasher);
+    if let Some(settings_hash) = settings_hash {
+        settings_hash.hash(&mut hasher);
+    }
     let hash = hasher.finish();
 
     Ok(CacheKey {

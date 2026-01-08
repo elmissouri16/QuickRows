@@ -170,8 +170,7 @@ option {
 .tool-bar {
     display: grid;
     grid-template-columns:
-        minmax(200px, 1fr) minmax(320px, 1.7fr)
-        minmax(240px, 1.1fr);
+        minmax(200px, 1fr) minmax(320px, 1.7fr) minmax(240px, 1.1fr);
     align-items: center;
     gap: 12px;
     padding: 6px 12px;
@@ -400,9 +399,9 @@ option {
 .status {
     padding: 8px 16px;
     font-size: 0.82rem;
-    border-bottom: 1px solid var(--border);
-    background: var(--status-bg);
-    color: var(--status-ink);
+    border-bottom: 1px solid #b71c1c;
+    background: #d32f2f;
+    color: white;
 }
 
 .table-shell {
@@ -421,6 +420,154 @@ option {
 .table-shell.is-empty {
     position: relative;
     background: var(--panel);
+}
+
+.table-toolbar {
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel-muted);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.table-toolbar.with-index {
+    padding-left: var(--index-width);
+}
+
+.parse-warning-pill {
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-size: 0.7rem;
+    background: var(--panel-strong);
+    color: var(--ink);
+    border: 1px solid var(--border);
+}
+
+.parse-banner {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--find-border);
+    background: var(--find-bg);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+}
+
+.parse-banner.with-index {
+    padding-left: var(--index-width);
+}
+
+.parse-banner-text {
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+}
+
+.parse-banner-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.parse-panel {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--find-border);
+    background: var(--find-bg);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.parse-panel.with-index .parse-grid,
+.parse-panel.with-index .parse-actions,
+.parse-panel.with-index .parse-warnings {
+    padding-left: var(--index-width);
+}
+
+.parse-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 10px;
+    align-items: end;
+}
+
+.parse-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.7rem;
+    color: var(--ink-muted);
+}
+
+.parse-field input,
+.parse-field select {
+    font-size: 0.78rem;
+}
+
+.parse-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.parse-meta {
+    font-size: 0.72rem;
+    letter-spacing: 0.02em;
+    color: var(--find-meta);
+}
+
+.parse-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.parse-warnings {
+    border-top: 1px dashed var(--border);
+    padding-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.parse-warnings-title {
+    font-size: 0.68rem;
+    letter-spacing: 0.04em;
+    color: var(--ink-muted);
+}
+
+.parse-warnings-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 160px;
+    overflow: auto;
+}
+
+.parse-warning {
+    display: flex;
+    gap: 8px;
+    font-size: 0.75rem;
+    color: var(--ink);
+}
+
+.parse-warning-id {
+    min-width: 80px;
+    font-weight: 600;
+    color: var(--ink-muted);
+}
+
+.parse-warning-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.parse-warnings-meta {
+    font-size: 0.68rem;
+    color: var(--ink-muted);
 }
 
 .find-panel {
@@ -794,25 +941,43 @@ option {
     width: 100%;
 }
 
-.recent-item {
+.recent-row {
+    display: flex;
+    align-items: center;
+    width: 100%;
     border: 1px solid var(--border);
     border-radius: var(--radius);
+    background: var(--panel);
+    transition:
+        background 0.15s ease,
+        border-color 0.15s ease;
+    overflow: hidden;
+    position: relative;
+}
+
+.recent-row:hover {
+    background: var(--panel-muted);
+    border-color: var(--accent-outline);
+}
+
+.recent-item {
+    flex: 1;
+    min-width: 0;
+    border: none;
+    border-radius: 0;
     padding: 8px 12px;
     text-align: left;
-    background: var(--panel);
+    background: transparent;
     color: var(--ink);
     cursor: pointer;
     display: flex;
     flex-direction: column;
     gap: 2px;
-    transition:
-        background 0.15s ease,
-        border-color 0.15s ease;
 }
 
 .recent-item:hover {
-    background: var(--panel-muted);
-    border-color: var(--accent-outline);
+    background: transparent;
+    border-color: transparent;
 }
 
 .recent-item:focus {
@@ -836,6 +1001,40 @@ option {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+}
+
+/* Remove .recent-row block since it is redefined above */
+
+.recent-remove {
+    appearance: none;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--radius);
+    color: var(--ink-muted);
+    font-size: 1.25rem;
+    line-height: 1;
+    padding: 0;
+    width: 32px;
+    height: 100%;
+    align-self: stretch;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    opacity: 0;
+    pointer-events: none;
+}
+
+.recent-row:hover .recent-remove {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.recent-remove:hover {
+    background: #d32f2f;
+    color: white;
+    border-color: #b71c1c;
 }
 
 @media (max-width: 1200px) {
@@ -871,4 +1070,410 @@ option {
         padding: 22px 24px;
         max-width: 320px;
     }
+}
+
+/* Loading Banner */
+.loading-banner {
+    background: #2e7d32;
+    color: white;
+    padding: 8px 16px;
+    font-size: 0.9rem;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    border-bottom: 1px solid #1b5e20;
+    flex-shrink: 0;
+}
+
+.loading-banner-icon {
+    display: flex;
+    align-items: center;
+}
+
+.spinner-ring {
+    width: 14px;
+    height: 14px;
+    border: 2px solid rgba(255, 255, 255, 0.4);
+    border-top-color: white;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+
+.loading-banner-text {
+    font-weight: 500;
+}
+
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+/* Clean Search UI - Refined */
+.find-widget {
+    position: fixed;
+    top: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    /* right: 20px; Removed */
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    background: var(--panel);
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+    font-size: 0.9rem;
+    padding: 0;
+    overflow: hidden;
+    height: 36px;
+    /* Explicit height */
+}
+
+.find-scope-select-wrapper {
+    position: relative;
+    display: flex;
+    align-items: center;
+    background: var(--bg);
+    /* Distinct background for scope selector */
+    border-right: 1px solid var(--border);
+    height: 34px;
+    /* Explicit height */
+    min-width: 130px;
+}
+
+.find-scope-select-wrapper:hover {
+    background: var(--panel-muted);
+}
+
+.find-scope-select {
+    appearance: none;
+    -webkit-appearance: none;
+    background: transparent;
+    border: none;
+    color: var(--ink);
+    font-size: 0.85rem;
+    font-weight: 500;
+    padding: 0 24px 0 28px;
+    /* Left space for icon, right for arrow */
+    cursor: pointer;
+    height: 100%;
+    width: 100%;
+    outline: none;
+}
+
+.find-scope-select option {
+    background: var(--panel);
+    color: var(--ink);
+}
+
+.find-scope-icon {
+    position: absolute;
+    left: 8px;
+    pointer-events: none;
+    display: flex;
+    align-items: center;
+    color: var(--ink-muted);
+    opacity: 0.8;
+}
+
+.find-scope-arrow {
+    position: absolute;
+    right: 8px;
+    pointer-events: none;
+    font-size: 0.6rem;
+    color: var(--ink-muted);
+    opacity: 0.8;
+}
+
+.find-input-container {
+    display: flex;
+    align-items: center;
+    flex: 1;
+    height: 34px;
+    padding: 0 8px;
+    background: var(--panel);
+}
+
+.find-input-container:focus-within {
+    /* Optional specific highlight, but main widget has border */
+}
+
+.find-input-container input {
+    border: none;
+    background: transparent;
+    outline: none;
+    padding: 0 8px;
+    width: 200px;
+    color: var(--ink);
+    font-size: 0.9rem;
+    height: 100%;
+}
+
+.find-input-actions {
+    display: flex;
+    align-items: center;
+    margin-right: 8px;
+    background: var(--bg);
+    border-radius: 4px;
+    padding: 2px;
+}
+
+.find-toggle-btn {
+    border: none;
+    background: transparent;
+    border-radius: 3px;
+    padding: 2px 6px;
+    cursor: pointer;
+    color: var(--ink-muted);
+    font-size: 0.8rem;
+    font-weight: 600;
+    line-height: 1.2;
+    transition: all 0.1s ease;
+}
+
+.find-toggle-btn:hover {
+    background: var(--panel-muted);
+    color: var(--ink);
+}
+
+.find-toggle-btn.active {
+    background: var(--accent);
+    color: #fff;
+    /* White text on active accent */
+}
+
+/* Fix dark mode contrast for active state if accent is light */
+:root[data-theme="dark"] .find-toggle-btn.active {
+    color: var(--bg);
+    background: var(--accent);
+}
+
+.find-results-count {
+    padding: 0 12px;
+    color: var(--ink-muted);
+    font-size: 0.85rem;
+    white-space: nowrap;
+    border-left: 1px solid var(--border);
+    height: 20px;
+    display: flex;
+    align-items: center;
+    line-height: 1;
+}
+
+.find-icon-btn {
+    border: none;
+    background: transparent;
+    width: 34px;
+    height: 34px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    color: var(--ink-muted);
+    font-size: 1.1rem;
+    transition: background 0.1s;
+    border-left: 1px solid transparent;
+}
+
+.find-icon-btn:hover:not(:disabled) {
+    background: var(--panel-muted);
+    color: var(--ink);
+}
+
+.find-icon-btn:disabled {
+    opacity: 0.3;
+    cursor: default;
+}
+
+/* Ensure last button (close) separates nicely */
+.find-icon-btn:last-child {
+    border-left: 1px solid var(--border);
+    color: var(--ink);
+}
+
+.find-icon-btn:last-child:hover {
+    background: #e81123;
+    color: white;
+}
+
+.find-scope-select-wrapper {
+    position: relative;
+    display: flex;
+    align-items: center;
+    background: transparent;
+    border-right: 1px solid var(--border);
+    margin-right: 4px;
+    height: 100%;
+}
+
+.find-scope-select {
+    appearance: none;
+    background: transparent;
+    border: none;
+    color: var(--ink);
+    font-size: 0.85rem;
+    padding: 0 18px 0 24px;
+    /* Space for icon and arrow */
+    cursor: pointer;
+    height: 100%;
+    outline: none;
+    max-width: 120px;
+    text-overflow: ellipsis;
+}
+
+.find-scope-select option {
+    background: var(--panel);
+    color: var(--ink);
+}
+
+.find-scope-icon {
+    position: absolute;
+    left: 6px;
+    pointer-events: none;
+    display: flex;
+    align-items: center;
+    color: var(--ink-muted);
+}
+
+.find-scope-arrow {
+    position: absolute;
+    right: 6px;
+    pointer-events: none;
+    font-size: 0.6rem;
+    color: var(--ink-muted);
+}
+
+.find-scope-select:hover {
+    background: var(--panel-muted);
+}
+
+/* Refined Column Picker Style override */
+.find-scope-select-wrapper {
+    border-right: 1px solid var(--border);
+    /* Keep divider but ensure color matches */
+    margin-right: 0;
+    padding-right: 0;
+    width: auto;
+    background: rgba(0, 0, 0, 0.05);
+    /* Slight bg to distinguish */
+    border-radius: 4px 0 0 4px;
+}
+
+:root[data-theme="dark"] .find-scope-select-wrapper {
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.find-scope-select {
+    font-weight: 500;
+    color: var(--ink);
+    padding: 0 22px 0 26px;
+    /* Adjust padding */
+    height: 32px;
+    /* Fixed height matching inputs */
+}
+
+.find-scope-icon {
+    left: 8px;
+    opacity: 0.7;
+}
+
+.find-scope-arrow {
+    right: 8px;
+    opacity: 0.7;
+}
+
+.find-widget {
+    padding: 2px;
+    /* Reduce padding of main container */
+    gap: 0;
+    /* Remove gap, use borders/padding internally */
+    align-items: stretch;
+    /* Stretch height */
+}
+
+.find-input-container {
+    border: none;
+    /* Remove redundant border if parent has it? No, parent has border. */
+    background: transparent;
+    border-radius: 0;
+    height: 32px;
+}
+
+.find-input-container:focus-within {
+    outline: none;
+    background: var(--bg-input);
+}
+
+.find-search-icon {
+    display: flex;
+    align-items: center;
+    color: var(--ink-muted);
+    padding-left: 8px;
+    pointer-events: none;
+}
+
+.find-input-container input {
+    padding-left: 8px;
+    /* Reduce padding since icon is there? OR add space. */
+    padding-left: 6px;
+}
+
+/* Update existing input padding rule to be more specific or override */
+.find-input-container input {
+    padding: 0 8px;
+    /* Original */
+}
+
+/* Correct way: ensure input padding allows for icon if it was absolute?
+   But here it is flex item. left to right: Icon, Input. 
+   So input padding-left can be small. 
+*/
+
+/* Alignment fixes */
+.find-results-count {
+    height: 100%;
+    /* Match parent height */
+    border-left: 1px solid var(--border);
+    margin: 0;
+    padding: 0 12px;
+}
+
+/* Ensure button height matches container */
+.find-icon-btn {
+    height: 100%;
+    width: 34px;
+    border-radius: 0;
+}
+
+/* Force alignment fix for results count */
+.find-results-count {
+    height: 100% !important;
+    border-left: 1px solid var(--border);
+    margin: 0 !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+    display: flex !important;
+    align-items: center !important;
+}
+
+/* Ensure container allows full height children */
+.find-widget {
+    align-items: stretch !important;
+}
+
+/* Overwrite previous cat append to fix alignment */
+.find-results-count {
+    height: 100% !important;
+    border-left: 1px solid var(--border);
+    margin: 0 !important;
+    padding: 0 12px !important;
+    display: flex !important;
+    align-items: center !important;
+    line-height: normal !important;
+}
+.find-search-icon.spinning {
+    animation: spin 1s linear infinite;
+    color: var(--accent);
+    opacity: 1;
 }
