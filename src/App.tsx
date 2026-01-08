@@ -1439,6 +1439,17 @@ function App() {
     setContextMenu(null);
   }, []);
 
+  const handleSearchFromCell = useCallback((value: string) => {
+    setSearchTerm(value);
+    setShowFind(true);
+    setActiveHighlight("search");
+    setContextMenu(null);
+    // Focus search input after a short delay
+    setTimeout(() => {
+      searchInputRef.current?.focus();
+    }, 10);
+  }, []);
+
   return (
     <main
       className="app"
@@ -2179,6 +2190,19 @@ function App() {
             }}
           >
             Copy row
+          </button>
+          <button
+            type="button"
+            className="context-menu-item"
+            onClick={() => {
+              if (contextMenu.cellText === null) {
+                return;
+              }
+              handleSearchFromCell(contextMenu.cellText);
+            }}
+            disabled={contextMenu.cellText === null}
+          >
+            Search for this
           </button>
         </div>
       ) : null}

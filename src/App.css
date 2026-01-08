@@ -706,6 +706,7 @@ option {
     text-overflow: ellipsis;
     font-size: 0.84rem;
     font-variant-numeric: tabular-nums;
+    contain: layout style paint;
 }
 
 .table-cell.index {
@@ -1472,6 +1473,7 @@ option {
     align-items: center !important;
     line-height: normal !important;
 }
+
 .find-search-icon.spinning {
     animation: spin 1s linear infinite;
     color: var(--accent);

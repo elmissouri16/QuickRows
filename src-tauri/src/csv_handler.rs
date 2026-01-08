@@ -1,6 +1,7 @@
 use chardetng::EncodingDetector;
 use csv::{ByteRecord, Position, ReaderBuilder, StringRecord, Terminator};
 use encoding_rs::Encoding;
+use rayon::prelude::*;
 use rayon::slice::ParallelSliceMut;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -1614,49 +1615,178 @@ pub fn find_duplicates_hashed_mmap(
     settings: &ParseSettings,
     column_idx: Option<usize>,
 ) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
-    let cursor = Cursor::new(data);
     let mut safe_settings = settings.clone();
     safe_settings.has_headers = false;
-    let rdr = build_reader(cursor, &safe_settings, false);
+    
+    // 1. Compute Hashes (Parallel)
+    // We split into chunks to allow parallel processing.
+    // Within each chunk, we assume offsets are sequential (which they are for the whole file),
+    // so we can Seek once and Read sequentially for maximum speed.
+    // If offsets are NOT sequential (e.g. filtered), this might read wrong data if we just readNext.
+    // BUT, find_duplicates logic usually runs on the whole file or filtered set.
+    // If filtered, offsets are Monotonic but potentially Sparse.
+    // If Sparse, "Read Next" gives the Wrong Row (it gives the immediate physical next).
+    // CRITICAL: We MUST check if offsets are contiguous to optimize.
+    // Actually, for safety, if we just Seek every time it's slower but correct.
+    // OR, we check: if next_offset == current_pos, read. Else seek.
+    // given we parse rows, we know how many bytes used? No, ByteRecord doesn't tell us consumed bytes easily?
+    // Actually `ByteRecord` + `Position`.
+    // Let's stick to "Seek every row" inside the chunk if uncertain, OR "Seek once" if we know we are unfiltered.
+    // The `offsets` passed to `find_duplicates` comes from `state.row_offsets`. 
+    // This is arguably the WHOLE file offsets.
+    // So sequential read is valid.
+    
+    // We'll use a safer hybrid: In parallel chunk, create reader.
+    // For each offset, check if we are at position? No, getting position is slow.
+    // Let's assume SEEKING in-memory Cursor is very fast (it is). 
+    // `rdr.seek` creates a new internal buffer or clears it. 
+    // Optimization: Use `ReaderBuilder` with a decent buffer, but reset is inevitable on seek.
+    // Rayon `map` reduces to `Vec<(u64, u32)>`.
 
-    // 1. Compute Hashes
-    let mut hashes = compute_hashes_from_reader(rdr, offsets, column_idx)?;
+    let chunk_size = 4096; // Tunable
+    let mut hashes: Vec<(u64, u32)> = offsets.par_chunks(chunk_size)
+        .enumerate()
+        .map(|(chunk_idx, batch_offsets)| {
+            let start_row = chunk_idx * chunk_size;
+            let mut local_hashes = Vec::with_capacity(batch_offsets.len());
+            // Create a thread-local reader
+            let cursor = Cursor::new(data);
+             // We reuse settings but has_headers=false for data reading
+            let mut rdr = build_reader(cursor, &safe_settings, false);
+            let mut record = ByteRecord::new();
+            
+            // Optimization: If possible, we try to stride.
+            // But strict correctness with `seek` for every row is safer given `csv` crate buffering.
+            // On memory mapped file, seek is just `cursor.set_position`.
+            // The overhead is `rdr` buffer invalidation.
+            // For 10M rows, 10M seeks + reads.
+            // In parallel (e.g. 8 threads), 1.25M each.
+            // Should be fast enough.
+            
+            for (i, &offset) in batch_offsets.iter().enumerate() {
+                let mut pos = Position::new();
+                pos.set_byte(offset);
+                if rdr.seek(pos).is_ok() {
+                    if rdr.read_byte_record(&mut record).unwrap_or(false) {
+                         let hash = {
+                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                            if let Some(idx) = column_idx {
+                                 if let Some(field) = record.get(idx) {
+                                     field.hash(&mut hasher);
+                                 }
+                            } else {
+                                for field in &record {
+                                    field.hash(&mut hasher);
+                                }
+                            }
+                            hasher.finish()
+                        };
+                        local_hashes.push((hash, (start_row + i) as u32));
+                    }
+                }
+            }
+            local_hashes
+        })
+        .flatten()
+        .collect();
 
     // 2. Sort by hash
     hashes.par_sort_unstable_by_key(|k| k.0);
 
-    // 3. Find candidates and verify
-    let mut duplicates = Vec::new();
+    // 3. Find candidates (Identify Collision Groups)
+    // We define a collision group as a range [start, end) where hashes are identical.
+    // We can scan linearly to find these ranges (very fast on sorted vec),
+    // then process ranges in parallel.
+    
+    let mut groups = Vec::new();
     let mut i = 0;
     while i < hashes.len() {
         let mut run_end = i + 1;
         while run_end < hashes.len() && hashes[run_end].0 == hashes[i].0 {
             run_end += 1;
         }
-
+        
         if run_end > i + 1 {
-            let candidates: Vec<usize> = hashes[i..run_end].iter().map(|&(_, idx)| idx as usize).collect();
-            let mut warnings = Vec::new();
-            let rows = read_rows_by_index_mmap(data, offsets, &candidates, &safe_settings, None, &mut warnings)?;
-            
-            let mut content_map: std::collections::HashMap<Vec<String>, Vec<usize>> = std::collections::HashMap::with_capacity(rows.len());
-             for (k, row) in rows.into_iter().enumerate() {
-                let original_idx = candidates[k];
-                let key = match column_idx {
-                    Some(idx) => vec![row.get(idx).cloned().unwrap_or_default()],
-                    None => row,
-                };
-                content_map.entry(key).or_default().push(original_idx);
-            }
-            for (_, indices) in content_map {
-                if indices.len() > 1 {
-                    duplicates.extend(indices);
-                }
-            }
+            groups.push(i..run_end);
         }
         i = run_end;
     }
 
+    // 4. Verify Groups in Parallel
+    let confirmed_duplicates: Vec<usize> = groups.into_par_iter()
+        .map(|range| {
+            // Re-construct logic for checking rows in this range
+            // We need a thread-local reader (or just read bytes slice directly if we knew lengths)
+            // But we need CSV parsing for quotes etc.
+            // We can just use the `read_rows_by_index_mmap` helper or inline it.
+            // Inline is better for avoiding repeated `read_rows` overhead calls (chunking).
+            
+            // Extract the indices for this group
+            let group_indices: Vec<usize> = hashes[range].iter().map(|&(_, idx)| idx as usize).collect();
+            
+            // Optimization: Since we know the offsets, we can read just those rows.
+            // We'll create a local reader.
+            
+            let cursor = Cursor::new(data);
+            let mut rdr = build_reader(cursor, &safe_settings, false);
+            let mut record = ByteRecord::new();
+            
+            // Map Content -> List of Indices
+            let mut content_map: std::collections::HashMap<Vec<u8>, Vec<usize>> = std::collections::HashMap::with_capacity(group_indices.len());
+            
+            for &idx in &group_indices {
+                if let Some(&offset) = offsets.get(idx) {
+                    let mut pos = Position::new();
+                    pos.set_byte(offset);
+                    if rdr.seek(pos).is_ok() {
+                         if rdr.read_byte_record(&mut record).unwrap_or(false) {
+                            // Key is either column or whole row
+                            let key = if let Some(c_idx) = column_idx {
+                                record.get(c_idx).unwrap_or(&[]).to_vec()
+                            } else {
+                                // For whole row, we can just use the raw bytes of the record?
+                                // ByteRecord is slightly complex structure. `as_slice`? 
+                                // `record.as_slice()` is just the field data concatenated? No.
+                                // Clone the record into Vec<String>? Expensive.
+                                // We can maintain `ByteRecord` -> Vec<Vec<u8>> (fields).
+                                // Or just formatted string?
+                                // "Duplicate" means Exact Match.
+                                // If we assume `ByteRecord` equality implies duplicate.
+                                // We can use `record.clone()`? `ByteRecord` is strictly equal if fields equal.
+                                // But ByteRecord is not Hashable by default?
+                                // It is `Eq`.
+                                // Let's use `Vec<u8>` for key.
+                                
+                                // Actually, `content_map` key.
+                                // If we just stick to `Vec<u8>` (bytes of the field).
+                                // For whole row, maybe serialize to bytes?
+                                
+                                let mut k = Vec::new();
+                                for field in &record {
+                                    k.extend_from_slice(field);
+                                    k.push(0); // delimiter-ish to distinguish fields?
+                                }
+                                k
+                                
+                            };
+                            content_map.entry(key).or_default().push(idx);
+                        }
+                    }
+                }
+            }
+            
+            let mut local_dupes = Vec::new();
+            for (_, indices) in content_map {
+                if indices.len() > 1 {
+                    local_dupes.extend(indices);
+                }
+            }
+            local_dupes
+        })
+        .flatten()
+        .collect();
+        
+    let mut duplicates = confirmed_duplicates;
     duplicates.sort_unstable();
     Ok(duplicates)
 }

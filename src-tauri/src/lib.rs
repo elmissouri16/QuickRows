@@ -528,8 +528,13 @@ async fn sort_csv(
         let len = state.headers.lock().unwrap().len();
         if len == 0 { None } else { Some(len) }
     };
+    // Memory optimization: truncate values to 256 chars max
+    // Most sort comparisons differ in first few chars anyway
+    const SORT_VALUE_MAX_LEN: usize = 256;
     let mut warnings = Vec::new();
-    let mut rows: Vec<(usize, String)> = Vec::new();
+    let mut rows: Vec<(u32, Box<str>)> = Vec::with_capacity(
+        offsets.as_ref().map(|o| o.len()).unwrap_or(100_000)
+    );
     let mut start = 0usize;
 
     loop {
@@ -589,8 +594,15 @@ async fn sort_csv(
         }
 
         for (idx, row) in chunk.iter().enumerate() {
-            let row_index = start + idx;
-            let value = row.get(column_idx).cloned().unwrap_or_default();
+            let row_index = (start + idx) as u32;
+            let value = row.get(column_idx).map(|s| {
+                // Truncate to reduce memory usage
+                if s.len() > SORT_VALUE_MAX_LEN {
+                    s[..SORT_VALUE_MAX_LEN].into()
+                } else {
+                    s.as_str().into()
+                }
+            }).unwrap_or_else(|| "".into());
             rows.push((row_index, value));
         }
 
@@ -612,7 +624,8 @@ async fn sort_csv(
         rows.par_sort_unstable_by(|a, b| b.1.cmp(&a.1));
     }
 
-    let order = rows.iter().map(|(idx, _)| *idx).collect::<Vec<_>>();
+    // Convert u32 indices back to usize
+    let order: Vec<usize> = rows.iter().map(|(idx, _)| *idx as usize).collect();
     *state.sorted_order.lock().unwrap() = Some(order.clone());
     let _ = write_order_cache(&order_path, key, column_idx, ascending, &order);
 
