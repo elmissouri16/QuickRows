@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::fs::File;
-use std::io::{BufReader, Cursor, Read, Seek, Write};
+use std::io::{BufReader, Cursor, Read, Seek};
 
 const SAMPLE_SIZE: usize = 64 * 1024;
 pub const MAX_WARNING_COUNT: usize = 200;
@@ -1553,18 +1553,12 @@ pub fn find_duplicates_hashed(
     // 1. Compute Hashes
     let mut hashes = compute_hashes_from_reader(rdr, offsets, column_idx)?;
 
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/csv_debug.log") {
-        let _ = writeln!(f, "DEBUG: Computed {} hashes", hashes.len());
-    }
+
 
     // 2. Sort by hash
     hashes.par_sort_unstable_by_key(|k| k.0);
 
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/csv_debug.log") {
-        if !hashes.is_empty() {
-             let _ = writeln!(f, "DEBUG: Sorted. First: {:x}, Last: {:x}", hashes[0].0, hashes[hashes.len()-1].0);
-        }
-    }
+
 
     // 3. Find candidates and verify
     let mut duplicates = Vec::new();
@@ -1578,9 +1572,7 @@ pub fn find_duplicates_hashed(
         }
 
         if run_end > i + 1 {
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/csv_debug.log") {
-                let _ = writeln!(f, "DEBUG: Collision block at i={} size={}", i, run_end - i);
-            }
+
 
             // Found a collision group of size (run_end - i)
             let candidates: Vec<usize> = hashes[i..run_end].iter().map(|&(_, idx)| idx as usize).collect();
@@ -1610,9 +1602,7 @@ pub fn find_duplicates_hashed(
         i = run_end;
     }
 
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/csv_debug.log") {
-        let _ = writeln!(f, "DEBUG: Total duplicates found: {}", duplicates.len());
-    }
+
 
     duplicates.sort_unstable();
     Ok(duplicates)
@@ -1629,9 +1619,13 @@ pub fn find_duplicates_hashed_mmap(
     safe_settings.has_headers = false;
     let rdr = build_reader(cursor, &safe_settings, false);
 
+    // 1. Compute Hashes
     let mut hashes = compute_hashes_from_reader(rdr, offsets, column_idx)?;
+
+    // 2. Sort by hash
     hashes.par_sort_unstable_by_key(|k| k.0);
 
+    // 3. Find candidates and verify
     let mut duplicates = Vec::new();
     let mut i = 0;
     while i < hashes.len() {
@@ -1675,43 +1669,6 @@ fn compute_hashes_from_reader<R: Read + Seek>(
     let mut hashes = Vec::with_capacity(offsets.len());
     let mut record = ByteRecord::new();
     
-    // We can't easily jump around with a single reader if we want to be fast and just iterate?
-    // BUT, offsets might not be sequential if we filtered? 
-    // Actually, usually offsets ARE sequential for the whole file.
-    // If we use `offsets`, we should seek.
-    // BUT seeking for every row is slow.
-    // If offsets is just `0..N` rows, we can iterate.
-    // However, existing `read_chunk_with_offsets_from_reader` seeks.
-    // For "Find Duplicates", we usually scan the whole file.
-    // The `offsets` vec passed from AppState is likely ALL row offsets.
-    // If so, we can just iterate the reader linearly if we trust the offsets correspond to sequential rows.
-    // Safeguard: Check if we can just iterate.
-    // For now, to be safe and consistent with "random access" capability implies by offsets, let's seek.
-    // OPTIMIZATION: If we detect we are reading sequentially, don't seek. 
-    // But `rdr.seek` is reasonably fast if buffered? No, it flushes buffer usually.
-    // Better: Re-open file/reader and just iterate ALL records, and keep an index.
-    // Assert that `offsets.len()` match `records.count()`.
-    // Actually, `offsets` in AppState is built by scanning the whole file.
-    // So we can just iterate.
-    
-    // Position the reader at the start of data (skip headers if needed? No, `offsets` usually points to data rows).
-    // `offsets` contains the byte start of each row.
-    // If we just iterate `rdr.byte_records()`, we get all rows.
-    // We just need to make sure we associate them with the correct row index `i`.
-    // And if `rdr` was built with `has_headers(true)`, it skips the first row properly.
-    // BUT `offsets` might have been built with/without headers.
-    // The `offsets` in State typically exclude the header row if `has_headers` was true during scan.
-    // Let's rely on `Seek` for correctness first. If it's too slow, we optimize to stream.
-    // Actually, `Seek` 1 million times is very slow. 
-    // We MUST stream for performance.
-    
-    // Assume `offsets` represents the valid rows we want to check.
-    // If we just read sequentially `offsets.len()` records, will we get the same rows?
-    // Yes, provided the file hasn't changed.
-    // So:
-    // 1. Seek to offsets[0].
-    // 2. Read `offsets.len()` records.
-    
     if !offsets.is_empty() {
         let mut pos = Position::new();
         pos.set_byte(offsets[0]);
@@ -1728,23 +1685,15 @@ fn compute_hashes_from_reader<R: Read + Seek>(
                 if let Some(idx) = column_idx {
                      if let Some(field) = record.get(idx) {
                          field.hash(&mut hasher);
-                     } else {
-                         // handle missing
                      }
                 } else {
+                    // Hash all fields
                     for field in &record {
                         field.hash(&mut hasher);
                     }
                 }
                 hasher.finish()
             };
-
-            if i < 10 {
-                 use std::io::Write;
-                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/csv_debug.log") {
-                     let _ = writeln!(f, "DEBUG: Row {} hash={:016x}", i, hash);
-                 }
-            }
             
             hashes.push((hash, i as u32));
         }

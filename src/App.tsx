@@ -1934,12 +1934,11 @@ function App() {
             </div>
           ) : (
             <div className="empty-state">
-              <h2>Open a CSV to start</h2>
               <button
                 className="btn primary empty-cta"
                 onClick={handlePickFile}
               >
-                Open CSV
+                Open CSV File
               </button>
               {recentFiles.length ? (
                 <div className="empty-recent">
