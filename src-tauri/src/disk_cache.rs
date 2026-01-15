@@ -233,3 +233,51 @@ fn write_u64(writer: &mut impl Write, value: u64) -> Result<(), String> {
         .map_err(|err| err.to_string())?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        cache_key, offsets_cache_path, order_cache_path, read_offsets_cache, read_order_cache,
+        write_offsets_cache, write_order_cache,
+    };
+
+    #[test]
+    fn offsets_cache_round_trip() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file_path = dir.path().join("data.csv");
+        std::fs::write(&file_path, b"col1,col2\n1,2\n3,4\n").expect("write csv");
+
+        let key = cache_key(file_path.to_str().unwrap(), None).expect("cache key");
+        let offsets_path = offsets_cache_path(dir.path(), key);
+        let offsets = vec![0u64, 12, 16];
+
+        write_offsets_cache(&offsets_path, key, &offsets).expect("write offsets");
+        let loaded = read_offsets_cache(&offsets_path, key)
+            .expect("read offsets")
+            .expect("offsets");
+        assert_eq!(loaded, offsets);
+    }
+
+    #[test]
+    fn order_cache_round_trip_and_mismatch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file_path = dir.path().join("data.csv");
+        std::fs::write(&file_path, b"col1,col2\n1,2\n3,4\n").expect("write csv");
+
+        let key = cache_key(file_path.to_str().unwrap(), None).expect("cache key");
+        let order_path = order_cache_path(dir.path(), key, 2, true);
+        let order = vec![2usize, 0, 1];
+
+        write_order_cache(&order_path, key, 2, true, &order).expect("write order");
+        let loaded = read_order_cache(&order_path, key, 2, true)
+            .expect("read order")
+            .expect("order");
+        assert_eq!(loaded, order);
+
+        let wrong_column = read_order_cache(&order_path, key, 1, true).expect("read order");
+        assert!(wrong_column.is_none());
+
+        let wrong_direction = read_order_cache(&order_path, key, 2, false).expect("read order");
+        assert!(wrong_direction.is_none());
+    }
+}

@@ -14,3 +14,21 @@ pub fn search_parallel(data: &[Vec<String>], column_idx: usize, query: &str) -> 
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::search_parallel;
+
+    #[test]
+    fn search_parallel_finds_matching_rows() {
+        let data = vec![
+            vec!["alpha".to_string(), "bravo".to_string()],
+            vec!["charlie".to_string(), "AlphaBeta".to_string()],
+            vec!["delta".to_string(), "echo".to_string()],
+        ];
+
+        let mut matches = search_parallel(&data, 1, "alpha");
+        matches.sort_unstable();
+        assert_eq!(matches, vec![1]);
+    }
+}

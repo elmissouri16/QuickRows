@@ -26,3 +26,22 @@ impl CsvCache {
         self.cache.lock().unwrap().clear();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::CsvCache;
+
+    #[test]
+    fn put_get_clear_and_eviction() {
+        let cache = CsvCache::new(1);
+        cache.put(0, 1, vec![vec!["a".to_string()]]);
+        assert_eq!(cache.get(0, 1), Some(vec![vec!["a".to_string()]]));
+
+        cache.put(1, 1, vec![vec!["b".to_string()]]);
+        assert!(cache.get(0, 1).is_none());
+        assert_eq!(cache.get(1, 1), Some(vec![vec!["b".to_string()]]));
+
+        cache.clear();
+        assert!(cache.get(1, 1).is_none());
+    }
+}

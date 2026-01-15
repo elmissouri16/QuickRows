@@ -1544,13 +1544,13 @@ pub fn find_duplicates_hashed(
 ) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
-    
+
     // Force has_headers to false for raw row access
     let mut safe_settings = settings.clone();
     safe_settings.has_headers = false;
-    
+
     let rdr = build_reader(reader, &safe_settings, false);
-    
+
     // 1. Compute Hashes
     let mut hashes = compute_hashes_from_reader(rdr, offsets, column_idx)?;
 
@@ -1577,13 +1577,13 @@ pub fn find_duplicates_hashed(
 
             // Found a collision group of size (run_end - i)
             let candidates: Vec<usize> = hashes[i..run_end].iter().map(|&(_, idx)| idx as usize).collect();
-            
+
             let mut warnings = Vec::new();
-            
+
             let rows = read_rows_by_index(path, offsets, &candidates, &safe_settings, None, &mut warnings)?;
-            
+
             let mut content_map: std::collections::HashMap<Vec<String>, Vec<usize>> = std::collections::HashMap::with_capacity(rows.len());
-            
+
             for (k, row) in rows.into_iter().enumerate() {
                 let original_idx = candidates[k];
                 let key = match column_idx {
@@ -1592,14 +1592,14 @@ pub fn find_duplicates_hashed(
                 };
                 content_map.entry(key).or_default().push(original_idx);
             }
-            
+
             for (_, indices) in content_map {
                 if indices.len() > 1 {
                     duplicates.extend(indices);
                 }
             }
         }
-        
+
         i = run_end;
     }
 
@@ -1617,7 +1617,7 @@ pub fn find_duplicates_hashed_mmap(
 ) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
     let mut safe_settings = settings.clone();
     safe_settings.has_headers = false;
-    
+
     // 1. Compute Hashes (Parallel)
     // We split into chunks to allow parallel processing.
     // Within each chunk, we assume offsets are sequential (which they are for the whole file),
@@ -1632,14 +1632,14 @@ pub fn find_duplicates_hashed_mmap(
     // given we parse rows, we know how many bytes used? No, ByteRecord doesn't tell us consumed bytes easily?
     // Actually `ByteRecord` + `Position`.
     // Let's stick to "Seek every row" inside the chunk if uncertain, OR "Seek once" if we know we are unfiltered.
-    // The `offsets` passed to `find_duplicates` comes from `state.row_offsets`. 
+    // The `offsets` passed to `find_duplicates` comes from `state.row_offsets`.
     // This is arguably the WHOLE file offsets.
     // So sequential read is valid.
-    
+
     // We'll use a safer hybrid: In parallel chunk, create reader.
     // For each offset, check if we are at position? No, getting position is slow.
-    // Let's assume SEEKING in-memory Cursor is very fast (it is). 
-    // `rdr.seek` creates a new internal buffer or clears it. 
+    // Let's assume SEEKING in-memory Cursor is very fast (it is).
+    // `rdr.seek` creates a new internal buffer or clears it.
     // Optimization: Use `ReaderBuilder` with a decent buffer, but reset is inevitable on seek.
     // Rayon `map` reduces to `Vec<(u64, u32)>`.
 
@@ -1654,7 +1654,7 @@ pub fn find_duplicates_hashed_mmap(
              // We reuse settings but has_headers=false for data reading
             let mut rdr = build_reader(cursor, &safe_settings, false);
             let mut record = ByteRecord::new();
-            
+
             // Optimization: If possible, we try to stride.
             // But strict correctness with `seek` for every row is safer given `csv` crate buffering.
             // On memory mapped file, seek is just `cursor.set_position`.
@@ -1662,7 +1662,7 @@ pub fn find_duplicates_hashed_mmap(
             // For 10M rows, 10M seeks + reads.
             // In parallel (e.g. 8 threads), 1.25M each.
             // Should be fast enough.
-            
+
             for (i, &offset) in batch_offsets.iter().enumerate() {
                 let mut pos = Position::new();
                 pos.set_byte(offset);
@@ -1697,7 +1697,7 @@ pub fn find_duplicates_hashed_mmap(
     // We define a collision group as a range [start, end) where hashes are identical.
     // We can scan linearly to find these ranges (very fast on sorted vec),
     // then process ranges in parallel.
-    
+
     let mut groups = Vec::new();
     let mut i = 0;
     while i < hashes.len() {
@@ -1705,7 +1705,7 @@ pub fn find_duplicates_hashed_mmap(
         while run_end < hashes.len() && hashes[run_end].0 == hashes[i].0 {
             run_end += 1;
         }
-        
+
         if run_end > i + 1 {
             groups.push(i..run_end);
         }
@@ -1720,20 +1720,20 @@ pub fn find_duplicates_hashed_mmap(
             // But we need CSV parsing for quotes etc.
             // We can just use the `read_rows_by_index_mmap` helper or inline it.
             // Inline is better for avoiding repeated `read_rows` overhead calls (chunking).
-            
+
             // Extract the indices for this group
             let group_indices: Vec<usize> = hashes[range].iter().map(|&(_, idx)| idx as usize).collect();
-            
+
             // Optimization: Since we know the offsets, we can read just those rows.
             // We'll create a local reader.
-            
+
             let cursor = Cursor::new(data);
             let mut rdr = build_reader(cursor, &safe_settings, false);
             let mut record = ByteRecord::new();
-            
+
             // Map Content -> List of Indices
             let mut content_map: std::collections::HashMap<Vec<u8>, Vec<usize>> = std::collections::HashMap::with_capacity(group_indices.len());
-            
+
             for &idx in &group_indices {
                 if let Some(&offset) = offsets.get(idx) {
                     let mut pos = Position::new();
@@ -1745,7 +1745,7 @@ pub fn find_duplicates_hashed_mmap(
                                 record.get(c_idx).unwrap_or(&[]).to_vec()
                             } else {
                                 // For whole row, we can just use the raw bytes of the record?
-                                // ByteRecord is slightly complex structure. `as_slice`? 
+                                // ByteRecord is slightly complex structure. `as_slice`?
                                 // `record.as_slice()` is just the field data concatenated? No.
                                 // Clone the record into Vec<String>? Expensive.
                                 // We can maintain `ByteRecord` -> Vec<Vec<u8>> (fields).
@@ -1756,25 +1756,25 @@ pub fn find_duplicates_hashed_mmap(
                                 // But ByteRecord is not Hashable by default?
                                 // It is `Eq`.
                                 // Let's use `Vec<u8>` for key.
-                                
+
                                 // Actually, `content_map` key.
                                 // If we just stick to `Vec<u8>` (bytes of the field).
                                 // For whole row, maybe serialize to bytes?
-                                
+
                                 let mut k = Vec::new();
                                 for field in &record {
                                     k.extend_from_slice(field);
                                     k.push(0); // delimiter-ish to distinguish fields?
                                 }
                                 k
-                                
+
                             };
                             content_map.entry(key).or_default().push(idx);
                         }
                     }
                 }
             }
-            
+
             let mut local_dupes = Vec::new();
             for (_, indices) in content_map {
                 if indices.len() > 1 {
@@ -1785,7 +1785,7 @@ pub fn find_duplicates_hashed_mmap(
         })
         .flatten()
         .collect();
-        
+
     let mut duplicates = confirmed_duplicates;
     duplicates.sort_unstable();
     Ok(duplicates)
@@ -1798,18 +1798,18 @@ fn compute_hashes_from_reader<R: Read + Seek>(
 ) -> Result<Vec<(u64, u32)>, Box<dyn std::error::Error>> {
     let mut hashes = Vec::with_capacity(offsets.len());
     let mut record = ByteRecord::new();
-    
+
     if !offsets.is_empty() {
         let mut pos = Position::new();
         pos.set_byte(offsets[0]);
         rdr.seek(pos)?;
-        
+
         for (i, _) in offsets.iter().enumerate() {
             // We use `read_byte_record` to reuse memory
             if !rdr.read_byte_record(&mut record)? {
                 break;
             }
-            
+
             let hash = {
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 if let Some(idx) = column_idx {
@@ -1824,7 +1824,7 @@ fn compute_hashes_from_reader<R: Read + Seek>(
                 }
                 hasher.finish()
             };
-            
+
             hashes.push((hash, i as u32));
         }
     }
@@ -1834,3 +1834,186 @@ fn compute_hashes_from_reader<R: Read + Seek>(
 
 // Debug helper (appended via command to ensure availability)
 // Removed since we can just use eprintln!
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_temp_csv(contents: &str) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(contents.as_bytes()).expect("write csv");
+        file.flush().expect("flush csv");
+        file
+    }
+
+    #[test]
+    fn apply_parse_overrides_respects_inputs() {
+        let detected = DetectedSettings {
+            delimiter: b',',
+            quote: b'"',
+            escape: None,
+            line_ending: "lf".to_string(),
+            encoding: encoding_rs::UTF_8,
+            encoding_label: "utf-8".to_string(),
+            has_headers: true,
+        };
+        let overrides = ParseOverrides {
+            delimiter: Some("tab".to_string()),
+            quote: Some("single".to_string()),
+            escape: Some("backslash".to_string()),
+            line_ending: Some("crlf".to_string()),
+            encoding: Some("utf8".to_string()),
+            has_headers: Some(false),
+            malformed: Some("repair".to_string()),
+            max_field_size: Some(10),
+            max_record_size: Some(20),
+        };
+
+        let settings = apply_parse_overrides(&detected, Some(overrides));
+        assert_eq!(settings.delimiter, b'\t');
+        assert_eq!(settings.quote, b'\'');
+        assert_eq!(settings.escape, Some(b'\\'));
+        assert!(matches!(settings.terminator, Terminator::CRLF));
+        assert_eq!(settings.line_ending, "crlf".to_string());
+        assert_eq!(settings.encoding_label, "utf-8".to_string());
+        assert!(!settings.has_headers);
+        assert_eq!(settings.malformed, MalformedMode::Repair);
+        assert_eq!(settings.max_field_size, 10);
+        assert_eq!(settings.max_record_size, 20);
+    }
+
+    #[test]
+    fn parse_info_from_settings_round_trip() {
+        let settings = default_parse_settings();
+        let info = parse_info_from_settings(&settings);
+        assert_eq!(info.delimiter, ",");
+        assert_eq!(info.quote, "\"");
+        assert_eq!(info.escape, None);
+        assert_eq!(info.line_ending, "auto");
+        assert_eq!(info.encoding, "utf-8");
+        assert!(info.has_headers);
+        assert_eq!(info.malformed, "skip");
+        assert_eq!(info.max_field_size, 256 * 1024);
+        assert_eq!(info.max_record_size, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn build_offsets_and_read_chunk_with_offsets() {
+        let file = write_temp_csv(
+            "col1,col2\r\nalpha,1\r\nbeta,2\r\ngamma,3\r\n",
+        );
+        let settings = default_parse_settings();
+        let mut warnings = Vec::new();
+        let offsets = build_row_offsets(
+            file.path().to_str().unwrap(),
+            &settings,
+            Some(2),
+            &mut warnings,
+            None,
+        )
+        .expect("build offsets");
+        assert_eq!(offsets.len(), 3);
+        assert!(warnings.is_empty());
+
+        let mut chunk_warnings = Vec::new();
+        let rows = read_chunk_with_offsets(
+            file.path().to_str().unwrap(),
+            &offsets,
+            1,
+            1,
+            &settings,
+            Some(2),
+            &mut chunk_warnings,
+        )
+        .expect("read chunk");
+        assert_eq!(rows, vec![vec!["beta".to_string(), "2".to_string()]]);
+    }
+
+    #[test]
+    fn search_range_whole_word_and_contains() {
+        let file = write_temp_csv("col\r\nalpha\r\nalphabet\r\nbeta\r\n");
+        let settings = default_parse_settings();
+        let mut warnings = Vec::new();
+        let offsets = build_row_offsets(
+            file.path().to_str().unwrap(),
+            &settings,
+            Some(1),
+            &mut warnings,
+            None,
+        )
+        .expect("build offsets");
+
+        let whole_word = search_range_with_offsets(
+            file.path().to_str().unwrap(),
+            &offsets,
+            0,
+            offsets.len(),
+            Some(0),
+            "alpha",
+            false,
+            true,
+            &settings,
+        )
+        .expect("search whole word");
+        assert_eq!(whole_word, vec![0]);
+
+        let contains = search_range_with_offsets(
+            file.path().to_str().unwrap(),
+            &offsets,
+            0,
+            offsets.len(),
+            Some(0),
+            "alpha",
+            false,
+            false,
+            &settings,
+        )
+        .expect("search contains");
+        assert_eq!(contains, vec![0, 1]);
+    }
+
+    #[test]
+    fn decode_record_strips_bom() {
+        let data = "\u{feff}Name,Value\r\nAlice,1\r\n";
+        let mut settings = default_parse_settings();
+        settings.has_headers = false;
+        let mut rdr = build_reader(data.as_bytes(), &settings, false);
+        let mut record = csv::ByteRecord::new();
+        assert!(rdr.read_byte_record(&mut record).expect("read record"));
+        let (decoded, had_errors) = decode_record(&record, &settings, true);
+        assert!(!had_errors);
+        assert_eq!(decoded[0], "Name");
+    }
+
+    #[test]
+    fn find_duplicates_hashed_matches_rows() {
+        let file = write_temp_csv(
+            "id,name\r\n1,Alice\r\n2,Bob\r\n1,Alice\r\n3,Charlie\r\n2,Bob\r\n",
+        );
+        let settings = default_parse_settings();
+        let mut warnings = Vec::new();
+        let offsets = build_row_offsets(
+            file.path().to_str().unwrap(),
+            &settings,
+            Some(2),
+            &mut warnings,
+            None,
+        )
+        .expect("build offsets");
+
+        let duplicates = find_duplicates_hashed(
+            file.path().to_str().unwrap(),
+            &offsets,
+            &settings,
+            None,
+        )
+        .expect("find duplicates");
+        assert_eq!(duplicates, vec![0, 1, 2, 4]);
+
+        let data = std::fs::read(file.path()).expect("read file");
+        let mmap_duplicates =
+            find_duplicates_hashed_mmap(&data, &offsets, &settings, None).expect("find mmap");
+        assert_eq!(mmap_duplicates, vec![0, 1, 2, 4]);
+    }
+}

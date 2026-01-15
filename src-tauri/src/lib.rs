@@ -4,13 +4,12 @@ mod csv_mmap;
 mod disk_cache;
 use csv_cache::CsvCache;
 use csv_handler::{
-    apply_parse_overrides, build_reader, build_row_offsets, build_row_offsets_mmap,
-    default_parse_settings, detect_parse_settings, decode_record, get_headers,
-    parse_info_from_settings, read_chunk, read_chunk_mmap, read_chunk_with_offsets,
-    read_chunk_with_offsets_mmap, read_rows_by_index,
-    read_rows_by_index_mmap, search_range_with_offsets, search_range_with_offsets_mmap,
-    settings_cache_hash, ParseInfo, ParseOverrides, ParseSettings, ParseWarning,
-    MAX_WARNING_COUNT,
+    apply_parse_overrides, build_reader, build_row_offsets, build_row_offsets_mmap, decode_record,
+    default_parse_settings, detect_parse_settings, get_headers, parse_info_from_settings,
+    read_chunk, read_chunk_mmap, read_chunk_with_offsets, read_chunk_with_offsets_mmap,
+    read_rows_by_index, read_rows_by_index_mmap, search_range_with_offsets,
+    search_range_with_offsets_mmap, settings_cache_hash, ParseInfo, ParseOverrides, ParseSettings,
+    ParseWarning, MAX_WARNING_COUNT,
 };
 use csv_mmap::open_mmap_if_large;
 use disk_cache::{
@@ -24,7 +23,9 @@ use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
 
 #[cfg(desktop)]
-use tauri::menu::{CheckMenuItem, MenuBuilder, MenuItemBuilder, MenuItemKind, SubmenuBuilder};
+use tauri::menu::{
+    CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, MenuItemKind, SubmenuBuilder,
+};
 
 #[derive(Clone, serde::Serialize)]
 struct SortedRow {
@@ -64,7 +65,7 @@ impl SearchIndex {
             skipped_columns: Vec::new(),
         }
     }
-    
+
     fn clear(&mut self) {
         self.columns.clear();
         self.ready = false;
@@ -93,6 +94,49 @@ const SEARCH_CHUNK_SIZE: usize = 25_000;
 const BULK_CHUNK_SIZE: usize = 10_000;
 const INDEX_VALUE_MAX_LEN: usize = 256;
 const INDEX_MAX_CARDINALITY: usize = 2_000_000; // Skip column if >2M unique values
+const RESULT_CHUNK_SIZE: usize = 5_000;
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MatchesChunkPayload {
+    request_id: u32,
+    matches: Vec<usize>,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MatchesCompletePayload {
+    request_id: u32,
+    total: usize,
+}
+
+fn emit_matches_chunk(
+    app: &tauri::AppHandle,
+    event: &str,
+    request_id: u32,
+    matches: &[usize],
+) -> Result<(), String> {
+    if matches.is_empty() {
+        return Ok(());
+    }
+    let payload = MatchesChunkPayload {
+        request_id,
+        matches: matches.to_vec(),
+    };
+    app.emit(event, payload).map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn emit_matches_complete(
+    app: &tauri::AppHandle,
+    event: &str,
+    request_id: u32,
+    total: usize,
+) -> Result<(), String> {
+    let payload = MatchesCompletePayload { request_id, total };
+    app.emit(event, payload).map_err(|err| err.to_string())?;
+    Ok(())
+}
 
 /// Build search index for all columns in background
 fn build_search_index(
@@ -106,13 +150,15 @@ fn build_search_index(
     if num_columns == 0 {
         return index;
     }
-    
+
     // Initialize column indexes
-    index.columns = (0..num_columns).map(|_| Some(std::collections::HashMap::new())).collect();
-    
+    index.columns = (0..num_columns)
+        .map(|_| Some(std::collections::HashMap::new()))
+        .collect();
+
     let mut start = 0usize;
     let mut warnings = Vec::new();
-    
+
     loop {
         let chunk: Vec<Vec<String>> = if let Some(mmap) = mmap {
             match read_chunk_with_offsets_mmap(
@@ -141,51 +187,58 @@ fn build_search_index(
                 Err(_) => break,
             }
         };
-        
+
         if chunk.is_empty() {
             break;
         }
-        
+
         // Index each row
         for (idx, row) in chunk.iter().enumerate() {
             let row_index = (start + idx) as u32;
-            
+
             for (col_idx, cell) in row.iter().enumerate() {
                 if col_idx >= index.columns.len() {
                     continue;
                 }
-                
+
                 // Skip columns already marked as too high cardinality
                 if index.columns[col_idx].is_none() {
                     continue;
                 }
-                
+
                 let col_index = index.columns[col_idx].as_mut().unwrap();
-                
+
                 // Create lowercase key, truncated for memory efficiency
                 let key: Box<str> = if cell.len() > INDEX_VALUE_MAX_LEN {
                     cell[..INDEX_VALUE_MAX_LEN].to_lowercase().into()
                 } else {
                     cell.to_lowercase().into()
                 };
-                
-                col_index.entry(key).or_insert_with(Vec::new).push(row_index);
-                
+
+                col_index
+                    .entry(key)
+                    .or_insert_with(Vec::new)
+                    .push(row_index);
+
                 // Check cardinality limit
                 if col_index.len() > INDEX_MAX_CARDINALITY {
-                    println!("[INDEX] Skipping column {} (too many unique values: {})", col_idx, col_index.len());
+                    println!(
+                        "[INDEX] Skipping column {} (too many unique values: {})",
+                        col_idx,
+                        col_index.len()
+                    );
                     index.skipped_columns.push(col_idx);
                     index.columns[col_idx] = None;
                 }
             }
         }
-        
+
         if chunk.len() < BULK_CHUNK_SIZE {
             break;
         }
         start += chunk.len();
     }
-    
+
     index.ready = true;
     index
 }
@@ -247,14 +300,14 @@ async fn load_csv_metadata(
                 let mut take = file.take(sample.len() as u64);
                 if let Ok(read) = take.read(&mut sample) {
                     if read > 0 {
-                         let sample_slice = &sample[..read];
-                         let newlines = sample_slice.iter().filter(|&&b| b == b'\n').count();
-                         if newlines > 0 {
-                             let avg_len = read as f64 / newlines as f64;
-                             if avg_len > 0.0 {
-                                 estimated_count = Some((len as f64 / avg_len) as usize);
-                             }
-                         }
+                        let sample_slice = &sample[..read];
+                        let newlines = sample_slice.iter().filter(|&&b| b == b'\n').count();
+                        if newlines > 0 {
+                            let avg_len = read as f64 / newlines as f64;
+                            if avg_len > 0.0 {
+                                estimated_count = Some((len as f64 / avg_len) as usize);
+                            }
+                        }
                     }
                 }
             }
@@ -334,42 +387,61 @@ async fn load_csv_metadata(
         *state.total_rows.lock().unwrap() = count;
         *state.mmap.lock().unwrap() = mmap.clone();
         let _ = app.emit("row-count", count);
-        
+
         // Build search index in background
         let enable_indexing = *state.enable_indexing.lock().unwrap();
         if enable_indexing {
             let num_columns = state.headers.lock().unwrap().len();
-            println!("[INDEX] Starting index build: path={}, num_columns={}, offsets_len={}", path, num_columns, offsets.len());
+            println!(
+                "[INDEX] Starting index build: path={}, num_columns={}, offsets_len={}",
+                path,
+                num_columns,
+                offsets.len()
+            );
             let index_path = path.clone();
             let index_settings = settings.clone();
             let index_offsets = offsets;
             let index_mmap = mmap;
             let app_for_index = app.clone();
-            
+
             std::thread::spawn(move || {
-            println!("[INDEX] Thread started, building index...");
-            let index = if let Some(ref mmap) = index_mmap {
-                build_search_index(&index_path, &index_settings, &index_offsets, Some(mmap.as_ref()), num_columns)
-            } else {
-                build_search_index(&index_path, &index_settings, &index_offsets, None, num_columns)
-            };
-            println!("[INDEX] Index built: ready={}, columns={}", index.ready, index.columns.len());
-            
-            let state = app_for_index.state::<AppState>();
-            // Check if same file is still loaded
-            let current_path = state.file_path.lock().unwrap().clone();
-            if current_path.as_deref() == Some(index_path.as_str()) {
-                *state.search_index.lock().unwrap() = index;
-                println!("[INDEX] Index stored in state");
-                let _ = app_for_index.emit("index-ready", true);
-            } else {
-                println!("[INDEX] File changed, discarding index");
-            }
-        });
-     }
+                println!("[INDEX] Thread started, building index...");
+                let index = if let Some(ref mmap) = index_mmap {
+                    build_search_index(
+                        &index_path,
+                        &index_settings,
+                        &index_offsets,
+                        Some(mmap.as_ref()),
+                        num_columns,
+                    )
+                } else {
+                    build_search_index(
+                        &index_path,
+                        &index_settings,
+                        &index_offsets,
+                        None,
+                        num_columns,
+                    )
+                };
+                println!(
+                    "[INDEX] Index built: ready={}, columns={}",
+                    index.ready,
+                    index.columns.len()
+                );
+
+                let state = app_for_index.state::<AppState>();
+                // Check if same file is still loaded
+                let current_path = state.file_path.lock().unwrap().clone();
+                if current_path.as_deref() == Some(index_path.as_str()) {
+                    *state.search_index.lock().unwrap() = index;
+                    println!("[INDEX] Index stored in state");
+                    let _ = app_for_index.emit("index-ready", true);
+                } else {
+                    println!("[INDEX] File changed, discarding index");
+                }
+            });
+        }
     });
-
-
 
     Ok(CsvMetadata {
         headers,
@@ -399,7 +471,11 @@ async fn get_csv_chunk(
     let settings = state.parse_settings.lock().unwrap().clone();
     let expected_columns = {
         let len = state.headers.lock().unwrap().len();
-        if len == 0 { None } else { Some(len) }
+        if len == 0 {
+            None
+        } else {
+            Some(len)
+        }
     };
     let mut warnings = Vec::new();
 
@@ -428,7 +504,7 @@ async fn get_csv_chunk(
                     expected_columns,
                     &mut warnings,
                 )
-                    .map_err(|err| err.to_string())?
+                .map_err(|err| err.to_string())?
             }
         }
         None => {
@@ -479,28 +555,36 @@ async fn search_csv(
         .unwrap()
         .clone()
         .ok_or("No file loaded")?;
-    
+
     let match_case = match_case.unwrap_or(false);
     let whole_word = whole_word.unwrap_or(false);
-    
+
     let query_processed = if match_case {
         query.clone()
     } else {
         query.to_lowercase()
     };
-    
+
     let settings = state.parse_settings.lock().unwrap().clone();
 
     // Try index-based search first (for exact or contains matches)
     let search_index = state.search_index.lock().unwrap();
-    println!("[SEARCH] index.ready={} match_case={} column_idx={:?} columns_len={}", 
-             search_index.ready, match_case, column_idx, search_index.columns.len());
+    println!(
+        "[SEARCH] index.ready={} match_case={} column_idx={:?} columns_len={}",
+        search_index.ready,
+        match_case,
+        column_idx,
+        search_index.columns.len()
+    );
     if search_index.ready && !match_case {
         if let Some(col_idx) = column_idx {
             // Search specific column using index
             if col_idx < search_index.columns.len() {
                 let has_index = search_index.columns[col_idx].is_some();
-                println!("[SEARCH] Using index for column {}, has_index={}", col_idx, has_index);
+                println!(
+                    "[SEARCH] Using index for column {}, has_index={}",
+                    col_idx, has_index
+                );
                 if let Some(ref col_index) = search_index.columns[col_idx] {
                     // Truncate query key like we did during indexing
                     let query_key: Box<str> = if query_processed.len() > INDEX_VALUE_MAX_LEN {
@@ -508,7 +592,7 @@ async fn search_csv(
                     } else {
                         query_processed.clone().into()
                     };
-                    
+
                     // For whole_word, do exact match
                     if whole_word {
                         if let Some(rows) = col_index.get(&query_key) {
@@ -590,23 +674,23 @@ async fn search_csv(
     let mut matches = Vec::new();
     let mut record = csv::ByteRecord::new();
     let mut idx: usize = 0;
-    
+
     // Helper closure for matching logic
     let check_match = |cell: &str| -> bool {
-         if !match_case {
-             let val_lower = cell.to_lowercase();
-             if whole_word {
-                 val_lower == query_processed
-             } else {
-                 val_lower.contains(&query_processed)
-             }
-         } else {
-             if whole_word {
-                  cell == query_processed
-             } else {
-                  cell.contains(&query_processed)
-             }
-         }
+        if !match_case {
+            let val_lower = cell.to_lowercase();
+            if whole_word {
+                val_lower == query_processed
+            } else {
+                val_lower.contains(&query_processed)
+            }
+        } else {
+            if whole_word {
+                cell == query_processed
+            } else {
+                cell.contains(&query_processed)
+            }
+        }
     };
 
     if let Some(mmap) = mmap.as_ref() {
@@ -622,9 +706,7 @@ async fn search_csv(
                     .get(index)
                     .map(|cell| check_match(cell))
                     .unwrap_or(false),
-                None => decoded
-                    .iter()
-                    .any(|cell| check_match(cell)),
+                None => decoded.iter().any(|cell| check_match(cell)),
             };
             if is_match {
                 matches.push(idx);
@@ -646,9 +728,7 @@ async fn search_csv(
                     .get(index)
                     .map(|cell| check_match(cell))
                     .unwrap_or(false),
-                None => decoded
-                    .iter()
-                    .any(|cell| check_match(cell)),
+                None => decoded.iter().any(|cell| check_match(cell)),
             };
             if is_match {
                 matches.push(idx);
@@ -658,6 +738,218 @@ async fn search_csv(
     }
 
     Ok(matches)
+}
+
+#[tauri::command]
+async fn search_csv_stream(
+    column_idx: Option<usize>,
+    query: String,
+    match_case: Option<bool>,
+    whole_word: Option<bool>,
+    request_id: u32,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let path = state
+        .file_path
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("No file loaded")?;
+
+    let match_case = match_case.unwrap_or(false);
+    let whole_word = whole_word.unwrap_or(false);
+    let query_processed = if match_case {
+        query.clone()
+    } else {
+        query.to_lowercase()
+    };
+
+    let settings = state.parse_settings.lock().unwrap().clone();
+
+    // Try index-based search first (for exact or contains matches)
+    let search_index = state.search_index.lock().unwrap();
+    if search_index.ready && !match_case {
+        if let Some(col_idx) = column_idx {
+            if col_idx < search_index.columns.len() {
+                if let Some(ref col_index) = search_index.columns[col_idx] {
+                    let query_key: Box<str> = if query_processed.len() > INDEX_VALUE_MAX_LEN {
+                        query_processed[..INDEX_VALUE_MAX_LEN].into()
+                    } else {
+                        query_processed.clone().into()
+                    };
+
+                    if whole_word {
+                        if let Some(rows) = col_index.get(&query_key) {
+                            let matches: Vec<usize> = rows.iter().map(|&r| r as usize).collect();
+                            let total = matches.len();
+                            for chunk in matches.chunks(RESULT_CHUNK_SIZE) {
+                                emit_matches_chunk(&app, "search-chunk", request_id, chunk)?;
+                            }
+                            emit_matches_complete(&app, "search-complete", request_id, total)?;
+                            return Ok(());
+                        } else {
+                            emit_matches_complete(&app, "search-complete", request_id, 0)?;
+                            return Ok(());
+                        }
+                    } else {
+                        let matches: Vec<usize> = col_index
+                            .par_iter()
+                            .filter(|(key, _)| key.contains(&*query_key))
+                            .flat_map(|(_, rows)| rows.par_iter().map(|&r| r as usize))
+                            .collect();
+                        let mut matches: Vec<usize> = matches.into_iter().collect();
+                        matches.par_sort_unstable();
+                        matches.dedup();
+                        let total = matches.len();
+                        for chunk in matches.chunks(RESULT_CHUNK_SIZE) {
+                            emit_matches_chunk(&app, "search-chunk", request_id, chunk)?;
+                        }
+                        emit_matches_complete(&app, "search-complete", request_id, total)?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+    drop(search_index); // Release lock before sequential scan
+
+    let mmap = state.mmap.lock().unwrap().clone();
+    let offsets_guard = state.row_offsets.lock().unwrap();
+    if let Some(offsets) = offsets_guard.as_ref() {
+        let total = offsets.len();
+        let ranges = (0..total)
+            .step_by(SEARCH_CHUNK_SIZE)
+            .map(|start| (start, usize::min(start + SEARCH_CHUNK_SIZE, total)))
+            .collect::<Vec<_>>();
+
+        let mut matches = ranges
+            .par_iter()
+            .try_fold(Vec::new, |mut acc, (start, end)| {
+                let mut found = if let Some(mmap) = mmap.as_ref() {
+                    search_range_with_offsets_mmap(
+                        &mmap[..],
+                        offsets,
+                        *start,
+                        *end,
+                        column_idx,
+                        &query_processed,
+                        match_case,
+                        whole_word,
+                        &settings,
+                    )
+                } else {
+                    search_range_with_offsets(
+                        &path,
+                        offsets,
+                        *start,
+                        *end,
+                        column_idx,
+                        &query_processed,
+                        match_case,
+                        whole_word,
+                        &settings,
+                    )
+                }
+                .map_err(|err| err.to_string())?;
+                acc.append(&mut found);
+                Ok::<Vec<usize>, String>(acc)
+            })
+            .try_reduce(Vec::new, |mut left, mut right| {
+                left.append(&mut right);
+                Ok::<Vec<usize>, String>(left)
+            })?;
+
+        matches.sort_unstable();
+        let total = matches.len();
+        for chunk in matches.chunks(RESULT_CHUNK_SIZE) {
+            emit_matches_chunk(&app, "search-chunk", request_id, chunk)?;
+        }
+        emit_matches_complete(&app, "search-complete", request_id, total)?;
+        return Ok(());
+    }
+    drop(offsets_guard);
+
+    let mut matches = Vec::new();
+    let mut total = 0usize;
+    let mut record = csv::ByteRecord::new();
+    let mut idx: usize = 0;
+
+    let check_match = |cell: &str| -> bool {
+        if !match_case {
+            let val_lower = cell.to_lowercase();
+            if whole_word {
+                val_lower == query_processed
+            } else {
+                val_lower.contains(&query_processed)
+            }
+        } else {
+            if whole_word {
+                cell == query_processed
+            } else {
+                cell.contains(&query_processed)
+            }
+        }
+    };
+
+    if let Some(mmap) = mmap.as_ref() {
+        let mut rdr = build_reader(&mmap[..], &settings, settings.has_headers);
+        while rdr
+            .read_byte_record(&mut record)
+            .map_err(|err| err.to_string())?
+        {
+            let strip_bom = !settings.has_headers && idx == 0;
+            let (decoded, _) = decode_record(&record, &settings, strip_bom);
+            let is_match = match column_idx {
+                Some(index) => decoded
+                    .get(index)
+                    .map(|cell| check_match(cell))
+                    .unwrap_or(false),
+                None => decoded.iter().any(|cell| check_match(cell)),
+            };
+            if is_match {
+                matches.push(idx);
+                if matches.len() >= RESULT_CHUNK_SIZE {
+                    total += matches.len();
+                    emit_matches_chunk(&app, "search-chunk", request_id, &matches)?;
+                    matches.clear();
+                }
+            }
+            idx += 1;
+        }
+    } else {
+        let file = std::fs::File::open(&path).map_err(|err| err.to_string())?;
+        let reader = std::io::BufReader::new(file);
+        let mut rdr = build_reader(reader, &settings, settings.has_headers);
+        while rdr
+            .read_byte_record(&mut record)
+            .map_err(|err| err.to_string())?
+        {
+            let strip_bom = !settings.has_headers && idx == 0;
+            let (decoded, _) = decode_record(&record, &settings, strip_bom);
+            let is_match = match column_idx {
+                Some(index) => decoded
+                    .get(index)
+                    .map(|cell| check_match(cell))
+                    .unwrap_or(false),
+                None => decoded.iter().any(|cell| check_match(cell)),
+            };
+            if is_match {
+                matches.push(idx);
+                if matches.len() >= RESULT_CHUNK_SIZE {
+                    total += matches.len();
+                    emit_matches_chunk(&app, "search-chunk", request_id, &matches)?;
+                    matches.clear();
+                }
+            }
+            idx += 1;
+        }
+    }
+
+    total += matches.len();
+    emit_matches_chunk(&app, "search-chunk", request_id, &matches)?;
+    emit_matches_complete(&app, "search-complete", request_id, total)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -680,24 +972,49 @@ async fn find_duplicates(
 
     // Use hashed approach for memory efficiency
     let duplicates = if let Some(mmap) = mmap.as_ref() {
-        csv_handler::find_duplicates_hashed_mmap(
-            &mmap[..],
-            &offsets,
-            &settings,
-            column_idx,
-        )
-        .map_err(|err| err.to_string())?
+        csv_handler::find_duplicates_hashed_mmap(&mmap[..], &offsets, &settings, column_idx)
+            .map_err(|err| err.to_string())?
     } else {
-        csv_handler::find_duplicates_hashed(
-            &path,
-            &offsets,
-            &settings,
-            column_idx,
-        )
-        .map_err(|err| err.to_string())?
+        csv_handler::find_duplicates_hashed(&path, &offsets, &settings, column_idx)
+            .map_err(|err| err.to_string())?
     };
 
     Ok(duplicates)
+}
+
+#[tauri::command]
+async fn find_duplicates_stream(
+    column_idx: Option<usize>,
+    request_id: u32,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let path = state
+        .file_path
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("No file loaded")?;
+    let settings = state.parse_settings.lock().unwrap().clone();
+
+    let mmap = state.mmap.lock().unwrap().clone();
+    let offsets = state.row_offsets.lock().unwrap().clone();
+    let offsets = offsets.ok_or("File not fully indexed yet")?;
+
+    let duplicates = if let Some(mmap) = mmap.as_ref() {
+        csv_handler::find_duplicates_hashed_mmap(&mmap[..], &offsets, &settings, column_idx)
+            .map_err(|err| err.to_string())?
+    } else {
+        csv_handler::find_duplicates_hashed(&path, &offsets, &settings, column_idx)
+            .map_err(|err| err.to_string())?
+    };
+
+    let total = duplicates.len();
+    for chunk in duplicates.chunks(RESULT_CHUNK_SIZE) {
+        emit_matches_chunk(&app, "duplicates-chunk", request_id, chunk)?;
+    }
+    emit_matches_complete(&app, "duplicates-complete", request_id, total)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -736,15 +1053,18 @@ async fn sort_csv(
     let offsets = state.row_offsets.lock().unwrap().clone();
     let expected_columns = {
         let len = state.headers.lock().unwrap().len();
-        if len == 0 { None } else { Some(len) }
+        if len == 0 {
+            None
+        } else {
+            Some(len)
+        }
     };
     // Memory optimization: truncate values to 256 chars max
     // Most sort comparisons differ in first few chars anyway
     const SORT_VALUE_MAX_LEN: usize = 256;
     let mut warnings = Vec::new();
-    let mut rows: Vec<(u32, Box<str>)> = Vec::with_capacity(
-        offsets.as_ref().map(|o| o.len()).unwrap_or(100_000)
-    );
+    let mut rows: Vec<(u32, Box<str>)> =
+        Vec::with_capacity(offsets.as_ref().map(|o| o.len()).unwrap_or(100_000));
     let mut start = 0usize;
 
     loop {
@@ -805,14 +1125,17 @@ async fn sort_csv(
 
         for (idx, row) in chunk.iter().enumerate() {
             let row_index = (start + idx) as u32;
-            let value = row.get(column_idx).map(|s| {
-                // Truncate to reduce memory usage
-                if s.len() > SORT_VALUE_MAX_LEN {
-                    s[..SORT_VALUE_MAX_LEN].into()
-                } else {
-                    s.as_str().into()
-                }
-            }).unwrap_or_else(|| "".into());
+            let value = row
+                .get(column_idx)
+                .map(|s| {
+                    // Truncate to reduce memory usage
+                    if s.len() > SORT_VALUE_MAX_LEN {
+                        s[..SORT_VALUE_MAX_LEN].into()
+                    } else {
+                        s.as_str().into()
+                    }
+                })
+                .unwrap_or_else(|| "".into());
             rows.push((row_index, value));
         }
 
@@ -864,7 +1187,11 @@ async fn get_sorted_chunk(
     let settings = state.parse_settings.lock().unwrap().clone();
     let expected_columns = {
         let len = state.headers.lock().unwrap().len();
-        if len == 0 { None } else { Some(len) }
+        if len == 0 {
+            None
+        } else {
+            Some(len)
+        }
     };
     let mut warnings = Vec::new();
     let mmap = state.mmap.lock().unwrap().clone();
@@ -985,7 +1312,9 @@ pub fn run() {
             load_csv_metadata,
             get_csv_chunk,
             search_csv,
+            search_csv_stream,
             find_duplicates,
+            find_duplicates_stream,
             sort_csv,
             get_sorted_chunk,
             clear_sort,
@@ -1074,11 +1403,15 @@ fn build_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
     let open_item = MenuItemBuilder::with_id("open", "Open...")
         .accelerator("CmdOrCtrl+O")
         .build(app)?;
-    let clear_item = MenuItemBuilder::with_id("clear", "Clear").build(app)?;
+    let clear_item = MenuItemBuilder::with_id("clear", "Clear")
+        .accelerator("CmdOrCtrl+Shift+K")
+        .build(app)?;
     let find_item = MenuItemBuilder::with_id("find", "Find...")
         .accelerator("CmdOrCtrl+F")
         .build(app)?;
-    let clear_search_item = MenuItemBuilder::with_id("clear-search", "Clear Search").build(app)?;
+    let clear_search_item = MenuItemBuilder::with_id("clear-search", "Clear Search")
+        .accelerator("CmdOrCtrl+Shift+F")
+        .build(app)?;
     let next_match_item = MenuItemBuilder::with_id("next-match", "Next Match")
         .accelerator("F3")
         .build(app)?;
@@ -1091,11 +1424,33 @@ fn build_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
     let reload_item = MenuItemBuilder::with_id("reload", "Reload")
         .accelerator("CmdOrCtrl+R")
         .build(app)?;
-    let check_duplicates_item =
-        MenuItemBuilder::with_id("check-duplicates", "Check Duplicates...").build(app)?;
-    let parse_settings_item =
-        MenuItemBuilder::with_id("parse-settings", "Parse Settings...").build(app)?;
-
+    let toggle_theme_item = MenuItemBuilder::with_id("toggle-theme", "Toggle Theme")
+        .accelerator("CmdOrCtrl+Shift+T")
+        .build(app)?;
+    let show_index_item = CheckMenuItemBuilder::with_id("show-index", "Show Line Numbers")
+        .accelerator("CmdOrCtrl+I")
+        .checked(false)
+        .build(app)?;
+    let row_compact_item = MenuItemBuilder::with_id("row-compact", "Compact")
+        .accelerator("CmdOrCtrl+Alt+1")
+        .build(app)?;
+    let row_default_item = MenuItemBuilder::with_id("row-default", "Default")
+        .accelerator("CmdOrCtrl+Alt+2")
+        .build(app)?;
+    let row_spacious_item = MenuItemBuilder::with_id("row-spacious", "Spacious")
+        .accelerator("CmdOrCtrl+Alt+3")
+        .build(app)?;
+    let row_height_menu = SubmenuBuilder::new(app, "Row Height")
+        .item(&row_compact_item)
+        .item(&row_default_item)
+        .item(&row_spacious_item)
+        .build()?;
+    let check_duplicates_item = MenuItemBuilder::with_id("check-duplicates", "Check Duplicates...")
+        .accelerator("CmdOrCtrl+Shift+D")
+        .build(app)?;
+    let parse_settings_item = MenuItemBuilder::with_id("parse-settings", "Parse Settings...")
+        .accelerator("CmdOrCtrl+Shift+P")
+        .build(app)?;
 
     let file_menu = SubmenuBuilder::new(app, "File")
         .item(&open_item)
@@ -1104,13 +1459,19 @@ fn build_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
         .close_window()
         .quit()
         .build()?;
-    let settings_item = MenuItemBuilder::with_id("open-settings", "Open Settings...").build(app)?;
+    let settings_item = MenuItemBuilder::with_id("open-settings", "Open Settings...")
+        .accelerator("CmdOrCtrl+,")
+        .build(app)?;
     let edit_menu = SubmenuBuilder::new(app, "Settings")
         .item(&settings_item)
         .build()?;
 
     let view_menu = SubmenuBuilder::with_id(app, "view", "View")
         .item(&reload_item)
+        .item(&toggle_theme_item)
+        .separator()
+        .item(&show_index_item)
+        .item(&row_height_menu)
         .build()?;
     let search_menu = SubmenuBuilder::new(app, "Search")
         .item(&find_item)
@@ -1128,12 +1489,52 @@ fn build_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
         .accelerator("CmdOrCtrl+O")
         .enabled(false)
         .build(app)?;
+    let shortcuts_clear = MenuItemBuilder::new("Clear File")
+        .accelerator("CmdOrCtrl+Shift+K")
+        .enabled(false)
+        .build(app)?;
     let shortcuts_find = MenuItemBuilder::new("Find")
         .accelerator("CmdOrCtrl+F")
         .enabled(false)
         .build(app)?;
+    let shortcuts_clear_search = MenuItemBuilder::new("Clear Search")
+        .accelerator("CmdOrCtrl+Shift+F")
+        .enabled(false)
+        .build(app)?;
     let shortcuts_reload = MenuItemBuilder::new("Reload")
         .accelerator("CmdOrCtrl+R")
+        .enabled(false)
+        .build(app)?;
+    let shortcuts_toggle_theme = MenuItemBuilder::new("Toggle Theme")
+        .accelerator("CmdOrCtrl+Shift+T")
+        .enabled(false)
+        .build(app)?;
+    let shortcuts_show_index = MenuItemBuilder::new("Show Line Numbers")
+        .accelerator("CmdOrCtrl+I")
+        .enabled(false)
+        .build(app)?;
+    let shortcuts_row_compact = MenuItemBuilder::new("Row Height: Compact")
+        .accelerator("CmdOrCtrl+Alt+1")
+        .enabled(false)
+        .build(app)?;
+    let shortcuts_row_default = MenuItemBuilder::new("Row Height: Default")
+        .accelerator("CmdOrCtrl+Alt+2")
+        .enabled(false)
+        .build(app)?;
+    let shortcuts_row_spacious = MenuItemBuilder::new("Row Height: Spacious")
+        .accelerator("CmdOrCtrl+Alt+3")
+        .enabled(false)
+        .build(app)?;
+    let shortcuts_check_duplicates = MenuItemBuilder::new("Check Duplicates")
+        .accelerator("CmdOrCtrl+Shift+D")
+        .enabled(false)
+        .build(app)?;
+    let shortcuts_parse_settings = MenuItemBuilder::new("Parse Settings")
+        .accelerator("CmdOrCtrl+Shift+P")
+        .enabled(false)
+        .build(app)?;
+    let shortcuts_settings = MenuItemBuilder::new("Open Settings")
+        .accelerator("CmdOrCtrl+,")
         .enabled(false)
         .build(app)?;
     let shortcuts_next = MenuItemBuilder::new("Next Match")
@@ -1155,15 +1556,28 @@ fn build_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
         .build(app)?;
     let shortcuts_menu = SubmenuBuilder::new(app, "Shortcuts")
         .item(&shortcuts_open)
-        .item(&shortcuts_find)
-        .item(&shortcuts_reload)
+        .item(&shortcuts_clear)
         .separator()
+        .item(&shortcuts_find)
+        .item(&shortcuts_clear_search)
         .item(&shortcuts_next)
         .item(&shortcuts_prev)
         .separator()
         .item(&shortcuts_enter)
         .item(&shortcuts_shift_enter)
         .item(&shortcuts_esc)
+        .separator()
+        .item(&shortcuts_reload)
+        .item(&shortcuts_toggle_theme)
+        .item(&shortcuts_show_index)
+        .item(&shortcuts_row_compact)
+        .item(&shortcuts_row_default)
+        .item(&shortcuts_row_spacious)
+        .separator()
+        .item(&shortcuts_check_duplicates)
+        .item(&shortcuts_parse_settings)
+        .separator()
+        .item(&shortcuts_settings)
         .build()?;
     let package = app.package_info();
     let authors = package

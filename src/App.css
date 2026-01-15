@@ -171,8 +171,10 @@ option {
 
 .tool-bar {
     display: grid;
-    grid-template-columns:
-        minmax(200px, 1fr) minmax(320px, 1.7fr) minmax(240px, 1.1fr);
+    grid-template-columns: minmax(200px, 1fr) minmax(320px, 1.7fr) minmax(
+            240px,
+            1.1fr
+        );
     align-items: center;
     gap: 12px;
     padding: 6px 12px;
@@ -1429,8 +1431,8 @@ option {
 }
 
 /* Correct way: ensure input padding allows for icon if it was absolute?
-   But here it is flex item. left to right: Icon, Input. 
-   So input padding-left can be small. 
+   But here it is flex item. left to right: Icon, Input.
+   So input padding-left can be small.
 */
 
 /* Alignment fixes */
@@ -1562,7 +1564,9 @@ option {
     backdrop-filter: blur(2px);
     display: flex;
     justify-content: center;
-    align-items: center;
+    align-items: flex-start;
+    padding: 24px 16px;
+    overflow-y: auto;
     z-index: 9999;
 }
 
@@ -1571,13 +1575,16 @@ option {
     background-color: var(--surface);
     width: 480px;
     max-width: 90vw;
+    max-height: none;
     border-radius: 12px;
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.7);
     border: 1px solid var(--border);
     display: flex;
     flex-direction: column;
+    overflow: visible;
     position: relative;
     z-index: 10000;
+    margin: 24px auto;
 }
 
 .modal-header {
@@ -1617,7 +1624,9 @@ option {
 
 .modal-body {
     padding: 24px;
-    flex: 1;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: visible;
 }
 
 .setting-group {
@@ -1668,7 +1677,7 @@ option {
     right: 0;
     bottom: 0;
     background-color: #3a3a3a;
-    transition: .3s;
+    transition: 0.3s;
     border-radius: 24px;
 }
 
@@ -1680,16 +1689,16 @@ option {
     left: 3px;
     bottom: 3px;
     background-color: white;
-    transition: .3s;
+    transition: 0.3s;
     border-radius: 50%;
     box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
 }
 
-input:checked+.slider {
+input:checked + .slider {
     background-color: var(--accent);
 }
 
-input:checked+.slider:before {
+input:checked + .slider:before {
     transform: translateX(20px);
 }
 
