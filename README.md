@@ -3,6 +3,7 @@
 QuickRows is a fast, desktop CSV viewer built with Tauri (Rust) and React.
 It is designed to stay responsive with very large files by pushing heavy work
 into the Rust backend and rendering rows virtually in the UI.
+This is a vibe-coded project tailored to my personal workflow and needs.
 
 ## Features
 - Open large CSVs without loading everything into memory.
