@@ -56,6 +56,8 @@
     --cell-min: 160px;
     --row-height: 36px;
     --surface: #ffffff;
+    --floating-toolbar-bg: rgba(255, 255, 255, 0.86);
+    --floating-toolbar-border: rgba(46, 52, 54, 0.18);
 }
 
 :root[data-theme="dark"] {
@@ -105,6 +107,8 @@
     --empty-card: #242424;
     --empty-card-border: #3b3b3b;
     --surface: #1e1e1e;
+    --floating-toolbar-bg: rgba(36, 36, 36, 0.86);
+    --floating-toolbar-border: rgba(255, 255, 255, 0.14);
 }
 
 * {
@@ -408,6 +412,31 @@ option {
     color: white;
 }
 
+.notice {
+    position: fixed;
+    left: 12px;
+    bottom: 12px;
+    z-index: 30;
+    padding: 8px 12px;
+    font-size: 0.82rem;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--floating-toolbar-bg);
+    color: var(--ink);
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.22);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    pointer-events: none;
+    max-width: calc(100vw - 24px);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.notice.with-floating-toolbar {
+    bottom: 64px;
+}
+
 .table-shell {
     flex: 1;
     min-height: 0;
@@ -458,6 +487,15 @@ option {
     background: var(--panel-strong);
     color: var(--ink);
     border: 1px solid var(--border);
+}
+
+.selection-pill {
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-size: 0.7rem;
+    background: var(--accent-soft);
+    color: var(--ink);
+    border: 1px solid var(--accent-outline);
 }
 
 .parse-banner {
@@ -654,6 +692,44 @@ option {
     min-height: 0;
     display: flex;
     flex-direction: column;
+    position: relative;
+}
+
+.floating-toolbar {
+    position: absolute;
+    left: 12px;
+    right: 12px;
+    bottom: 12px;
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    z-index: 16;
+    pointer-events: none;
+}
+
+.floating-toolbar.with-loading {
+    bottom: 44px;
+}
+
+.floating-toolbar-surface {
+    pointer-events: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-radius: 999px;
+    background: var(--floating-toolbar-bg);
+    border: 1px solid var(--floating-toolbar-border);
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.25);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+}
+
+.floating-toolbar-actions {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
 }
 
 .table-header {
@@ -684,34 +760,41 @@ option {
     display: flex;
     align-items: center;
     border-bottom: 1px solid var(--row-divider);
+    user-select: none;
+    -webkit-user-select: none;
 }
 
 .table-row.even {
-    background: var(--row-even);
+    background-color: var(--row-even);
 }
 
 .table-row.odd {
-    background: var(--row-odd);
+    background-color: var(--row-odd);
 }
 
 .table-row:hover {
-    background: var(--row-hover);
+    background-color: var(--row-hover);
 }
 
 .table-row.match {
-    background: var(--row-match);
+    background-color: var(--row-match);
     outline: 1px solid var(--row-match-outline);
     outline-offset: -1px;
 }
 
 .table-row.current {
-    background: var(--row-current);
+    background-color: var(--row-current);
     outline: 2px solid var(--row-current-outline);
     outline-offset: -2px;
 }
 
+.table-row.selected {
+    background-image: linear-gradient(var(--accent-soft), var(--accent-soft));
+    box-shadow: inset 0 0 0 2px var(--accent-outline-strong);
+}
+
 .table-row.deleted {
-    background: var(--panel-muted);
+    background-color: var(--panel-muted);
 }
 
 .table-cell {
@@ -727,6 +810,8 @@ option {
     font-size: 0.84rem;
     font-variant-numeric: tabular-nums;
     contain: layout style paint;
+    user-select: none;
+    -webkit-user-select: none;
 }
 
 .table-cell.deleted {
@@ -737,6 +822,8 @@ option {
 
 .table-cell.editing {
     padding: 0;
+    user-select: text;
+    -webkit-user-select: text;
 }
 
 .cell-editor {
@@ -750,6 +837,8 @@ option {
     background: var(--input-bg);
     color: var(--input-text);
     outline: none;
+    user-select: text;
+    -webkit-user-select: text;
 }
 
 .table-cell.index {

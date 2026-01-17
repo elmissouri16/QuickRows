@@ -20,7 +20,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 // use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use tauri::{Emitter, Manager, State};
+use tauri::{Emitter, Manager, State, WebviewWindowBuilder};
 
 #[cfg(desktop)]
 use tauri::menu::{
@@ -1232,6 +1232,21 @@ async fn get_sorted_chunk(
 }
 
 #[tauri::command]
+async fn get_sorted_indices(
+    start: usize,
+    count: usize,
+    state: State<'_, AppState>,
+) -> Result<Vec<usize>, String> {
+    let sorted = state.sorted_order.lock().unwrap();
+    let order = sorted.as_ref().ok_or("No sorted data")?;
+    if start >= order.len() {
+        return Ok(Vec::new());
+    }
+    let end = usize::min(start + count, order.len());
+    Ok(order[start..end].to_vec())
+}
+
+#[tauri::command]
 async fn clear_sort(state: State<'_, AppState>) -> Result<(), String> {
     *state.sorted_order.lock().unwrap() = None;
     Ok(())
@@ -1297,6 +1312,14 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            for window_config in app.config().app.windows.iter().filter(|w| !w.create) {
+                WebviewWindowBuilder::from_config(app.handle(), window_config)?
+                    .enable_clipboard_access()
+                    .build()?;
+            }
+            Ok(())
+        })
         .manage(AppState {
             file_path: Mutex::new(None),
             total_rows: Mutex::new(0),
@@ -1322,6 +1345,7 @@ pub fn run() {
             find_duplicates_stream,
             sort_csv,
             get_sorted_chunk,
+            get_sorted_indices,
             clear_sort,
             take_pending_open,
             get_row_count,

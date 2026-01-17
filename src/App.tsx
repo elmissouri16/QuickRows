@@ -113,7 +113,86 @@ type ParseOverridesState = {
   maxRecordSize: number;
 };
 
+type SelectionRange = { start: number; end: number };
+
 const clampColumnWidth = (value: number) => Math.max(COLUMN_WIDTH_MIN, value);
+const normalizeSelectionRanges = (ranges: SelectionRange[]) => {
+  const sorted = ranges
+    .map((range) => ({
+      start: Math.min(range.start, range.end),
+      end: Math.max(range.start, range.end),
+    }))
+    .filter(
+      (range) => Number.isFinite(range.start) && Number.isFinite(range.end),
+    )
+    .sort((a, b) => a.start - b.start);
+
+  const merged: SelectionRange[] = [];
+  for (const range of sorted) {
+    const last = merged[merged.length - 1];
+    if (!last || range.start > last.end + 1) {
+      merged.push({ ...range });
+      continue;
+    }
+    last.end = Math.max(last.end, range.end);
+  }
+  return merged;
+};
+const isIndexInSelectionRanges = (ranges: SelectionRange[], index: number) => {
+  let lo = 0;
+  let hi = ranges.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const range = ranges[mid];
+    if (index < range.start) {
+      hi = mid - 1;
+      continue;
+    }
+    if (index > range.end) {
+      lo = mid + 1;
+      continue;
+    }
+    return true;
+  }
+  return false;
+};
+const toggleSelectionIndex = (ranges: SelectionRange[], index: number) => {
+  const next: SelectionRange[] = [];
+  for (const range of ranges) {
+    if (index < range.start || index > range.end) {
+      next.push(range);
+      continue;
+    }
+    if (range.start === range.end) {
+      continue;
+    }
+    if (index === range.start) {
+      next.push({ start: range.start + 1, end: range.end });
+      continue;
+    }
+    if (index === range.end) {
+      next.push({ start: range.start, end: range.end - 1 });
+      continue;
+    }
+    next.push({ start: range.start, end: index - 1 });
+    next.push({ start: index + 1, end: range.end });
+  }
+  return next;
+};
+const addSelectionRange = (ranges: SelectionRange[], range: SelectionRange) =>
+  normalizeSelectionRanges([...ranges, range]);
+const isTextInputTarget = (target: EventTarget | null) => {
+  if (!target || !(target instanceof HTMLElement)) {
+    return false;
+  }
+  const tag = target.tagName;
+  return (
+    tag === "INPUT" ||
+    tag === "TEXTAREA" ||
+    tag === "SELECT" ||
+    target.isContentEditable
+  );
+};
 const getSystemTheme = (): ThemeMode => {
   if (typeof window !== "undefined") {
     if (window.matchMedia?.("(prefers-color-scheme: dark)").matches) {
@@ -222,6 +301,7 @@ function App() {
   const [rowCountReady, setRowCountReady] = useState(false);
   const [loadingRows, setLoadingRows] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
   const [searchColumn, setSearchColumn] = useState<number | null>(null);
   const [searchMatchCase, setSearchMatchCase] = useState(false);
@@ -273,6 +353,9 @@ function App() {
   const [deletedRowsVersion, setDeletedRowsVersion] = useState(0);
   const [loadingProgress, setLoadingProgress] = useState<number | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [selectedRanges, setSelectedRanges] = useState<SelectionRange[]>([]);
+  const [selectionAnchor, setSelectionAnchor] = useState<number | null>(null);
+  const [focusedRow, setFocusedRow] = useState<number | null>(null);
   const [enableIndexing, setEnableIndexing] = useState(() => {
     const saved = localStorage.getItem("csv-viewer-enable-indexing");
     return saved !== null ? saved === "true" : true; // Default enabled
@@ -305,12 +388,84 @@ function App() {
   const resizeFrameRef = useRef<number | null>(null);
   const pendingWidthRef = useRef<number | null>(null);
 
+  const selectedCount = useMemo(() => {
+    let total = 0;
+    for (const range of selectedRanges) {
+      total += range.end - range.start + 1;
+    }
+    return total;
+  }, [selectedRanges]);
+
+  const isDirty = editsRef.current.size > 0 || deletedRowsRef.current.size > 0;
+
+  const clearSelection = useCallback(() => {
+    setSelectedRanges([]);
+    setSelectionAnchor(null);
+    setFocusedRow(null);
+  }, []);
+
+  const selectDisplayRow = useCallback(
+    (displayIndex: number, opts: { shiftKey: boolean; toggleKey: boolean }) => {
+      if (!Number.isFinite(displayIndex) || displayIndex < 0) {
+        return;
+      }
+      if (totalRows && displayIndex > totalRows - 1) {
+        return;
+      }
+
+      if (opts.shiftKey) {
+        const anchor = selectionAnchor ?? displayIndex;
+        const range = {
+          start: Math.min(anchor, displayIndex),
+          end: Math.max(anchor, displayIndex),
+        };
+        setSelectedRanges((prev) => {
+          const normalized = normalizeSelectionRanges(prev);
+          return opts.toggleKey
+            ? addSelectionRange(normalized, range)
+            : [range];
+        });
+        setSelectionAnchor((prev) => prev ?? displayIndex);
+        setFocusedRow(displayIndex);
+        return;
+      }
+
+      if (opts.toggleKey) {
+        setSelectedRanges((prev) => {
+          const normalized = normalizeSelectionRanges(prev);
+          if (isIndexInSelectionRanges(normalized, displayIndex)) {
+            return toggleSelectionIndex(normalized, displayIndex);
+          }
+          return addSelectionRange(normalized, {
+            start: displayIndex,
+            end: displayIndex,
+          });
+        });
+        setSelectionAnchor(displayIndex);
+        setFocusedRow(displayIndex);
+        return;
+      }
+
+      setSelectedRanges([{ start: displayIndex, end: displayIndex }]);
+      setSelectionAnchor(displayIndex);
+      setFocusedRow(displayIndex);
+    },
+    [selectionAnchor, totalRows],
+  );
+
   useEffect(() => {
     if (error) {
       const timer = setTimeout(() => setError(null), 3000);
       return () => clearTimeout(timer);
     }
   }, [error]);
+
+  useEffect(() => {
+    if (notice) {
+      const timer = setTimeout(() => setNotice(null), 2200);
+      return () => clearTimeout(timer);
+    }
+  }, [notice]);
 
   const editingKey = useMemo(
     () =>
@@ -330,6 +485,31 @@ function App() {
     localStorage.setItem("csv-viewer-enable-indexing", String(enableIndexing));
     invoke("set_enable_indexing", { enabled: enableIndexing }).catch(() => {});
   }, [enableIndexing]);
+
+  useEffect(() => {
+    if (!totalRows) {
+      setSelectedRanges([]);
+      setSelectionAnchor(null);
+      setFocusedRow(null);
+      return;
+    }
+    setSelectedRanges((prev) => {
+      const maxIndex = totalRows - 1;
+      const next = prev
+        .map((range) => ({
+          start: Math.max(0, Math.min(range.start, maxIndex)),
+          end: Math.max(0, Math.min(range.end, maxIndex)),
+        }))
+        .filter((range) => range.start <= range.end);
+      return normalizeSelectionRanges(next);
+    });
+    setSelectionAnchor((prev) =>
+      prev === null ? null : Math.min(prev, totalRows - 1),
+    );
+    setFocusedRow((prev) =>
+      prev === null ? null : Math.min(prev, totalRows - 1),
+    );
+  }, [totalRows]);
 
   const MAX_SCROLL_PIXELS = 15_000_000;
   const totalSize = totalRows * rowHeight;
@@ -540,6 +720,13 @@ function App() {
   }, [showIndex]);
 
   useEffect(() => {
+    if (!filePath) {
+      return;
+    }
+    clearSelection();
+  }, [clearSelection, filePath, sortState?.column, sortState?.direction]);
+
+  useEffect(() => {
     if (themePreference !== "system") {
       setResolvedTheme(themePreference);
       return;
@@ -602,6 +789,9 @@ function App() {
     searchRequestIdRef.current += 1;
     duplicateRequestIdRef.current += 1;
     setError(null);
+    setSelectedRanges([]);
+    setSelectionAnchor(null);
+    setFocusedRow(null);
     setSortState(null);
     setSortLoading(false);
     setSortedIndexLookup(null);
@@ -813,6 +1003,194 @@ function App() {
     [getOriginalRowIndex],
   );
 
+  const deleteSelectedRows = useCallback(async () => {
+    if (!filePath) {
+      return;
+    }
+    const normalized = normalizeSelectionRanges(selectedRanges);
+    if (!normalized.length) {
+      return;
+    }
+
+    const selectionSize = selectedCount;
+    if (selectionSize >= 1000) {
+      const ok = window.confirm(
+        `Delete ${selectionSize.toLocaleString()} selected rows?`,
+      );
+      if (!ok) {
+        return;
+      }
+    }
+
+    try {
+      let changed = false;
+      if (!sortState) {
+        for (const range of normalized) {
+          for (
+            let displayRow = range.start;
+            displayRow <= range.end;
+            displayRow += 1
+          ) {
+            if (displayRow < 0 || displayRow >= totalRows) {
+              continue;
+            }
+            if (deletedRowsRef.current.has(displayRow)) {
+              continue;
+            }
+            deletedRowsRef.current.add(displayRow);
+            changed = true;
+          }
+        }
+      } else {
+        for (const range of normalized) {
+          let start = Math.max(0, range.start);
+          const end = Math.min(range.end, totalRows - 1);
+          while (start <= end) {
+            const count = Math.min(CHUNK_SIZE, end - start + 1);
+            const originalIndices = await invoke<number[]>(
+              "get_sorted_indices",
+              {
+                start,
+                count,
+              },
+            );
+            originalIndices.forEach((originalRow) => {
+              if (deletedRowsRef.current.has(originalRow)) {
+                return;
+              }
+              deletedRowsRef.current.add(originalRow);
+              changed = true;
+            });
+            start += count;
+            if (originalIndices.length < count) {
+              break;
+            }
+          }
+        }
+      }
+
+      if (!changed) {
+        return;
+      }
+
+      setEditingCell((prev) =>
+        prev && deletedRowsRef.current.has(prev.originalRow) ? null : prev,
+      );
+      setDeletedRowsVersion((prev) => prev + 1);
+      setHasEdits(true);
+      setSearchStale(true);
+      setDuplicateStale(true);
+    } catch (err) {
+      setError(
+        typeof err === "string" ? err : "Failed to delete selected rows.",
+      );
+    }
+  }, [filePath, selectedCount, selectedRanges, sortState, totalRows]);
+
+  const copySelectedRows = useCallback(async () => {
+    if (!filePath) {
+      return;
+    }
+    if (sortLoading) {
+      setError("Wait for sorting to finish before copying.");
+      return;
+    }
+    const normalized = normalizeSelectionRanges(selectedRanges);
+    if (!normalized.length) {
+      return;
+    }
+
+    const selectionSize = selectedCount;
+    if (selectionSize >= 5000) {
+      const ok = window.confirm(
+        `Copy ${selectionSize.toLocaleString()} selected rows?`,
+      );
+      if (!ok) {
+        return;
+      }
+    }
+
+    try {
+      const lines: string[] = [];
+      if (!sortState) {
+        for (const range of normalized) {
+          let start = Math.max(0, range.start);
+          const end = Math.min(range.end, totalRows - 1);
+          while (start <= end) {
+            const count = Math.min(CHUNK_SIZE, end - start + 1);
+            const chunk = await invoke<string[][]>("get_csv_chunk", {
+              start,
+              count,
+            });
+            chunk.forEach((row, idx) => {
+              const originalIndex = start + idx;
+              if (deletedRowsRef.current.has(originalIndex)) {
+                return;
+              }
+              const nextRow = applyEditsToRow(row, originalIndex);
+              lines.push(
+                formatCsvRow(nextRow, csvFormat.delimiter, csvFormat.quote),
+              );
+            });
+            start += chunk.length;
+            if (chunk.length < count) {
+              break;
+            }
+          }
+        }
+      } else {
+        for (const range of normalized) {
+          let start = Math.max(0, range.start);
+          const end = Math.min(range.end, totalRows - 1);
+          while (start <= end) {
+            const count = Math.min(CHUNK_SIZE, end - start + 1);
+            const chunk = await invoke<SortedRow[]>("get_sorted_chunk", {
+              start,
+              count,
+            });
+            chunk.forEach((item) => {
+              if (deletedRowsRef.current.has(item.index)) {
+                return;
+              }
+              const nextRow = applyEditsToRow(item.row, item.index);
+              lines.push(
+                formatCsvRow(nextRow, csvFormat.delimiter, csvFormat.quote),
+              );
+            });
+            start += chunk.length;
+            if (chunk.length < count) {
+              break;
+            }
+          }
+        }
+      }
+
+      if (!lines.length) {
+        return;
+      }
+
+      const ok = await copyToClipboard(lines.join(csvFormat.lineEnding));
+      if (!ok) {
+        setError("Copy failed (clipboard access may be disabled).");
+        return;
+      }
+      setNotice(`Copied ${lines.length.toLocaleString()} row(s).`);
+    } catch (err) {
+      setError(typeof err === "string" ? err : "Failed to copy selected rows.");
+    }
+  }, [
+    applyEditsToRow,
+    csvFormat.delimiter,
+    csvFormat.lineEnding,
+    csvFormat.quote,
+    filePath,
+    selectedCount,
+    selectedRanges,
+    sortLoading,
+    sortState,
+    totalRows,
+  ]);
+
   const restoreRow = useCallback(
     (displayRow: number) => {
       const originalRow = getOriginalRowIndex(displayRow);
@@ -830,6 +1208,77 @@ function App() {
     },
     [getOriginalRowIndex],
   );
+
+  const restoreSelectedRows = useCallback(async () => {
+    if (!filePath) {
+      return;
+    }
+    const normalized = normalizeSelectionRanges(selectedRanges);
+    if (!normalized.length) {
+      return;
+    }
+
+    try {
+      let changed = false;
+      if (!sortState) {
+        for (const range of normalized) {
+          for (
+            let displayRow = range.start;
+            displayRow <= range.end;
+            displayRow += 1
+          ) {
+            if (displayRow < 0 || displayRow >= totalRows) {
+              continue;
+            }
+            if (!deletedRowsRef.current.has(displayRow)) {
+              continue;
+            }
+            deletedRowsRef.current.delete(displayRow);
+            changed = true;
+          }
+        }
+      } else {
+        for (const range of normalized) {
+          let start = Math.max(0, range.start);
+          const end = Math.min(range.end, totalRows - 1);
+          while (start <= end) {
+            const count = Math.min(CHUNK_SIZE, end - start + 1);
+            const originalIndices = await invoke<number[]>(
+              "get_sorted_indices",
+              {
+                start,
+                count,
+              },
+            );
+            originalIndices.forEach((originalRow) => {
+              if (!deletedRowsRef.current.has(originalRow)) {
+                return;
+              }
+              deletedRowsRef.current.delete(originalRow);
+              changed = true;
+            });
+            start += count;
+            if (originalIndices.length < count) {
+              break;
+            }
+          }
+        }
+      }
+
+      if (!changed) {
+        return;
+      }
+
+      setDeletedRowsVersion((prev) => prev + 1);
+      setHasEdits(true);
+      setSearchStale(true);
+      setDuplicateStale(true);
+    } catch (err) {
+      setError(
+        typeof err === "string" ? err : "Failed to restore selected rows.",
+      );
+    }
+  }, [filePath, selectedRanges, sortState, totalRows]);
 
   const commitEdit = useCallback(() => {
     if (!editingCell) {
@@ -954,6 +1403,9 @@ function App() {
     setWindowTitle(null);
     setHeaders([]);
     setTotalRows(0);
+    setSelectedRanges([]);
+    setSelectionAnchor(null);
+    setFocusedRow(null);
     dataRef.current = new Map();
     setDataVersion((prev) => prev + 1);
     setSearchTerm("");
@@ -991,8 +1443,8 @@ function App() {
   }, []);
 
   useEffect(() => {
-    setWindowTitle(filePath, hasEdits);
-  }, [filePath, hasEdits]);
+    setWindowTitle(filePath, isDirty);
+  }, [filePath, isDirty]);
 
   const handleCheckDuplicates = useCallback(() => {
     if (!filePath) {
@@ -1187,6 +1639,137 @@ function App() {
       searchInputRef.current?.select();
     }
   }, [showFind]);
+
+  useEffect(() => {
+    if (!filePath) {
+      return;
+    }
+    if (!totalRows) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (showSettings || contextMenu || editingKey) {
+        return;
+      }
+      if (isTextInputTarget(event.target)) {
+        return;
+      }
+
+      const toggleKey = event.metaKey || event.ctrlKey;
+      const key = event.key;
+
+      if (toggleKey && (key === "a" || key === "A")) {
+        event.preventDefault();
+        const normalized = normalizeSelectionRanges(selectedRanges);
+        const fallback =
+          focusedRow ??
+          selectionAnchor ??
+          (normalized.length ? normalized[0].start : 0);
+        const anchor = Math.max(0, Math.min(fallback, totalRows - 1));
+        setSelectedRanges([{ start: 0, end: totalRows - 1 }]);
+        setSelectionAnchor(anchor);
+        setFocusedRow(anchor);
+        return;
+      }
+
+      if (key === "Escape") {
+        if (selectedRanges.length) {
+          event.preventDefault();
+          clearSelection();
+        }
+        return;
+      }
+
+      if (key === "Delete" || key === "Backspace") {
+        if (selectedRanges.length) {
+          event.preventDefault();
+          void deleteSelectedRows();
+        }
+        return;
+      }
+
+      if (toggleKey && (key === "c" || key === "C")) {
+        if (selectedCount > 1) {
+          event.preventDefault();
+          void copySelectedRows();
+        }
+        return;
+      }
+
+      const isNavKey =
+        key === "ArrowDown" ||
+        key === "ArrowUp" ||
+        key === "Home" ||
+        key === "End" ||
+        key === "PageDown" ||
+        key === "PageUp";
+      if (!isNavKey) {
+        return;
+      }
+
+      const normalized = normalizeSelectionRanges(selectedRanges);
+      const current =
+        focusedRow ??
+        selectionAnchor ??
+        (normalized.length ? normalized[0].start : 0);
+
+      let nextIndex = current;
+      const pageSize = Math.max(
+        1,
+        Math.floor((parentRef.current?.clientHeight ?? 0) / rowHeight),
+      );
+
+      if (key === "ArrowDown") nextIndex = Math.min(totalRows - 1, current + 1);
+      if (key === "ArrowUp") nextIndex = Math.max(0, current - 1);
+      if (key === "Home") nextIndex = 0;
+      if (key === "End") nextIndex = totalRows - 1;
+      if (key === "PageDown")
+        nextIndex = Math.min(totalRows - 1, current + pageSize);
+      if (key === "PageUp") nextIndex = Math.max(0, current - pageSize);
+
+      if (nextIndex === current) {
+        return;
+      }
+
+      event.preventDefault();
+      rowVirtualizer.scrollToIndex(nextIndex, { align: "center" });
+      setFocusedRow(nextIndex);
+
+      if (event.shiftKey) {
+        const anchor = selectionAnchor ?? current;
+        const range = {
+          start: Math.min(anchor, nextIndex),
+          end: Math.max(anchor, nextIndex),
+        };
+        setSelectedRanges([range]);
+        setSelectionAnchor(anchor);
+        return;
+      }
+
+      if (!toggleKey) {
+        setSelectedRanges([{ start: nextIndex, end: nextIndex }]);
+        setSelectionAnchor(nextIndex);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [
+    clearSelection,
+    copySelectedRows,
+    contextMenu,
+    deleteSelectedRows,
+    editingKey,
+    filePath,
+    focusedRow,
+    rowHeight,
+    rowVirtualizer,
+    selectedRanges,
+    selectionAnchor,
+    showSettings,
+    totalRows,
+  ]);
 
   useEffect(() => {
     const scrollTarget = parentRef.current;
@@ -1842,6 +2425,8 @@ function App() {
   // const searchSelectionValue =
   //   searchColumn === null ? "row" : String(searchColumn);
   const parseWarningCount = parseWarnings.length;
+  const showFloatingToolbar =
+    !!filePath && (parseWarningCount > 0 || isDirty || selectedCount > 1);
 
   const handleResizeStart = useCallback(
     (event: React.MouseEvent<HTMLDivElement>, columnIndex: number) => {
@@ -1929,6 +2514,7 @@ function App() {
       return null;
     });
   };
+
   const openContextMenu = useCallback(
     (
       event: React.MouseEvent,
@@ -1939,6 +2525,17 @@ function App() {
     ) => {
       event.preventDefault();
       event.stopPropagation();
+      if (rowIndex !== null && rowIndex !== undefined) {
+        setSelectedRanges((prev) => {
+          const normalized = normalizeSelectionRanges(prev);
+          if (isIndexInSelectionRanges(normalized, rowIndex)) {
+            return normalized;
+          }
+          return [{ start: rowIndex, end: rowIndex }];
+        });
+        setSelectionAnchor(rowIndex);
+        setFocusedRow(rowIndex);
+      }
       const menuWidth = 200;
       const menuHeight = cellText === null ? 136 : 168;
       const padding = 12;
@@ -1951,7 +2548,12 @@ function App() {
     [],
   );
   const handleCopy = useCallback(async (value: string) => {
-    await copyToClipboard(value);
+    const ok = await copyToClipboard(value);
+    if (!ok) {
+      setError("Copy failed (clipboard access may be disabled).");
+    } else {
+      setNotice("Copied to clipboard.");
+    }
     setContextMenu(null);
   }, []);
 
@@ -1983,6 +2585,13 @@ function App() {
       }
     >
       {error ? <div className="status">{error}</div> : null}
+      {notice ? (
+        <div
+          className={`notice${showFloatingToolbar ? " with-floating-toolbar" : ""}`}
+        >
+          {notice}
+        </div>
+      ) : null}
 
       <section className={`table-shell${filePath ? "" : " is-empty"}`}>
         {loadingProgress !== null ? (
@@ -1995,35 +2604,6 @@ function App() {
               {loadingProgress.toLocaleString()} rows)...
             </div>
             {/* Optional: Cancel button if supported */}
-          </div>
-        ) : null}
-        {filePath ? (
-          <div className={`table-toolbar${showIndex ? " with-index" : ""}`}>
-            {parseWarningCount > 0 ? (
-              <span className="parse-warning-pill">
-                {parseWarningCount} warning
-                {parseWarningCount === 1 ? "" : "s"}
-              </span>
-            ) : null}
-            {hasEdits ? (
-              <div className="table-toolbar-actions">
-                <span className="table-toolbar-meta">Unsaved edits</span>
-                <button
-                  className="btn subtle"
-                  onClick={() => handleSave(false)}
-                  disabled={saving}
-                >
-                  {saving ? "Saving..." : "Save"}
-                </button>
-                <button
-                  className="btn subtle"
-                  onClick={() => handleSave(true)}
-                  disabled={saving}
-                >
-                  Save As
-                </button>
-              </div>
-            ) : null}
           </div>
         ) : null}
         {showHeaderPrompt && filePath ? (
@@ -2496,6 +3076,10 @@ function App() {
                     ? rowIndexMapRef.current.get(virtualRow.index)
                     : virtualRow.index;
                   const isDeleted = isRowDeleted(originalIndex);
+                  const isSelected = isIndexInSelectionRanges(
+                    selectedRanges,
+                    virtualRow.index,
+                  );
                   const displayRow = rowData
                     ? applyEditsToRow(rowData, originalIndex)
                     : null;
@@ -2521,10 +3105,19 @@ function App() {
                   return (
                     <div
                       key={virtualRow.index}
-                      className={`table-row${isMatch ? " match" : ""}${isCurrent ? " current" : ""}${isEven ? " even" : " odd"}${isDeleted ? " deleted" : ""}`}
+                      className={`table-row${isMatch ? " match" : ""}${isCurrent ? " current" : ""}${isEven ? " even" : " odd"}${isDeleted ? " deleted" : ""}${isSelected ? " selected" : ""}`}
                       style={{
                         height: `${virtualRow.size}px`,
                         transform: `translateY(${virtualRow.start - (rowVirtualizer.scrollOffset ?? 0)}px)`,
+                      }}
+                      onMouseDown={(event) => {
+                        if (event.button !== 0) {
+                          return;
+                        }
+                        selectDisplayRow(virtualRow.index, {
+                          shiftKey: event.shiftKey,
+                          toggleKey: event.metaKey || event.ctrlKey,
+                        });
                       }}
                     >
                       {showIndex ? (
@@ -2657,6 +3250,79 @@ function App() {
             </div>
             {loadingRows ? (
               <div className="loading-strip">Fetching more rows...</div>
+            ) : null}
+            {showFloatingToolbar ? (
+              <div
+                className={`floating-toolbar${loadingRows ? " with-loading" : ""}`}
+              >
+                {parseWarningCount > 0 || selectedCount > 1 ? (
+                  <div className="floating-toolbar-surface">
+                    {parseWarningCount > 0 ? (
+                      <span className="parse-warning-pill">
+                        {parseWarningCount} warning
+                        {parseWarningCount === 1 ? "" : "s"}
+                      </span>
+                    ) : null}
+                    {selectedCount > 1 ? (
+                      <span className="selection-pill">
+                        {selectedCount.toLocaleString()} selected
+                      </span>
+                    ) : null}
+                  </div>
+                ) : (
+                  <span />
+                )}
+                {selectedCount > 1 || isDirty ? (
+                  <div className="floating-toolbar-surface floating-toolbar-actions">
+                    {selectedCount > 1 ? (
+                      <>
+                        <button
+                          className="btn subtle"
+                          onClick={() => void copySelectedRows()}
+                          title="Copy selected rows (Ctrl/Cmd+C)"
+                        >
+                          Copy selected
+                        </button>
+                        <button
+                          className="btn subtle"
+                          onClick={() => void deleteSelectedRows()}
+                          title="Delete selected rows (Delete)"
+                        >
+                          Delete selected
+                        </button>
+                        <button
+                          className="btn subtle"
+                          onClick={() => void restoreSelectedRows()}
+                          title="Restore selected rows"
+                        >
+                          Restore selected
+                        </button>
+                      </>
+                    ) : null}
+                    {isDirty ? (
+                      <>
+                        <span className="table-toolbar-meta">
+                          Unsaved edits
+                        </span>
+                        <button
+                          className="btn subtle"
+                          onClick={() => handleSave(false)}
+                          disabled={saving}
+                        >
+                          {saving ? "Saving..." : "Save"}
+                        </button>
+                        <button
+                          className="btn subtle"
+                          onClick={() => handleSave(true)}
+                          disabled={saving}
+                        >
+                          Save As
+                        </button>
+                      </>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
             ) : null}
           </div>
         )}
@@ -2935,86 +3601,123 @@ function App() {
           onClick={(event) => event.stopPropagation()}
           onContextMenu={(event) => event.preventDefault()}
         >
-          <button
-            type="button"
-            className="context-menu-item"
-            onClick={() => {
-              if (contextMenu.cellText === null) {
-                return;
-              }
-              void handleCopy(contextMenu.cellText);
-            }}
-            disabled={contextMenu.cellText === null}
-          >
-            Copy cell
-          </button>
-          <button
-            type="button"
-            className="context-menu-item"
-            onClick={() => {
-              if (
-                contextMenu.cellText === null ||
-                contextMenu.rowIndex === null ||
-                contextMenu.columnIndex === null
-              ) {
-                return;
-              }
-              setContextMenu(null);
-              startEditCell(
-                contextMenu.rowIndex,
-                contextMenu.columnIndex,
-                contextMenu.cellText,
-              );
-            }}
-            disabled={
-              contextMenu.cellText === null ||
-              contextMenu.rowIndex === null ||
-              contextMenu.columnIndex === null ||
-              contextMenuRowDeleted
-            }
-          >
-            Edit cell
-          </button>
-          <button
-            type="button"
-            className="context-menu-item"
-            onClick={() => {
-              if (contextMenu.rowIndex === null) {
-                return;
-              }
-              setContextMenu(null);
-              if (contextMenuRowDeleted) {
-                restoreRow(contextMenu.rowIndex);
-                return;
-              }
-              deleteRow(contextMenu.rowIndex);
-            }}
-            disabled={contextMenu.rowIndex === null}
-          >
-            {contextMenuRowDeleted ? "Restore row" : "Delete row"}
-          </button>
-          <button
-            type="button"
-            className="context-menu-item"
-            onClick={() => {
-              void handleCopy(contextMenu.rowText);
-            }}
-          >
-            Copy row
-          </button>
-          <button
-            type="button"
-            className="context-menu-item"
-            onClick={() => {
-              if (contextMenu.cellText === null) {
-                return;
-              }
-              handleSearchFromCell(contextMenu.cellText);
-            }}
-            disabled={contextMenu.cellText === null}
-          >
-            Search for this
-          </button>
+          {selectedCount > 1 ? (
+            <>
+              <button
+                type="button"
+                className="context-menu-item"
+                onClick={() => {
+                  setContextMenu(null);
+                  void copySelectedRows();
+                }}
+              >
+                Copy selected rows
+              </button>
+              <button
+                type="button"
+                className="context-menu-item"
+                onClick={() => {
+                  setContextMenu(null);
+                  void deleteSelectedRows();
+                }}
+              >
+                Delete selected
+              </button>
+              <button
+                type="button"
+                className="context-menu-item"
+                onClick={() => {
+                  setContextMenu(null);
+                  void restoreSelectedRows();
+                }}
+              >
+                Restore selected
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                className="context-menu-item"
+                onClick={() => {
+                  if (contextMenu.cellText === null) {
+                    return;
+                  }
+                  void handleCopy(contextMenu.cellText);
+                }}
+                disabled={contextMenu.cellText === null}
+              >
+                Copy cell
+              </button>
+              <button
+                type="button"
+                className="context-menu-item"
+                onClick={() => {
+                  if (
+                    contextMenu.cellText === null ||
+                    contextMenu.rowIndex === null ||
+                    contextMenu.columnIndex === null
+                  ) {
+                    return;
+                  }
+                  setContextMenu(null);
+                  startEditCell(
+                    contextMenu.rowIndex,
+                    contextMenu.columnIndex,
+                    contextMenu.cellText,
+                  );
+                }}
+                disabled={
+                  contextMenu.cellText === null ||
+                  contextMenu.rowIndex === null ||
+                  contextMenu.columnIndex === null ||
+                  contextMenuRowDeleted
+                }
+              >
+                Edit cell
+              </button>
+              <button
+                type="button"
+                className="context-menu-item"
+                onClick={() => {
+                  if (contextMenu.rowIndex === null) {
+                    return;
+                  }
+                  setContextMenu(null);
+                  if (contextMenuRowDeleted) {
+                    restoreRow(contextMenu.rowIndex);
+                    return;
+                  }
+                  deleteRow(contextMenu.rowIndex);
+                }}
+                disabled={contextMenu.rowIndex === null}
+              >
+                {contextMenuRowDeleted ? "Restore row" : "Delete row"}
+              </button>
+              <button
+                type="button"
+                className="context-menu-item"
+                onClick={() => {
+                  void handleCopy(contextMenu.rowText);
+                }}
+              >
+                Copy row
+              </button>
+              <button
+                type="button"
+                className="context-menu-item"
+                onClick={() => {
+                  if (contextMenu.cellText === null) {
+                    return;
+                  }
+                  handleSearchFromCell(contextMenu.cellText);
+                }}
+                disabled={contextMenu.cellText === null}
+              >
+                Search for this
+              </button>
+            </>
+          )}
         </div>
       ) : null}
     </main>
