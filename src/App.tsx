@@ -86,6 +86,8 @@ type EditingCell = {
   column: number;
   originalRow: number;
   value: string;
+  initialValue: string;
+  originalValue: string;
 };
 type ParseOverridesState = {
   delimiter:
@@ -961,7 +963,12 @@ function App() {
   );
 
   const startEditCell = useCallback(
-    (displayRow: number, column: number, value: string) => {
+    (
+      displayRow: number,
+      column: number,
+      value: string,
+      originalValue: string,
+    ) => {
       if (!filePath) {
         return;
       }
@@ -977,6 +984,8 @@ function App() {
         column,
         originalRow,
         value,
+        initialValue: value,
+        originalValue,
       });
     },
     [filePath, getOriginalRowIndex, isRowDeleted],
@@ -1202,7 +1211,7 @@ function App() {
       }
       deletedRowsRef.current.delete(originalRow);
       setDeletedRowsVersion((prev) => prev + 1);
-      setHasEdits(true);
+      setHasEdits(editsRef.current.size > 0 || deletedRowsRef.current.size > 0);
       setSearchStale(true);
       setDuplicateStale(true);
     },
@@ -1270,7 +1279,7 @@ function App() {
       }
 
       setDeletedRowsVersion((prev) => prev + 1);
-      setHasEdits(true);
+      setHasEdits(editsRef.current.size > 0 || deletedRowsRef.current.size > 0);
       setSearchStale(true);
       setDuplicateStale(true);
     } catch (err) {
@@ -1284,23 +1293,30 @@ function App() {
     if (!editingCell) {
       return;
     }
-    const { displayRow, column, originalRow, value } = editingCell;
-    const edits = editsRef.current;
-    const rowEdits = edits.get(originalRow) ?? new Map<number, string>();
-    rowEdits.set(column, value);
-    edits.set(originalRow, rowEdits);
+    const { column, originalRow, value, initialValue, originalValue } =
+      editingCell;
+    setEditingCell(null);
 
-    const dataMap = dataRef.current;
-    const existing = dataMap.get(displayRow);
-    if (existing) {
-      const nextRow = existing.slice();
-      nextRow[column] = value;
-      dataMap.set(displayRow, nextRow);
+    if (value === initialValue) {
+      return;
     }
 
-    setDataVersion((prev) => prev + 1);
-    setEditingCell(null);
-    setHasEdits(true);
+    const edits = editsRef.current;
+    const rowEdits = edits.get(originalRow);
+    if (value === originalValue) {
+      if (rowEdits) {
+        rowEdits.delete(column);
+        if (rowEdits.size === 0) {
+          edits.delete(originalRow);
+        }
+      }
+    } else {
+      const nextRowEdits = rowEdits ?? new Map<number, string>();
+      nextRowEdits.set(column, value);
+      edits.set(originalRow, nextRowEdits);
+    }
+
+    setHasEdits(editsRef.current.size > 0 || deletedRowsRef.current.size > 0);
     setSearchStale(true);
     setDuplicateStale(true);
   }, [editingCell]);
@@ -3194,6 +3210,7 @@ function App() {
                                   virtualRow.index,
                                   cellIdx,
                                   cellValue,
+                                  rowData?.[cellIdx] ?? "",
                                 )
                               }
                               onKeyDown={(event) => {
@@ -3203,6 +3220,7 @@ function App() {
                                     virtualRow.index,
                                     cellIdx,
                                     cellValue,
+                                    rowData?.[cellIdx] ?? "",
                                   );
                                 }
                               }}
@@ -3665,6 +3683,9 @@ function App() {
                     contextMenu.rowIndex,
                     contextMenu.columnIndex,
                     contextMenu.cellText,
+                    dataRef.current.get(contextMenu.rowIndex)?.[
+                      contextMenu.columnIndex
+                    ] ?? contextMenu.cellText,
                   );
                 }}
                 disabled={

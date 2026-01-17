@@ -1328,10 +1328,6 @@ option {
     background: var(--panel);
 }
 
-.find-input-container:focus-within {
-    /* Optional specific highlight, but main widget has border */
-}
-
 .find-input-container input {
     border: none;
     background: transparent;
