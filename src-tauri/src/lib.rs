@@ -1261,6 +1261,11 @@ async fn get_parse_warnings(
 }
 
 #[tauri::command]
+async fn write_csv_file(path: String, contents: String) -> Result<(), String> {
+    std::fs::write(path, contents).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 async fn set_show_index_checked(checked: bool, app: tauri::AppHandle) -> Result<(), String> {
     if let Some(menu) = app.menu() {
         if let Some(item) = menu.get("view") {
@@ -1321,6 +1326,7 @@ pub fn run() {
             take_pending_open,
             get_row_count,
             get_parse_warnings,
+            write_csv_file,
             set_show_index_checked,
             set_enable_indexing
         ]);
@@ -1331,6 +1337,12 @@ pub fn run() {
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => {
                 let _ = app.emit("menu-open", ());
+            }
+            "save" => {
+                let _ = app.emit("menu-save", ());
+            }
+            "save-as" => {
+                let _ = app.emit("menu-save-as", ());
             }
             "clear" => {
                 let _ = app.emit("menu-clear", ());
@@ -1403,6 +1415,12 @@ fn build_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
     let open_item = MenuItemBuilder::with_id("open", "Open...")
         .accelerator("CmdOrCtrl+O")
         .build(app)?;
+    let save_item = MenuItemBuilder::with_id("save", "Save")
+        .accelerator("CmdOrCtrl+S")
+        .build(app)?;
+    let save_as_item = MenuItemBuilder::with_id("save-as", "Save As...")
+        .accelerator("CmdOrCtrl+Shift+S")
+        .build(app)?;
     let clear_item = MenuItemBuilder::with_id("clear", "Clear")
         .accelerator("CmdOrCtrl+Shift+K")
         .build(app)?;
@@ -1454,6 +1472,9 @@ fn build_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
 
     let file_menu = SubmenuBuilder::new(app, "File")
         .item(&open_item)
+        .item(&save_item)
+        .item(&save_as_item)
+        .separator()
         .item(&clear_item)
         .separator()
         .close_window()

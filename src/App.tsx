@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type { CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useDebounce } from "./hooks/useDebounce";
@@ -50,6 +50,8 @@ type ContextMenuState = {
   y: number;
   cellText: string | null;
   rowText: string;
+  rowIndex: number | null;
+  columnIndex: number | null;
 };
 type ParseInfo = {
   delimiter: string;
@@ -78,6 +80,12 @@ type CsvMetadata = {
   effective: ParseInfo;
   warnings: ParseWarning[];
   estimated_count?: number;
+};
+type EditingCell = {
+  displayRow: number;
+  column: number;
+  originalRow: number;
+  value: string;
 };
 type ParseOverridesState = {
   delimiter:
@@ -138,21 +146,36 @@ const getFileNameFromPath = (path: string) => {
   }
   return path.slice(lastIndex + 1);
 };
-const setWindowTitle = (path: string | null) => {
+const setWindowTitle = (path: string | null, dirty: boolean = false) => {
   const name = path ? getFileNameFromPath(path) : "";
-  const title = name ? `${name} - ${BASE_TITLE}` : BASE_TITLE;
+  const suffix = dirty ? " *" : "";
+  const title = name ? `${name}${suffix} - ${BASE_TITLE}` : BASE_TITLE;
   getCurrentWindow()
     .setTitle(title)
     .catch(() => {});
 };
-const formatCsvCell = (value: string) => {
-  if (!/[",\n\r]/.test(value)) {
-    return value;
+const formatCsvCell = (
+  value: string,
+  delimiter: string = ",",
+  quote: string = '"',
+) => {
+  if (
+    value &&
+    (value.includes(delimiter) ||
+      value.includes("\n") ||
+      value.includes("\r") ||
+      value.includes(quote))
+  ) {
+    const escaped = value.split(quote).join(`${quote}${quote}`);
+    return `${quote}${escaped}${quote}`;
   }
-  return `"${value.replace(/"/g, '""')}"`;
+  return value;
 };
-const formatCsvRow = (row: string[]) =>
-  row.map((cell) => formatCsvCell(cell)).join(",");
+const formatCsvRow = (
+  row: string[],
+  delimiter: string = ",",
+  quote: string = '"',
+) => row.map((cell) => formatCsvCell(cell, delimiter, quote)).join(delimiter);
 
 const copyToClipboard = async (value: string) => {
   if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
@@ -232,6 +255,7 @@ function App() {
   const [lastOpenDir, setLastOpenDir] = useState<string | null>(null);
   const [recentFiles, setRecentFiles] = useState<string[]>([]);
   const [parseDetected, setParseDetected] = useState<ParseInfo | null>(null);
+  const [parseEffective, setParseEffective] = useState<ParseInfo | null>(null);
   const [parseWarnings, setParseWarnings] = useState<ParseWarning[]>([]);
   /* const [showParseSettings, setShowParseSettings] = useState(false); */
 
@@ -240,6 +264,13 @@ function App() {
     DEFAULT_PARSE_OVERRIDES,
   );
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [editingCell, setEditingCell] = useState<EditingCell | null>(null);
+  const [hasEdits, setHasEdits] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [searchStale, setSearchStale] = useState(false);
+  const [duplicateStale, setDuplicateStale] = useState(false);
+  const [savePath, setSavePath] = useState<string | null>(null);
+  const [deletedRowsVersion, setDeletedRowsVersion] = useState(0);
   const [loadingProgress, setLoadingProgress] = useState<number | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [enableIndexing, setEnableIndexing] = useState(() => {
@@ -254,14 +285,18 @@ function App() {
   const duplicateResultsCountRef = useRef(0);
   const sortWorkerRef = useRef<Worker | null>(null);
   const sortWorkerRequestIdRef = useRef(0);
+  const editsRef = useRef<Map<number, Map<number, string>>>(new Map());
+  const deletedRowsRef = useRef<Set<number>>(new Set());
   const [, setDataVersion] = useState(0);
   const [, setRowIndexVersion] = useState(0);
+  const [searchRefreshToken, setSearchRefreshToken] = useState(0);
 
   const debouncedSearch = useDebounce(searchTerm, 450);
   const parentRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const headerRef = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const editInputRef = useRef<HTMLInputElement>(null);
   const resizeRef = useRef<{
     columnIndex: number;
     startX: number;
@@ -276,6 +311,20 @@ function App() {
       return () => clearTimeout(timer);
     }
   }, [error]);
+
+  const editingKey = useMemo(
+    () =>
+      editingCell ? `${editingCell.displayRow}:${editingCell.column}` : null,
+    [editingCell?.displayRow, editingCell?.column],
+  );
+
+  useEffect(() => {
+    if (!editingKey) {
+      return;
+    }
+    editInputRef.current?.focus();
+    editInputRef.current?.select();
+  }, [editingKey]);
 
   useEffect(() => {
     localStorage.setItem("csv-viewer-enable-indexing", String(enableIndexing));
@@ -355,14 +404,20 @@ function App() {
 
   const virtualItems = rowVirtualizer.getVirtualItems();
   const activeResults = useMemo(() => {
-    if (activeHighlight === "search") {
+    if (activeHighlight === "search" && !searchStale) {
       return searchResults;
     }
-    if (activeHighlight === "duplicates") {
+    if (activeHighlight === "duplicates" && !duplicateStale) {
       return duplicateResults;
     }
     return null;
-  }, [activeHighlight, duplicateResults, searchResults]);
+  }, [
+    activeHighlight,
+    duplicateResults,
+    searchResults,
+    searchStale,
+    duplicateStale,
+  ]);
   const activeMatchSet = useMemo(() => {
     if (!activeResults) return null;
     return new Set(activeResults);
@@ -372,7 +427,7 @@ function App() {
     [debouncedSearch],
   );
   const searchHighlightActive =
-    activeHighlight === "search" && searchQueryLower.length > 0;
+    activeHighlight === "search" && !searchStale && searchQueryLower.length > 0;
   const activeCurrentMatch =
     activeHighlight === "search"
       ? currentMatch
@@ -564,9 +619,19 @@ function App() {
     setDuplicateColumn(null);
     setActiveHighlight(null);
     setParseDetected(null);
+    setParseEffective(null);
     setParseWarnings([]);
     setShowHeaderPrompt(false);
     setContextMenu(null);
+    setEditingCell(null);
+    setHasEdits(false);
+    setSaving(false);
+    setSearchStale(false);
+    setDuplicateStale(false);
+    setSavePath(null);
+    editsRef.current = new Map();
+    deletedRowsRef.current = new Set();
+    setDeletedRowsVersion((prev) => prev + 1);
     dataRef.current = new Map();
     setDataVersion((prev) => prev + 1);
     setRowCountReady(false);
@@ -649,6 +714,152 @@ function App() {
       .catch(() => {});
   }, [appendParseWarnings]);
 
+  const csvFormat = useMemo(() => {
+    const delimiter = parseEffective?.delimiter ?? ",";
+    const quote = parseEffective?.quote ?? '"';
+    const lineEndingValue = parseEffective?.line_ending ?? "lf";
+    const lineEnding =
+      lineEndingValue === "crlf"
+        ? "\r\n"
+        : lineEndingValue === "cr"
+          ? "\r"
+          : "\n";
+    return {
+      delimiter,
+      quote,
+      lineEnding,
+      hasHeaders: parseEffective?.has_headers ?? false,
+    };
+  }, [parseEffective]);
+
+  const applyEditsToRow = useCallback(
+    (row: string[], originalIndex: number | undefined) => {
+      if (originalIndex === undefined) {
+        return row;
+      }
+      const rowEdits = editsRef.current.get(originalIndex);
+      if (!rowEdits || rowEdits.size === 0) {
+        return row;
+      }
+      const next = row.slice();
+      rowEdits.forEach((value, colIndex) => {
+        next[colIndex] = value;
+      });
+      return next;
+    },
+    [],
+  );
+
+  const getOriginalRowIndex = useCallback(
+    (displayRow: number) => {
+      if (!sortState) {
+        return displayRow;
+      }
+      return rowIndexMapRef.current.get(displayRow);
+    },
+    [sortState],
+  );
+
+  const isRowDeleted = useCallback(
+    (originalIndex: number | undefined) => {
+      if (originalIndex === undefined) {
+        return false;
+      }
+      return deletedRowsRef.current.has(originalIndex);
+    },
+    [deletedRowsVersion],
+  );
+
+  const startEditCell = useCallback(
+    (displayRow: number, column: number, value: string) => {
+      if (!filePath) {
+        return;
+      }
+      const originalRow = getOriginalRowIndex(displayRow);
+      if (originalRow === undefined) {
+        return;
+      }
+      if (isRowDeleted(originalRow)) {
+        return;
+      }
+      setEditingCell({
+        displayRow,
+        column,
+        originalRow,
+        value,
+      });
+    },
+    [filePath, getOriginalRowIndex, isRowDeleted],
+  );
+
+  const deleteRow = useCallback(
+    (displayRow: number) => {
+      const originalRow = getOriginalRowIndex(displayRow);
+      if (originalRow === undefined) {
+        return;
+      }
+      if (deletedRowsRef.current.has(originalRow)) {
+        return;
+      }
+      deletedRowsRef.current.add(originalRow);
+      setEditingCell((prev) =>
+        prev && prev.originalRow === originalRow ? null : prev,
+      );
+      setDeletedRowsVersion((prev) => prev + 1);
+      setHasEdits(true);
+      setSearchStale(true);
+      setDuplicateStale(true);
+    },
+    [getOriginalRowIndex],
+  );
+
+  const restoreRow = useCallback(
+    (displayRow: number) => {
+      const originalRow = getOriginalRowIndex(displayRow);
+      if (originalRow === undefined) {
+        return;
+      }
+      if (!deletedRowsRef.current.has(originalRow)) {
+        return;
+      }
+      deletedRowsRef.current.delete(originalRow);
+      setDeletedRowsVersion((prev) => prev + 1);
+      setHasEdits(true);
+      setSearchStale(true);
+      setDuplicateStale(true);
+    },
+    [getOriginalRowIndex],
+  );
+
+  const commitEdit = useCallback(() => {
+    if (!editingCell) {
+      return;
+    }
+    const { displayRow, column, originalRow, value } = editingCell;
+    const edits = editsRef.current;
+    const rowEdits = edits.get(originalRow) ?? new Map<number, string>();
+    rowEdits.set(column, value);
+    edits.set(originalRow, rowEdits);
+
+    const dataMap = dataRef.current;
+    const existing = dataMap.get(displayRow);
+    if (existing) {
+      const nextRow = existing.slice();
+      nextRow[column] = value;
+      dataMap.set(displayRow, nextRow);
+    }
+
+    setDataVersion((prev) => prev + 1);
+    setEditingCell(null);
+    setHasEdits(true);
+    setSearchStale(true);
+    setDuplicateStale(true);
+  }, [editingCell]);
+
+  const cancelEdit = useCallback(() => {
+    setEditingCell(null);
+  }, []);
+
   const handleOpenPath = useCallback(
     async (path: string, overrides?: Record<string, unknown>) => {
       try {
@@ -658,9 +869,10 @@ function App() {
         });
         resetForNewFile();
         setFilePath(path);
-        setWindowTitle(path);
+        setWindowTitle(path, false);
         setHeaders(csvMetadata.headers);
         setParseDetected(csvMetadata.detected);
+        setParseEffective(csvMetadata.effective);
         setParseWarnings(csvMetadata.warnings ?? []);
         invoke("get_parse_warnings", { clear: true }).catch(() => {});
         setLoadingProgress(0);
@@ -762,15 +974,25 @@ function App() {
     setDuplicateColumn(null);
     setActiveHighlight(null);
     setParseDetected(null);
+    setParseEffective(null);
     setParseWarnings([]);
     setShowHeaderPrompt(false);
     setContextMenu(null);
+    setEditingCell(null);
+    setHasEdits(false);
+    setSaving(false);
+    setSearchStale(false);
+    setDuplicateStale(false);
+    setSavePath(null);
+    editsRef.current = new Map();
+    deletedRowsRef.current = new Set();
+    setDeletedRowsVersion((prev) => prev + 1);
     invoke("clear_sort").catch(() => {});
   }, []);
 
   useEffect(() => {
-    setWindowTitle(filePath);
-  }, [filePath]);
+    setWindowTitle(filePath, hasEdits);
+  }, [filePath, hasEdits]);
 
   const handleCheckDuplicates = useCallback(() => {
     if (!filePath) {
@@ -782,6 +1004,7 @@ function App() {
     setDuplicateChecking(true);
     setDuplicateResults([]);
     setActiveHighlight("duplicates");
+    setDuplicateStale(false);
     invoke("find_duplicates_stream", {
       columnIdx: duplicateColumn,
       request_id: requestId,
@@ -986,12 +1209,14 @@ function App() {
     if (!filePath || !rowCountReady) {
       searchRequestIdRef.current += 1;
       setSearching(false);
+      setSearchStale(false);
       return;
     }
     if (!debouncedSearch) {
       searchRequestIdRef.current += 1;
       setSearchResults(null);
       setSearching(false);
+      setSearchStale(false);
       return;
     }
 
@@ -1000,6 +1225,7 @@ function App() {
     setError(null);
     setSearching(true);
     setSearchResults([]);
+    setSearchStale(false);
     invoke("search_csv_stream", {
       columnIdx: searchColumn,
       query: debouncedSearch,
@@ -1021,6 +1247,7 @@ function App() {
     searchColumn,
     searchMatchCase,
     searchWholeWord,
+    searchRefreshToken,
   ]);
 
   const getDisplayIndex = useCallback(
@@ -1145,6 +1372,100 @@ function App() {
     });
   }, [duplicateResults, scrollToMatch]);
 
+  const handleSave = useCallback(
+    async (forceSaveAs: boolean) => {
+      if (!filePath || saving) {
+        return;
+      }
+      if (!hasEdits) {
+        return;
+      }
+      setError(null);
+      setSaving(true);
+
+      try {
+        let targetPath = savePath ?? filePath;
+        if (forceSaveAs || !targetPath) {
+          const selected = await save({
+            filters: [{ name: "CSV", extensions: ["csv"] }],
+            defaultPath: targetPath ?? lastOpenDir ?? undefined,
+          });
+          if (!selected) {
+            setSaving(false);
+            return;
+          }
+          targetPath = selected;
+          setSavePath(targetPath);
+          const nextDir = getDirFromPath(targetPath);
+          if (nextDir) {
+            setLastOpenDir(nextDir);
+          }
+        }
+
+        const rows: string[] = [];
+        if (csvFormat.hasHeaders && headers.length) {
+          rows.push(
+            formatCsvRow(headers, csvFormat.delimiter, csvFormat.quote),
+          );
+        }
+
+        let start = 0;
+        while (true) {
+          const chunk = await invoke<string[][]>("get_csv_chunk", {
+            start,
+            count: CHUNK_SIZE,
+          });
+          if (chunk.length === 0) {
+            break;
+          }
+          chunk.forEach((row, idx) => {
+            const originalIndex = start + idx;
+            if (deletedRowsRef.current.has(originalIndex)) {
+              return;
+            }
+            const nextRow = applyEditsToRow(row, originalIndex);
+            rows.push(
+              formatCsvRow(nextRow, csvFormat.delimiter, csvFormat.quote),
+            );
+          });
+          if (chunk.length < CHUNK_SIZE) {
+            break;
+          }
+          start += chunk.length;
+        }
+
+        const contents = rows.join(csvFormat.lineEnding);
+        await invoke("write_csv_file", {
+          path: targetPath,
+          contents,
+        });
+
+        setHasEdits(false);
+        if (targetPath === filePath) {
+          editsRef.current = new Map();
+          await handleOpenPath(filePath);
+        } else {
+          setSavePath(targetPath);
+        }
+      } catch (err) {
+        setError(typeof err === "string" ? err : "Failed to save CSV file.");
+      } finally {
+        setSaving(false);
+      }
+    },
+    [
+      applyEditsToRow,
+      csvFormat,
+      filePath,
+      handleOpenPath,
+      hasEdits,
+      headers,
+      lastOpenDir,
+      savePath,
+      saving,
+    ],
+  );
+
   useEffect(() => {
     if (!filePath) {
       setSortLoading(false);
@@ -1216,6 +1537,12 @@ function App() {
         listen("menu-open", () => {
           handlePickFile();
         }),
+        listen("menu-save", () => {
+          handleSave(false);
+        }),
+        listen("menu-save-as", () => {
+          handleSave(true);
+        }),
         listen("menu-clear", () => {
           handleClearFile();
         }),
@@ -1234,6 +1561,7 @@ function App() {
           setSearching(false);
           setCurrentMatch(0);
           setActiveHighlight((prev) => (prev === "search" ? null : prev));
+          setSearchStale(false);
         }),
         listen("menu-check-duplicates", () => {
           setShowDuplicates(true);
@@ -1290,6 +1618,7 @@ function App() {
     goToPrevMatch,
     handleClearFile,
     handlePickFile,
+    handleSave,
     toggleTheme,
   ]);
 
@@ -1389,6 +1718,7 @@ function App() {
         if (count > 0) {
           setTotalRows(count);
           setRowCountReady(true);
+          setLoadingProgress(null);
           return;
         }
       } catch {
@@ -1397,6 +1727,9 @@ function App() {
 
       attempts += 1;
       if (!active || attempts >= ROW_COUNT_POLL_MAX) {
+        if (active) {
+          setLoadingProgress(null);
+        }
         return;
       }
       timer = setTimeout(poll, ROW_COUNT_POLL_INTERVAL);
@@ -1411,6 +1744,12 @@ function App() {
       }
     };
   }, [filePath, rowCountReady]);
+
+  useEffect(() => {
+    if (rowCountReady && loadingProgress !== null) {
+      setLoadingProgress(null);
+    }
+  }, [loadingProgress, rowCountReady]);
 
   useEffect(() => {
     if (!filePath || !rowCountReady) {
@@ -1591,17 +1930,23 @@ function App() {
     });
   };
   const openContextMenu = useCallback(
-    (event: React.MouseEvent, cellText: string | null, rowText: string) => {
+    (
+      event: React.MouseEvent,
+      cellText: string | null,
+      rowText: string,
+      rowIndex: number | null,
+      columnIndex: number | null,
+    ) => {
       event.preventDefault();
       event.stopPropagation();
       const menuWidth = 200;
-      const menuHeight = cellText === null ? 56 : 88;
+      const menuHeight = cellText === null ? 136 : 168;
       const padding = 12;
       const maxX = window.innerWidth - menuWidth - padding;
       const maxY = window.innerHeight - menuHeight - padding;
       const x = Math.max(padding, Math.min(event.clientX, maxX));
       const y = Math.max(padding, Math.min(event.clientY, maxY));
-      setContextMenu({ x, y, cellText, rowText });
+      setContextMenu({ x, y, cellText, rowText, rowIndex, columnIndex });
     },
     [],
   );
@@ -1621,6 +1966,11 @@ function App() {
     }, 10);
   }, []);
 
+  const contextMenuOriginalRow =
+    contextMenu?.rowIndex !== null && contextMenu?.rowIndex !== undefined
+      ? getOriginalRowIndex(contextMenu.rowIndex)
+      : undefined;
+  const contextMenuRowDeleted = isRowDeleted(contextMenuOriginalRow);
   return (
     <main
       className="app"
@@ -1647,12 +1997,33 @@ function App() {
             {/* Optional: Cancel button if supported */}
           </div>
         ) : null}
-        {filePath && parseWarningCount > 0 ? (
+        {filePath ? (
           <div className={`table-toolbar${showIndex ? " with-index" : ""}`}>
-            <span className="parse-warning-pill">
-              {parseWarningCount} warning
-              {parseWarningCount === 1 ? "" : "s"}
-            </span>
+            {parseWarningCount > 0 ? (
+              <span className="parse-warning-pill">
+                {parseWarningCount} warning
+                {parseWarningCount === 1 ? "" : "s"}
+              </span>
+            ) : null}
+            {hasEdits ? (
+              <div className="table-toolbar-actions">
+                <span className="table-toolbar-meta">Unsaved edits</span>
+                <button
+                  className="btn subtle"
+                  onClick={() => handleSave(false)}
+                  disabled={saving}
+                >
+                  {saving ? "Saving..." : "Save"}
+                </button>
+                <button
+                  className="btn subtle"
+                  onClick={() => handleSave(true)}
+                  disabled={saving}
+                >
+                  Save As
+                </button>
+              </div>
+            ) : null}
           </div>
         ) : null}
         {showHeaderPrompt && filePath ? (
@@ -1814,6 +2185,20 @@ function App() {
                 ? `${currentMatch + 1} of ${searchResults.length}`
                 : "No results"}
             </span>
+            {searchStale ? (
+              <div className="find-stale">
+                <span className="find-results-stale">Results outdated</span>
+                <button
+                  className="find-rerun-btn"
+                  onClick={() => {
+                    setSearchRefreshToken((prev) => prev + 1);
+                    setActiveHighlight("search");
+                  }}
+                >
+                  Re-run
+                </button>
+              </div>
+            ) : null}
 
             <button
               className="find-icon-btn"
@@ -1925,6 +2310,7 @@ function App() {
                 setActiveHighlight((prev) =>
                   prev === "duplicates" ? null : prev,
                 );
+                setDuplicateStale(false);
               }}
               disabled={duplicateResults === null}
             >
@@ -1939,6 +2325,17 @@ function App() {
                 ? `${currentDuplicateMatch + 1} of ${duplicateResults.length}`
                 : "No duplicates"}
             </span>
+            {duplicateStale ? (
+              <div className="find-stale">
+                <span className="find-results-stale">Results outdated</span>
+                <button
+                  className="find-rerun-btn"
+                  onClick={handleCheckDuplicates}
+                >
+                  Re-run
+                </button>
+              </div>
+            ) : null}
 
             <button
               className="find-icon-btn"
@@ -2098,8 +2495,18 @@ function App() {
                   const originalIndex = sortState
                     ? rowIndexMapRef.current.get(virtualRow.index)
                     : virtualRow.index;
+                  const isDeleted = isRowDeleted(originalIndex);
+                  const displayRow = rowData
+                    ? applyEditsToRow(rowData, originalIndex)
+                    : null;
                   const rowNumber = (originalIndex ?? virtualRow.index) + 1;
-                  const rowText = rowData ? formatCsvRow(rowData) : "";
+                  const rowText = displayRow
+                    ? formatCsvRow(
+                        displayRow,
+                        csvFormat.delimiter,
+                        csvFormat.quote,
+                      )
+                    : "";
                   const currentIndex = activeResults?.[activeCurrentMatch];
                   const isMatch =
                     originalIndex !== undefined
@@ -2114,7 +2521,7 @@ function App() {
                   return (
                     <div
                       key={virtualRow.index}
-                      className={`table-row${isMatch ? " match" : ""}${isCurrent ? " current" : ""}${isEven ? " even" : " odd"}`}
+                      className={`table-row${isMatch ? " match" : ""}${isCurrent ? " current" : ""}${isEven ? " even" : " odd"}${isDeleted ? " deleted" : ""}`}
                       style={{
                         height: `${virtualRow.size}px`,
                         transform: `translateY(${virtualRow.start - (rowVirtualizer.scrollOffset ?? 0)}px)`,
@@ -2127,14 +2534,20 @@ function App() {
                             if (!rowData) {
                               return;
                             }
-                            openContextMenu(event, null, rowText);
+                            openContextMenu(
+                              event,
+                              null,
+                              rowText,
+                              virtualRow.index,
+                              null,
+                            );
                           }}
                         >
                           {rowNumber}
                         </div>
                       ) : null}
-                      {rowData ? (
-                        rowData.map((cell, cellIdx) => {
+                      {displayRow ? (
+                        displayRow.map((cell, cellIdx) => {
                           const cellValue = cell ?? "";
                           let isCellMatch = false;
                           if (
@@ -2164,16 +2577,73 @@ function App() {
                           return (
                             <div
                               key={cellIdx}
-                              className={`table-cell${isCellMatch ? " cell-match" : ""}`}
+                              className={`table-cell${isCellMatch ? " cell-match" : ""}${
+                                editingCell?.displayRow === virtualRow.index &&
+                                editingCell.column === cellIdx
+                                  ? " editing"
+                                  : ""
+                              }${isDeleted ? " deleted" : ""}`}
                               style={
                                 columnStyles[cellIdx] ?? defaultColumnStyle
                               }
                               title={cellValue}
                               onContextMenu={(event) =>
-                                openContextMenu(event, cellValue, rowText)
+                                openContextMenu(
+                                  event,
+                                  cellValue,
+                                  rowText,
+                                  virtualRow.index,
+                                  cellIdx,
+                                )
                               }
+                              onDoubleClick={() =>
+                                startEditCell(
+                                  virtualRow.index,
+                                  cellIdx,
+                                  cellValue,
+                                )
+                              }
+                              onKeyDown={(event) => {
+                                if (event.key === "Enter") {
+                                  event.preventDefault();
+                                  startEditCell(
+                                    virtualRow.index,
+                                    cellIdx,
+                                    cellValue,
+                                  );
+                                }
+                              }}
+                              tabIndex={0}
                             >
-                              {cellValue}
+                              {editingCell?.displayRow === virtualRow.index &&
+                              editingCell.column === cellIdx ? (
+                                <input
+                                  ref={editInputRef}
+                                  className="cell-editor"
+                                  value={editingCell.value}
+                                  onChange={(event) =>
+                                    setEditingCell((prev) =>
+                                      prev
+                                        ? { ...prev, value: event.target.value }
+                                        : prev,
+                                    )
+                                  }
+                                  onBlur={commitEdit}
+                                  onKeyDown={(event) => {
+                                    event.stopPropagation();
+                                    if (event.key === "Enter") {
+                                      event.preventDefault();
+                                      commitEdit();
+                                    }
+                                    if (event.key === "Escape") {
+                                      event.preventDefault();
+                                      cancelEdit();
+                                    }
+                                  }}
+                                />
+                              ) : (
+                                cellValue
+                              )}
                             </div>
                           );
                         })
@@ -2477,6 +2947,51 @@ function App() {
             disabled={contextMenu.cellText === null}
           >
             Copy cell
+          </button>
+          <button
+            type="button"
+            className="context-menu-item"
+            onClick={() => {
+              if (
+                contextMenu.cellText === null ||
+                contextMenu.rowIndex === null ||
+                contextMenu.columnIndex === null
+              ) {
+                return;
+              }
+              setContextMenu(null);
+              startEditCell(
+                contextMenu.rowIndex,
+                contextMenu.columnIndex,
+                contextMenu.cellText,
+              );
+            }}
+            disabled={
+              contextMenu.cellText === null ||
+              contextMenu.rowIndex === null ||
+              contextMenu.columnIndex === null ||
+              contextMenuRowDeleted
+            }
+          >
+            Edit cell
+          </button>
+          <button
+            type="button"
+            className="context-menu-item"
+            onClick={() => {
+              if (contextMenu.rowIndex === null) {
+                return;
+              }
+              setContextMenu(null);
+              if (contextMenuRowDeleted) {
+                restoreRow(contextMenu.rowIndex);
+                return;
+              }
+              deleteRow(contextMenu.rowIndex);
+            }}
+            disabled={contextMenu.rowIndex === null}
+          >
+            {contextMenuRowDeleted ? "Restore row" : "Delete row"}
           </button>
           <button
             type="button"

@@ -439,6 +439,18 @@ option {
     padding-left: var(--index-width);
 }
 
+.table-toolbar-actions {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.table-toolbar-meta {
+    font-size: 0.75rem;
+    color: var(--ink-muted);
+}
+
 .parse-warning-pill {
     padding: 3px 8px;
     border-radius: 999px;
@@ -698,6 +710,10 @@ option {
     outline-offset: -2px;
 }
 
+.table-row.deleted {
+    background: var(--panel-muted);
+}
+
 .table-cell {
     min-width: var(--cell-min);
     width: var(--cell-min);
@@ -711,6 +727,29 @@ option {
     font-size: 0.84rem;
     font-variant-numeric: tabular-nums;
     contain: layout style paint;
+}
+
+.table-cell.deleted {
+    color: var(--ink-muted);
+    text-decoration: line-through;
+    text-decoration-thickness: 1px;
+}
+
+.table-cell.editing {
+    padding: 0;
+}
+
+.cell-editor {
+    width: 100%;
+    height: 100%;
+    border: 1px solid var(--accent-outline);
+    border-radius: 0;
+    padding: 4px 8px;
+    font-family: inherit;
+    font-size: 0.84rem;
+    background: var(--input-bg);
+    color: var(--input-text);
+    outline: none;
 }
 
 .table-cell.index {
@@ -1264,6 +1303,39 @@ option {
     display: flex;
     align-items: center;
     line-height: 1;
+}
+
+.find-stale {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: 8px;
+}
+
+.find-results-stale {
+    font-size: 0.72rem;
+    color: var(--ink-muted);
+    padding: 2px 6px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--panel-strong);
+    white-space: nowrap;
+}
+
+.find-rerun-btn {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 0 8px;
+    height: 24px;
+    background: var(--panel);
+    color: var(--ink);
+    font-size: 0.72rem;
+    font-family: inherit;
+    cursor: pointer;
+}
+
+.find-rerun-btn:hover:not(:disabled) {
+    background: var(--panel-muted);
 }
 
 .find-icon-btn {
