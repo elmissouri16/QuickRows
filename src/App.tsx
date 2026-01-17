@@ -1475,7 +1475,7 @@ function App() {
     setDuplicateStale(false);
     invoke("find_duplicates_stream", {
       columnIdx: duplicateColumn,
-      request_id: requestId,
+      requestId,
     }).catch((err) => {
       if (requestId !== duplicateRequestIdRef.current) {
         return;
@@ -1830,7 +1830,7 @@ function App() {
       query: debouncedSearch,
       matchCase: searchMatchCase,
       wholeWord: searchWholeWord,
-      request_id: requestId,
+      requestId,
     }).catch((err) => {
       if (requestId !== searchRequestIdRef.current) {
         return;
