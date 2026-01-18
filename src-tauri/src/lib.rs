@@ -19,7 +19,11 @@ use disk_cache::{
 use memmap2::Mmap;
 use rayon::prelude::*;
 // use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, State, WebviewWindowBuilder};
 
 #[cfg(desktop)]
@@ -88,6 +92,7 @@ struct AppState {
     parse_warnings: Mutex<Vec<ParseWarning>>,
     search_index: Mutex<SearchIndex>,
     enable_indexing: Mutex<bool>,
+    debug_logging: Mutex<bool>,
 }
 
 const SEARCH_CHUNK_SIZE: usize = 25_000;
@@ -136,6 +141,78 @@ fn emit_matches_complete(
     let payload = MatchesCompletePayload { request_id, total };
     app.emit(event, payload).map_err(|err| err.to_string())?;
     Ok(())
+}
+
+const DEBUG_LOG_FILE: &str = "quickrows.log";
+const CRASH_LOG_FILE: &str = "quickrows-crash.log";
+const LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+fn now_timestamp() -> String {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = duration.as_secs();
+    let ms = duration.subsec_millis();
+    format!("{secs}.{ms:03}")
+}
+
+fn debug_log_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(ensure_cache_dir(app)?.join(DEBUG_LOG_FILE))
+}
+
+fn crash_log_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(ensure_cache_dir(app)?.join(CRASH_LOG_FILE))
+}
+
+fn maybe_truncate_log(path: &Path) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() <= LOG_MAX_BYTES {
+        return;
+    }
+    let _ = std::fs::write(path, b"");
+}
+
+fn append_log_line(path: &Path, line: &str) -> Result<(), String> {
+    maybe_truncate_log(path);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|err| err.to_string())?;
+    writeln!(file, "{line}").map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn append_debug_line(app: &tauri::AppHandle, line: &str) -> Result<(), String> {
+    append_log_line(&debug_log_path(app)?, line)
+}
+
+fn append_crash_line(app: &tauri::AppHandle, line: &str) -> Result<(), String> {
+    append_log_line(&crash_log_path(app)?, line)
+}
+
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn install_panic_hook(app: tauri::AppHandle) {
+    std::panic::set_hook(Box::new(move |info| {
+        let mut message = String::new();
+        message.push_str(&format!("[{}] PANIC: {info}\n", now_timestamp()));
+        let backtrace = std::backtrace::Backtrace::capture();
+        message.push_str(&format!("{backtrace}\n"));
+        let _ = append_crash_line(&app, &message);
+        let _ = append_debug_line(&app, &message);
+    }));
 }
 
 /// Build search index for all columns in background
@@ -210,7 +287,9 @@ fn build_search_index(
 
                 // Create lowercase key, truncated for memory efficiency
                 let key: Box<str> = if cell.len() > INDEX_VALUE_MAX_LEN {
-                    cell[..INDEX_VALUE_MAX_LEN].to_lowercase().into()
+                    truncate_utf8(cell, INDEX_VALUE_MAX_LEN)
+                        .to_lowercase()
+                        .into()
                 } else {
                     cell.to_lowercase().into()
                 };
@@ -588,7 +667,7 @@ async fn search_csv(
                 if let Some(ref col_index) = search_index.columns[col_idx] {
                     // Truncate query key like we did during indexing
                     let query_key: Box<str> = if query_processed.len() > INDEX_VALUE_MAX_LEN {
-                        query_processed[..INDEX_VALUE_MAX_LEN].into()
+                        truncate_utf8(&query_processed, INDEX_VALUE_MAX_LEN).into()
                     } else {
                         query_processed.clone().into()
                     };
@@ -774,7 +853,7 @@ async fn search_csv_stream(
             if col_idx < search_index.columns.len() {
                 if let Some(ref col_index) = search_index.columns[col_idx] {
                     let query_key: Box<str> = if query_processed.len() > INDEX_VALUE_MAX_LEN {
-                        query_processed[..INDEX_VALUE_MAX_LEN].into()
+                        truncate_utf8(&query_processed, INDEX_VALUE_MAX_LEN).into()
                     } else {
                         query_processed.clone().into()
                     };
@@ -1031,6 +1110,17 @@ async fn sort_csv(
         .clone()
         .ok_or("No file loaded")?;
     let settings = state.parse_settings.lock().unwrap().clone();
+    let started = std::time::Instant::now();
+    let debug_enabled = *state.debug_logging.lock().unwrap();
+    if debug_enabled {
+        let _ = append_debug_line(
+            &app,
+            &format!(
+                "[{}] INFO sort_csv start column_idx={column_idx} ascending={ascending} path={path}",
+                now_timestamp()
+            ),
+        );
+    }
 
     let cache_dir = ensure_cache_dir(&app)?;
     let settings_hash = settings_cache_hash(&settings);
@@ -1038,6 +1128,17 @@ async fn sort_csv(
     let order_path = order_cache_path(&cache_dir, key, column_idx, ascending);
     if let Ok(Some(order)) = read_order_cache(&order_path, key, column_idx, ascending) {
         *state.sorted_order.lock().unwrap() = Some(order.clone());
+        if debug_enabled {
+            let _ = append_debug_line(
+                &app,
+                &format!(
+                    "[{}] INFO sort_csv cache_hit len={} ms={}",
+                    now_timestamp(),
+                    order.len(),
+                    started.elapsed().as_millis()
+                ),
+            );
+        }
         return Ok(order);
     }
     if !ascending {
@@ -1045,6 +1146,17 @@ async fn sort_csv(
         if let Ok(Some(mut order)) = read_order_cache(&asc_path, key, column_idx, true) {
             order.reverse();
             *state.sorted_order.lock().unwrap() = Some(order.clone());
+            if debug_enabled {
+                let _ = append_debug_line(
+                    &app,
+                    &format!(
+                        "[{}] INFO sort_csv cache_hit(reversed) len={} ms={}",
+                        now_timestamp(),
+                        order.len(),
+                        started.elapsed().as_millis()
+                    ),
+                );
+            }
             return Ok(order);
         }
     }
@@ -1130,7 +1242,7 @@ async fn sort_csv(
                 .map(|s| {
                     // Truncate to reduce memory usage
                     if s.len() > SORT_VALUE_MAX_LEN {
-                        s[..SORT_VALUE_MAX_LEN].into()
+                        truncate_utf8(s, SORT_VALUE_MAX_LEN).into()
                     } else {
                         s.as_str().into()
                     }
@@ -1161,6 +1273,17 @@ async fn sort_csv(
     let order: Vec<usize> = rows.iter().map(|(idx, _)| *idx as usize).collect();
     *state.sorted_order.lock().unwrap() = Some(order.clone());
     let _ = write_order_cache(&order_path, key, column_idx, ascending, &order);
+    if debug_enabled {
+        let _ = append_debug_line(
+            &app,
+            &format!(
+                "[{}] INFO sort_csv done len={} ms={}",
+                now_timestamp(),
+                order.len(),
+                started.elapsed().as_millis()
+            ),
+        );
+    }
 
     Ok(order)
 }
@@ -1276,6 +1399,52 @@ async fn get_parse_warnings(
 }
 
 #[tauri::command]
+async fn get_debug_log_path(app: tauri::AppHandle) -> Result<String, String> {
+    Ok(debug_log_path(&app)?.display().to_string())
+}
+
+#[tauri::command]
+async fn get_crash_log_path(app: tauri::AppHandle) -> Result<String, String> {
+    Ok(crash_log_path(&app)?.display().to_string())
+}
+
+#[tauri::command]
+async fn clear_debug_log(app: tauri::AppHandle) -> Result<(), String> {
+    std::fs::write(debug_log_path(&app)?, b"").map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn set_debug_logging(
+    enabled: bool,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    *state.debug_logging.lock().unwrap() = enabled;
+    let path = debug_log_path(&app)?;
+    let _ = append_debug_line(
+        &app,
+        &format!("[{}] INFO debug_logging={enabled}", now_timestamp()),
+    );
+    Ok(path.display().to_string())
+}
+
+#[tauri::command]
+async fn append_debug_log(
+    message: String,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    if !*state.debug_logging.lock().unwrap() {
+        return Ok(());
+    }
+    let mut msg = message.replace('\n', "\\n");
+    if msg.len() > 8_000 {
+        msg.truncate(8_000);
+    }
+    append_debug_line(&app, &format!("[{}] WEB {msg}", now_timestamp()))
+}
+
+#[tauri::command]
 async fn write_csv_file(path: String, contents: String) -> Result<(), String> {
     std::fs::write(path, contents).map_err(|err| err.to_string())
 }
@@ -1313,6 +1482,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            install_panic_hook(app.handle().clone());
             for window_config in app.config().app.windows.iter().filter(|w| !w.create) {
                 WebviewWindowBuilder::from_config(app.handle(), window_config)?
                     .enable_clipboard_access()
@@ -1335,6 +1505,7 @@ pub fn run() {
             parse_warnings: Mutex::new(Vec::new()),
             search_index: Mutex::new(SearchIndex::new()),
             enable_indexing: Mutex::new(true),
+            debug_logging: Mutex::new(false),
         })
         .invoke_handler(tauri::generate_handler![
             load_csv_metadata,
@@ -1350,6 +1521,11 @@ pub fn run() {
             take_pending_open,
             get_row_count,
             get_parse_warnings,
+            get_debug_log_path,
+            get_crash_log_path,
+            set_debug_logging,
+            append_debug_log,
+            clear_debug_log,
             write_csv_file,
             set_show_index_checked,
             set_enable_indexing

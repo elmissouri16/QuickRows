@@ -42,5 +42,10 @@ This is a vibe-coded project tailored to my personal workflow and needs.
 - `npm run tauri dev`: run the full desktop app with Tauri.
 - `npm run tauri build`: package the desktop app.
 
+## Diagnostics (Logs & Crashes)
+- Enable **Settings → Diagnostics → Enable Debug Logging** to write a log file you can attach to issues.
+- Use the buttons in the same section to open/copy the log path.
+- Crash/panic info is written to a separate crash log file (also linked in **Settings → Diagnostics**).
+
 ## License
 MIT

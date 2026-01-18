@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type { CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, save } from "@tauri-apps/plugin-dialog";
+import { openPath } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useDebounce } from "./hooks/useDebounce";
@@ -355,6 +356,9 @@ function App() {
   const [deletedRowsVersion, setDeletedRowsVersion] = useState(0);
   const [loadingProgress, setLoadingProgress] = useState<number | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [debugLogging, setDebugLogging] = useState(false);
+  const [debugLogPath, setDebugLogPath] = useState<string | null>(null);
+  const [crashLogPath, setCrashLogPath] = useState<string | null>(null);
   const [selectedRanges, setSelectedRanges] = useState<SelectionRange[]>([]);
   const [selectionAnchor, setSelectionAnchor] = useState<number | null>(null);
   const [focusedRow, setFocusedRow] = useState<number | null>(null);
@@ -362,6 +366,8 @@ function App() {
     const saved = localStorage.getItem("csv-viewer-enable-indexing");
     return saved !== null ? saved === "true" : true; // Default enabled
   });
+  const debugLoggingRef = useRef(debugLogging);
+  debugLoggingRef.current = debugLogging;
   const dataRef = useRef<Map<number, string[]>>(new Map());
   const rowIndexMapRef = useRef<Map<number, number>>(new Map());
   const searchRequestIdRef = useRef(0);
@@ -370,6 +376,11 @@ function App() {
   const duplicateResultsCountRef = useRef(0);
   const sortWorkerRef = useRef<Worker | null>(null);
   const sortWorkerRequestIdRef = useRef(0);
+  const pendingSortOrderRef = useRef<{
+    requestId: number;
+    order: number[];
+  } | null>(null);
+  const sortWorkerTimeoutRef = useRef<number | null>(null);
   const editsRef = useRef<Map<number, Map<number, string>>>(new Map());
   const deletedRowsRef = useRef<Set<number>>(new Set());
   const [, setDataVersion] = useState(0);
@@ -544,14 +555,61 @@ function App() {
     },
   });
 
+  const appendDebugLog = useCallback((message: string) => {
+    if (!debugLoggingRef.current) {
+      return;
+    }
+    invoke("append_debug_log", { message }).catch(() => {});
+  }, []);
+
+  const buildSortLookupChunked = useCallback(
+    (order: number[], requestId: number) => {
+      pendingSortOrderRef.current = null;
+      if (sortWorkerTimeoutRef.current !== null) {
+        window.clearTimeout(sortWorkerTimeoutRef.current);
+        sortWorkerTimeoutRef.current = null;
+      }
+
+      const lookup = new Uint32Array(order.length);
+      let i = 0;
+      const chunkSize = 250_000;
+
+      const step = () => {
+        if (requestId !== sortWorkerRequestIdRef.current) {
+          return;
+        }
+        const end = Math.min(order.length, i + chunkSize);
+        for (; i < end; i += 1) {
+          lookup[order[i]] = i;
+        }
+        if (i < order.length) {
+          window.setTimeout(step, 0);
+          return;
+        }
+        setSortedIndexLookup(lookup);
+        rowVirtualizer.scrollToIndex(0);
+        setSortLoading(false);
+      };
+
+      step();
+    },
+    [rowVirtualizer],
+  );
+
   useEffect(() => {
     if (typeof Worker === "undefined") {
       return;
     }
-    const worker = new Worker(
-      new URL("./workers/csv.worker.ts", import.meta.url),
-      { type: "module" },
-    );
+    let worker: Worker | null = null;
+    try {
+      worker = new Worker(new URL("./workers/csv.worker.ts", import.meta.url), {
+        type: "module",
+      });
+    } catch (err) {
+      appendDebugLog(`Sort worker init failed: ${String(err)}`);
+      sortWorkerRef.current = null;
+      return;
+    }
     sortWorkerRef.current = worker;
 
     const handleMessage = (event: MessageEvent<SortWorkerResponse>) => {
@@ -562,18 +620,52 @@ function App() {
       if (data.requestId !== sortWorkerRequestIdRef.current) {
         return;
       }
+      pendingSortOrderRef.current = null;
+      if (sortWorkerTimeoutRef.current !== null) {
+        window.clearTimeout(sortWorkerTimeoutRef.current);
+        sortWorkerTimeoutRef.current = null;
+      }
       setSortedIndexLookup(data.lookup);
       rowVirtualizer.scrollToIndex(0);
       setSortLoading(false);
     };
 
+    const handleWorkerError = (event: ErrorEvent) => {
+      appendDebugLog(
+        `Sort worker error: ${event.message || "Unknown worker error"}`,
+      );
+      const pending = pendingSortOrderRef.current;
+      pendingSortOrderRef.current = null;
+      if (sortWorkerTimeoutRef.current !== null) {
+        window.clearTimeout(sortWorkerTimeoutRef.current);
+        sortWorkerTimeoutRef.current = null;
+      }
+      try {
+        worker?.terminate();
+      } catch {
+        // ignore
+      }
+      sortWorkerRef.current = null;
+      if (pending && pending.requestId === sortWorkerRequestIdRef.current) {
+        buildSortLookupChunked(pending.order, pending.requestId);
+      }
+    };
+
+    const handleWorkerMessageError = () => {
+      appendDebugLog("Sort worker message deserialization failed.");
+    };
+
     worker.addEventListener("message", handleMessage);
+    worker.addEventListener("error", handleWorkerError);
+    worker.addEventListener("messageerror", handleWorkerMessageError);
     return () => {
       worker.removeEventListener("message", handleMessage);
+      worker.removeEventListener("error", handleWorkerError);
+      worker.removeEventListener("messageerror", handleWorkerMessageError);
       worker.terminate();
       sortWorkerRef.current = null;
     };
-  }, [rowVirtualizer]);
+  }, [appendDebugLog, buildSortLookupChunked, rowVirtualizer]);
 
   const headerLabels = useMemo(
     () =>
@@ -631,6 +723,7 @@ function App() {
         theme?: ThemePreference;
         lastOpenDir?: string;
         recentFiles?: string[];
+        debugLogging?: boolean;
         parseOverrides?: Partial<ParseOverridesState>;
       };
       if (typeof parsed.showIndex === "boolean") {
@@ -679,6 +772,9 @@ function App() {
           setRecentFiles(nextRecent);
         }
       }
+      if (typeof parsed.debugLogging === "boolean") {
+        setDebugLogging(parsed.debugLogging);
+      }
       if (parsed.parseOverrides) {
         setParseOverrides((prev) => ({
           ...prev,
@@ -699,6 +795,7 @@ function App() {
       theme: themePreference,
       lastOpenDir,
       recentFiles,
+      debugLogging,
       parseOverrides,
     };
     try {
@@ -714,12 +811,60 @@ function App() {
     themePreference,
     lastOpenDir,
     recentFiles,
+    debugLogging,
     parseOverrides,
   ]);
 
   useEffect(() => {
     invoke("set_show_index_checked", { checked: showIndex }).catch(() => {});
   }, [showIndex]);
+
+  useEffect(() => {
+    invoke<string>("get_debug_log_path")
+      .then((path) => setDebugLogPath(path))
+      .catch(() => {});
+    invoke<string>("get_crash_log_path")
+      .then((path) => setCrashLogPath(path))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    invoke<string>("set_debug_logging", { enabled: debugLogging })
+      .then((path) => setDebugLogPath(path))
+      .catch(() => {});
+  }, [debugLogging]);
+
+  useEffect(() => {
+    if (!debugLogging) {
+      return;
+    }
+
+    const onError = (event: ErrorEvent) => {
+      appendDebugLog(
+        `window.error: ${event.message || "Unknown error"} @ ${event.filename}:${event.lineno}:${event.colno}`,
+      );
+    };
+    const onRejection = (event: PromiseRejectionEvent) => {
+      const reason = (() => {
+        try {
+          if (typeof event.reason === "string") {
+            return event.reason;
+          }
+          return JSON.stringify(event.reason);
+        } catch {
+          return String(event.reason);
+        }
+      })();
+      appendDebugLog(`unhandledrejection: ${reason}`);
+    };
+
+    window.addEventListener("error", onError);
+    window.addEventListener("unhandledrejection", onRejection);
+    return () => {
+      window.removeEventListener("error", onError);
+      window.removeEventListener("unhandledrejection", onRejection);
+    };
+  }, [appendDebugLog, debugLogging]);
 
   useEffect(() => {
     if (!filePath) {
@@ -1399,7 +1544,7 @@ function App() {
   );
 
   const handlePickFile = useCallback(async () => {
-    const selected = await open({
+    const selected = await openDialog({
       multiple: false,
       filters: [{ name: "CSV", extensions: ["csv"] }],
       defaultPath: lastOpenDir ?? undefined,
@@ -2106,26 +2251,49 @@ function App() {
             requestId,
             order,
           };
-          worker.postMessage(message);
-          return;
+          pendingSortOrderRef.current = { requestId, order };
+          if (sortWorkerTimeoutRef.current !== null) {
+            window.clearTimeout(sortWorkerTimeoutRef.current);
+          }
+          sortWorkerTimeoutRef.current = window.setTimeout(() => {
+            if (requestId !== sortWorkerRequestIdRef.current) {
+              return;
+            }
+            appendDebugLog("Sort worker timeout; falling back to main thread.");
+            try {
+              sortWorkerRef.current?.terminate();
+            } catch {
+              // ignore
+            }
+            sortWorkerRef.current = null;
+            buildSortLookupChunked(order, requestId);
+          }, 15_000);
+          try {
+            worker.postMessage(message);
+            return;
+          } catch (err) {
+            appendDebugLog(`Sort worker postMessage failed: ${String(err)}`);
+            sortWorkerRef.current = null;
+          }
         }
-        const lookup = new Array(order.length);
-        order.forEach((original, displayIndex) => {
-          lookup[original] = displayIndex;
-        });
-        setSortedIndexLookup(lookup);
-        rowVirtualizer.scrollToIndex(0);
-        setSortLoading(false);
+        buildSortLookupChunked(order, requestId);
       })
       .catch((err) => {
         if (requestId !== sortWorkerRequestIdRef.current) {
           return;
         }
+        appendDebugLog(`sort_csv invoke failed: ${String(err)}`);
         setError(typeof err === "string" ? err : "Failed to sort CSV.");
         setSortState(null);
         setSortLoading(false);
       });
-  }, [filePath, rowVirtualizer, sortState]);
+  }, [
+    appendDebugLog,
+    buildSortLookupChunked,
+    filePath,
+    rowVirtualizer,
+    sortState,
+  ]);
 
   useEffect(() => {
     let active = true;
@@ -3598,6 +3766,75 @@ function App() {
                   <button className="btn secondary" onClick={handleApplyParse}>
                     Reload File
                   </button>
+                </div>
+              </div>
+              <div className="setting-group">
+                <h3>Diagnostics</h3>
+                <div className="setting-item">
+                  <div className="setting-item-row">
+                    <span className="setting-label">Enable Debug Logging</span>
+                    <label className="toggle-switch">
+                      <input
+                        type="checkbox"
+                        checked={debugLogging}
+                        onChange={(e) => setDebugLogging(e.target.checked)}
+                      />
+                      <span className="slider"></span>
+                    </label>
+                  </div>
+                  <p className="setting-description">
+                    When enabled, QuickRows writes extra logs to help diagnose
+                    hangs and crashes.
+                  </p>
+                  <div
+                    className="setting-item-row"
+                    style={{ justifyContent: "flex-end", gap: 8 }}
+                  >
+                    <button
+                      className="btn secondary small"
+                      type="button"
+                      disabled={!debugLogPath}
+                      onClick={() => {
+                        if (!debugLogPath) return;
+                        openPath(debugLogPath).catch(() => {});
+                      }}
+                    >
+                      Open Log File
+                    </button>
+                    <button
+                      className="btn secondary small"
+                      type="button"
+                      disabled={!crashLogPath}
+                      onClick={() => {
+                        if (!crashLogPath) return;
+                        openPath(crashLogPath).catch(() => {});
+                      }}
+                    >
+                      Open Crash Log
+                    </button>
+                    <button
+                      className="btn secondary small"
+                      type="button"
+                      disabled={!debugLogPath}
+                      onClick={() => {
+                        if (!debugLogPath) return;
+                        navigator.clipboard
+                          .writeText(debugLogPath)
+                          .catch(() => {});
+                      }}
+                    >
+                      Copy Log Path
+                    </button>
+                    <button
+                      className="btn secondary small"
+                      type="button"
+                      onClick={() => {
+                        invoke("clear_debug_log").catch(() => {});
+                      }}
+                    >
+                      Clear Logs
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
