@@ -3796,7 +3796,12 @@ function App() {
                       disabled={!debugLogPath}
                       onClick={() => {
                         if (!debugLogPath) return;
-                        openPath(debugLogPath).catch(() => {});
+                        openPath(debugLogPath).catch((err) => {
+                          console.error(err);
+                          setError(
+                            "Failed to open log file. Use 'Copy Log Path' and open it manually.",
+                          );
+                        });
                       }}
                     >
                       Open Log File
@@ -3807,7 +3812,12 @@ function App() {
                       disabled={!crashLogPath}
                       onClick={() => {
                         if (!crashLogPath) return;
-                        openPath(crashLogPath).catch(() => {});
+                        openPath(crashLogPath).catch((err) => {
+                          console.error(err);
+                          setError(
+                            "Failed to open crash log. Use 'Copy Log Path' and open it manually.",
+                          );
+                        });
                       }}
                     >
                       Open Crash Log

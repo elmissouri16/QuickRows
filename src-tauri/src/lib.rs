@@ -204,6 +204,17 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+fn truncate_string_utf8(s: &mut String, max_bytes: usize) {
+    if s.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
+
 fn install_panic_hook(app: tauri::AppHandle) {
     std::panic::set_hook(Box::new(move |info| {
         let mut message = String::new();
@@ -1400,12 +1411,22 @@ async fn get_parse_warnings(
 
 #[tauri::command]
 async fn get_debug_log_path(app: tauri::AppHandle) -> Result<String, String> {
-    Ok(debug_log_path(&app)?.display().to_string())
+    let path = debug_log_path(&app)?;
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path);
+    Ok(path.display().to_string())
 }
 
 #[tauri::command]
 async fn get_crash_log_path(app: tauri::AppHandle) -> Result<String, String> {
-    Ok(crash_log_path(&app)?.display().to_string())
+    let path = crash_log_path(&app)?;
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path);
+    Ok(path.display().to_string())
 }
 
 #[tauri::command]
@@ -1438,9 +1459,7 @@ async fn append_debug_log(
         return Ok(());
     }
     let mut msg = message.replace('\n', "\\n");
-    if msg.len() > 8_000 {
-        msg.truncate(8_000);
-    }
+    truncate_string_utf8(&mut msg, 8_000);
     append_debug_line(&app, &format!("[{}] WEB {msg}", now_timestamp()))
 }
 
