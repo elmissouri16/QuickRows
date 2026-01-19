@@ -1721,9 +1721,9 @@ option {
     backdrop-filter: blur(2px);
     display: flex;
     justify-content: center;
-    align-items: flex-start;
+    align-items: center;
     padding: 24px 16px;
-    overflow-y: auto;
+    overflow: hidden;
     z-index: 9999;
 }
 
@@ -1732,13 +1732,13 @@ option {
     background-color: var(--surface);
     width: 480px;
     max-width: 90vw;
-    max-height: none;
+    max-height: calc(100vh - 48px);
     border-radius: 12px;
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.7);
     border: 1px solid var(--border);
     display: flex;
     flex-direction: column;
-    overflow: visible;
+    overflow: hidden;
     position: relative;
     z-index: 10000;
     margin: 24px auto;
@@ -1783,7 +1783,8 @@ option {
     padding: 24px;
     flex: 1 1 auto;
     min-height: 0;
-    overflow: visible;
+    overflow-y: auto;
+    overflow-x: hidden;
 }
 
 .setting-group {
@@ -1805,6 +1806,14 @@ option {
     justify-content: space-between;
     align-items: center;
     margin-bottom: 8px;
+}
+
+.setting-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 12px;
+    flex-wrap: wrap;
 }
 
 .setting-label {

@@ -4,6 +4,7 @@ import type { CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog, save } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
+import { appDataDir, join } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useDebounce } from "./hooks/useDebounce";
@@ -3753,10 +3754,7 @@ function App() {
                     </select>
                   </div>
                 </div>
-                <div
-                  className="setting-item"
-                  style={{ justifyContent: "flex-end", gap: 12, marginTop: 16 }}
-                >
+                <div className="setting-item setting-actions">
                   <button
                     className="btn subtle"
                     onClick={() => applyParseOverrides(DEFAULT_PARSE_OVERRIDES)}
@@ -3793,56 +3791,34 @@ function App() {
                     <button
                       className="btn secondary small"
                       type="button"
-                      disabled={!debugLogPath}
-                      onClick={() => {
-                        if (!debugLogPath) return;
-                        openPath(debugLogPath).catch((err) => {
+                      disabled={!debugLogPath && !crashLogPath}
+                      onClick={async () => {
+                        try {
+                          const baseDir = await appDataDir();
+                          const logsDir = await join(
+                            baseDir,
+                            "csv-index-cache",
+                          );
+                          await openPath(logsDir);
+                          return;
+                        } catch (err) {
+                          const path = debugLogPath || crashLogPath;
+                          if (path) {
+                            try {
+                              await openPath(path);
+                              return;
+                            } catch (openErr) {
+                              console.error(openErr);
+                            }
+                          }
                           console.error(err);
                           setError(
-                            "Failed to open log file. Use 'Copy Log Path' and open it manually.",
+                            "Failed to open log folder. Open it manually if needed.",
                           );
-                        });
+                        }
                       }}
                     >
-                      Open Log File
-                    </button>
-                    <button
-                      className="btn secondary small"
-                      type="button"
-                      disabled={!crashLogPath}
-                      onClick={() => {
-                        if (!crashLogPath) return;
-                        openPath(crashLogPath).catch((err) => {
-                          console.error(err);
-                          setError(
-                            "Failed to open crash log. Use 'Copy Log Path' and open it manually.",
-                          );
-                        });
-                      }}
-                    >
-                      Open Crash Log
-                    </button>
-                    <button
-                      className="btn secondary small"
-                      type="button"
-                      disabled={!debugLogPath}
-                      onClick={() => {
-                        if (!debugLogPath) return;
-                        navigator.clipboard
-                          .writeText(debugLogPath)
-                          .catch(() => {});
-                      }}
-                    >
-                      Copy Log Path
-                    </button>
-                    <button
-                      className="btn secondary small"
-                      type="button"
-                      onClick={() => {
-                        invoke("clear_debug_log").catch(() => {});
-                      }}
-                    >
-                      Clear Logs
+                      Open Log Folder
                     </button>
                   </div>
                 </div>

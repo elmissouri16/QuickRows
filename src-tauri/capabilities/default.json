@@ -7,7 +7,13 @@
     "core:default",
     "core:window:allow-set-title",
     "opener:default",
-    "opener:allow-open-path",
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [
+        { "path": "$APPDATA/csv-index-cache" },
+        { "path": "$APPDATA/csv-index-cache/*" }
+      ]
+    },
     "dialog:default"
   ]
 }
