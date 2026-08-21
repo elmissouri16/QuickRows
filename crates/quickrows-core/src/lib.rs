@@ -26,6 +26,7 @@ pub use csv::{
     PreservedComment, MAX_WARNING_COUNT,
 };
 pub use diagnostics::Diagnostics;
+pub use disk_cache::FileFingerprint;
 pub use document::{
     BuiltSearchIndex, CancellationToken, CsvDocument, CsvMetadata, DocumentEdits, SearchIndexBuild,
     SortDirection, SortSpec,
@@ -33,5 +34,4 @@ pub use document::{
 pub use fragment::{
     CsvFragment, FragmentCellSpan, FragmentPosition, FragmentSpan, ResolvedFragmentRegion,
 };
-pub use mmap::open_mmap_if_large;
 pub use settings::{AppSettings, RowDensity, SettingsStore, ThemePreference};

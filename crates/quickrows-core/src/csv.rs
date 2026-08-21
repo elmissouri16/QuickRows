@@ -835,6 +835,8 @@ fn needs_prepared_source(settings: &ParseSettings) -> bool {
         || settings.escape.is_some_and(|value| !value.is_ascii())
         || settings.comment.is_some()
         || settings.excel_sep
+        || settings.max_field_size != usize::MAX
+        || settings.max_record_size != usize::MAX
         || settings.malformed != MalformedMode::Skip
 }
 
@@ -845,6 +847,8 @@ struct StreamingCanonicalWriter<'a, W: Write> {
     comments: &'a mut Vec<PreservedComment>,
     fields: Vec<String>,
     field: String,
+    field_size: usize,
+    record_size: usize,
     in_quotes: bool,
     pending_quote: bool,
     pending_escape: bool,
@@ -881,6 +885,8 @@ impl<'a, W: Write> StreamingCanonicalWriter<'a, W> {
             comments,
             fields: Vec::new(),
             field: String::new(),
+            field_size: 0,
+            record_size: 0,
             in_quotes: false,
             pending_quote: false,
             pending_escape: false,
@@ -926,6 +932,81 @@ impl<'a, W: Write> StreamingCanonicalWriter<'a, W> {
         Ok(())
     }
 
+    fn limit_exceeded(
+        &mut self,
+        kind: &str,
+        message: String,
+        limit: usize,
+        len: usize,
+    ) -> Result<(), String> {
+        if self.settings.malformed == MalformedMode::Strict {
+            return Err(message);
+        }
+        if !self.warned_record {
+            push_warning(
+                self.warnings,
+                ParseWarning {
+                    record: Some(self.record),
+                    line: None,
+                    byte: None,
+                    field: None,
+                    kind: if self.settings.malformed == MalformedMode::Repair {
+                        "repaired".to_string()
+                    } else {
+                        kind.to_string()
+                    },
+                    message,
+                    expected_len: Some(limit as u64),
+                    len: Some(len as u64),
+                },
+            );
+            self.warned_record = true;
+        }
+        if self.settings.malformed == MalformedMode::Skip {
+            self.skip_record = true;
+        }
+        Ok(())
+    }
+
+    fn push_field_char(&mut self, ch: char) -> Result<(), String> {
+        let bytes = ch.len_utf8();
+        self.field_size = self.field_size.saturating_add(bytes);
+        let field_too_large = self.field_size > self.settings.max_field_size;
+        if field_too_large {
+            self.limit_exceeded(
+                "max-field-size",
+                format!(
+                    "Field exceeds max size ({} bytes)",
+                    self.settings.max_field_size
+                ),
+                self.settings.max_field_size,
+                self.field_size,
+            )?;
+            return Ok(());
+        }
+
+        let next_record_size = self.record_size.saturating_add(bytes);
+        let record_too_large = next_record_size > self.settings.max_record_size;
+        if record_too_large {
+            self.limit_exceeded(
+                "max-record-size",
+                format!(
+                    "Record exceeds max size ({} bytes)",
+                    self.settings.max_record_size
+                ),
+                self.settings.max_record_size,
+                next_record_size,
+            )?;
+            return Ok(());
+        }
+
+        self.record_size = next_record_size;
+        if !self.skip_record {
+            self.field.push(ch);
+        }
+        Ok(())
+    }
+
     fn finish_record(&mut self) -> Result<(), String> {
         self.fields.push(std::mem::take(&mut self.field));
         if !self.skip_record {
@@ -935,6 +1016,8 @@ impl<'a, W: Write> StreamingCanonicalWriter<'a, W> {
             self.emitted_records += 1;
         }
         self.fields.clear();
+        self.field_size = 0;
+        self.record_size = 0;
         self.in_quotes = false;
         self.pending_quote = false;
         self.pending_escape = false;
@@ -961,6 +1044,8 @@ impl<'a, W: Write> StreamingCanonicalWriter<'a, W> {
     fn reset_comment(&mut self) {
         self.field.clear();
         self.fields.clear();
+        self.field_size = 0;
+        self.record_size = 0;
         self.in_quotes = false;
         self.pending_quote = false;
         self.pending_escape = false;
@@ -996,18 +1081,18 @@ impl<'a, W: Write> StreamingCanonicalWriter<'a, W> {
                 if self.pending_escape {
                     self.pending_escape = false;
                     if ch == self.settings.quote {
-                        self.field.push(ch);
+                        self.push_field_char(ch)?;
                         self.saw_record_content = true;
                         return Ok(());
                     }
                     if let Some(escape) = self.settings.escape {
-                        self.field.push(escape);
+                        self.push_field_char(escape)?;
                     }
                 }
                 if self.pending_quote {
                     self.pending_quote = false;
                     if ch == self.settings.quote {
-                        self.field.push(ch);
+                        self.push_field_char(ch)?;
                         self.saw_record_content = true;
                         return Ok(());
                     }
@@ -1020,7 +1105,7 @@ impl<'a, W: Write> StreamingCanonicalWriter<'a, W> {
                 } else if ch == self.settings.quote {
                     self.pending_quote = true;
                 } else {
-                    self.field.push(ch);
+                    self.push_field_char(ch)?;
                     self.saw_record_content = true;
                 }
                 return Ok(());
@@ -1032,7 +1117,7 @@ impl<'a, W: Write> StreamingCanonicalWriter<'a, W> {
                         "CSV quote must be followed by a delimiter or record ending",
                         "malformed-quote",
                     )?;
-                    self.field.push(ch);
+                    self.push_field_char(ch)?;
                     self.after_quote = false;
                     self.at_field_start = false;
                     self.at_record_start = false;
@@ -1051,6 +1136,7 @@ impl<'a, W: Write> StreamingCanonicalWriter<'a, W> {
                 self.saw_record_content = true;
             } else if ch == self.settings.delimiter {
                 self.fields.push(std::mem::take(&mut self.field));
+                self.field_size = 0;
                 self.at_field_start = true;
                 self.at_record_start = false;
                 self.saw_record_content = true;
@@ -1064,7 +1150,7 @@ impl<'a, W: Write> StreamingCanonicalWriter<'a, W> {
                         "malformed-quote",
                     )?;
                 }
-                self.field.push(ch);
+                self.push_field_char(ch)?;
                 self.at_field_start = false;
                 self.at_record_start = false;
                 self.saw_record_content = true;
@@ -1122,7 +1208,7 @@ impl<'a, W: Write> StreamingCanonicalWriter<'a, W> {
         } else {
             if self.pending_escape {
                 if let Some(escape) = self.settings.escape {
-                    self.field.push(escape);
+                    self.push_field_char(escape)?;
                 }
                 self.pending_escape = false;
             }
@@ -2419,10 +2505,7 @@ pub fn find_duplicates_hashed(
 
         if run_end > i + 1 {
             // Found a collision group of size (run_end - i)
-            let candidates: Vec<usize> = hashes[i..run_end]
-                .iter()
-                .map(|&(_, idx)| idx as usize)
-                .collect();
+            let candidates: Vec<usize> = hashes[i..run_end].iter().map(|&(_, idx)| idx).collect();
 
             let mut warnings = Vec::new();
 
@@ -2493,10 +2576,10 @@ pub fn find_duplicates_hashed_mmap(
     // Let's assume SEEKING in-memory Cursor is very fast (it is).
     // `rdr.seek` creates a new internal buffer or clears it.
     // Optimization: Use `ReaderBuilder` with a decent buffer, but reset is inevitable on seek.
-    // Rayon `map` reduces to `Vec<(u64, u32)>`.
+    // Rayon `map` reduces to `Vec<(u64, usize)>`.
 
     let chunk_size = 4096; // Tunable
-    let mut hashes: Vec<(u64, u32)> = offsets
+    let mut hashes: Vec<(u64, usize)> = offsets
         .par_chunks(chunk_size)
         .enumerate()
         .map(|(chunk_idx, batch_offsets)| {
@@ -2534,7 +2617,7 @@ pub fn find_duplicates_hashed_mmap(
                             }
                             hasher.finish()
                         };
-                        local_hashes.push((hash, (start_row + i) as u32));
+                        local_hashes.push((hash, start_row + i));
                     }
                 }
             }
@@ -2576,8 +2659,7 @@ pub fn find_duplicates_hashed_mmap(
             // Inline is better for avoiding repeated `read_rows` overhead calls (chunking).
 
             // Extract the indices for this group
-            let group_indices: Vec<usize> =
-                hashes[range].iter().map(|&(_, idx)| idx as usize).collect();
+            let group_indices: Vec<usize> = hashes[range].iter().map(|&(_, idx)| idx).collect();
 
             // Optimization: Since we know the offsets, we can read just those rows.
             // We'll create a local reader.
@@ -2650,7 +2732,7 @@ fn compute_hashes_from_reader<R: Read + Seek>(
     mut rdr: csv::Reader<R>,
     offsets: &[u64],
     column_idx: Option<usize>,
-) -> Result<Vec<(u64, u32)>, Box<dyn std::error::Error>> {
+) -> Result<Vec<(u64, usize)>, Box<dyn std::error::Error>> {
     let mut hashes = Vec::with_capacity(offsets.len());
     let mut record = ByteRecord::new();
 
@@ -2680,7 +2762,7 @@ fn compute_hashes_from_reader<R: Read + Seek>(
                 hasher.finish()
             };
 
-            hashes.push((hash, i as u32));
+            hashes.push((hash, i));
         }
     }
 
@@ -2901,6 +2983,33 @@ mod tests {
             assert_eq!(detected.line_ending, "crlf");
             assert!(detected.source_bom);
         }
+    }
+
+    #[test]
+    fn finite_size_limits_stream_oversized_records_into_a_bounded_snapshot() {
+        let mut source = tempfile::NamedTempFile::new().unwrap();
+        source.write_all(b"name,value\nrow,").unwrap();
+        source.write_all(&vec![b'x'; 2 * 1024 * 1024]).unwrap();
+        source.write_all(b"\n").unwrap();
+        source.flush().unwrap();
+
+        let mut settings = default_parse_settings();
+        settings.has_headers = true;
+        settings.malformed = MalformedMode::Skip;
+        settings.max_field_size = 32;
+        settings.max_record_size = 64;
+        let prepared = prepare_csv_source(source.path(), &settings).unwrap();
+
+        assert!(prepared.temporary.is_some());
+        assert!(std::fs::metadata(&prepared.path).unwrap().len() < 128);
+        assert_eq!(
+            std::fs::read_to_string(&prepared.path).unwrap(),
+            "name,value\n"
+        );
+        assert!(prepared
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == "max-field-size"));
     }
 
     #[test]

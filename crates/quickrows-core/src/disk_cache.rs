@@ -7,43 +7,81 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
+const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 3);
 
 const OFFSETS_MAGIC: &[u8; 4] = b"CVOF";
 const ORDER_MAGIC: &[u8; 4] = b"CVSO";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileFingerprint {
+    pub len: u64,
+    pub modified: u64,
+    pub content_hash: [u8; 32],
+}
 
 #[derive(Clone, Copy)]
 pub struct CacheKey {
     pub hash: u64,
     pub len: u64,
     pub modified: u64,
+    pub content_hash: [u8; 32],
 }
 
-pub fn cache_key(path: &str, settings_hash: Option<u64>) -> Result<CacheKey, String> {
-    let meta = fs::metadata(path).map_err(|err| err.to_string())?;
-    let len = meta.len();
-    let modified = meta
+pub fn file_fingerprint(path: impl AsRef<Path>) -> Result<FileFingerprint, String> {
+    let path = path.as_ref();
+    let mut file = File::open(path).map_err(|err| err.to_string())?;
+    let metadata = file.metadata().map_err(|err| err.to_string())?;
+    let modified = metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos() as u64)
         .unwrap_or(0);
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; HASH_BUFFER_BYTES];
+    loop {
+        let read = file.read(&mut buffer).map_err(|err| err.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let content_hash = *hasher.finalize().as_bytes();
+    Ok(FileFingerprint {
+        len: metadata.len(),
+        modified,
+        content_hash,
+    })
+}
 
+pub fn cache_key_from_fingerprint(
+    path: &str,
+    settings_hash: Option<u64>,
+    fingerprint: FileFingerprint,
+) -> CacheKey {
     let mut hasher = DefaultHasher::new();
     path.hash(&mut hasher);
-    len.hash(&mut hasher);
-    modified.hash(&mut hasher);
+    fingerprint.len.hash(&mut hasher);
+    fingerprint.modified.hash(&mut hasher);
+    fingerprint.content_hash.hash(&mut hasher);
     if let Some(settings_hash) = settings_hash {
         settings_hash.hash(&mut hasher);
     }
     let hash = hasher.finish();
 
-    Ok(CacheKey {
+    CacheKey {
         hash,
-        len,
-        modified,
-    })
+        len: fingerprint.len,
+        modified: fingerprint.modified,
+        content_hash: fingerprint.content_hash,
+    }
+}
+
+pub fn cache_key(path: &str, settings_hash: Option<u64>) -> Result<CacheKey, String> {
+    let fingerprint = file_fingerprint(path)?;
+    Ok(cache_key_from_fingerprint(path, settings_hash, fingerprint))
 }
 
 pub fn ensure_cache_dir(base: &Path) -> Result<PathBuf, String> {
@@ -96,6 +134,7 @@ struct WarningCache {
     version: u32,
     len: u64,
     modified: u64,
+    content_hash: [u8; 32],
     warnings: Vec<ParseWarning>,
 }
 
@@ -112,7 +151,11 @@ pub fn read_warnings_cache(
         return Ok(None);
     }
     let cache: WarningCache = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    if cache.version != CACHE_VERSION || cache.len != key.len || cache.modified != key.modified {
+    if cache.version != CACHE_VERSION
+        || cache.len != key.len
+        || cache.modified != key.modified
+        || cache.content_hash != key.content_hash
+    {
         return Ok(None);
     }
     Ok(Some(cache.warnings))
@@ -127,6 +170,7 @@ pub fn write_warnings_cache(
         version: CACHE_VERSION,
         len: key.len,
         modified: key.modified,
+        content_hash: key.content_hash,
         warnings: warnings.to_vec(),
     };
     let bytes = serde_json::to_vec(&cache).map_err(|error| error.to_string())?;
@@ -151,7 +195,8 @@ pub fn read_offsets_cache(path: &Path, key: CacheKey) -> Result<Option<Vec<u64>>
 
     let len = read_u64(&mut file)?;
     let modified = read_u64(&mut file)?;
-    if len != key.len || modified != key.modified {
+    let content_hash = read_hash(&mut file)?;
+    if len != key.len || modified != key.modified || content_hash != key.content_hash {
         return Ok(None);
     }
 
@@ -160,7 +205,7 @@ pub fn read_offsets_cache(path: &Path, key: CacheKey) -> Result<Option<Vec<u64>>
         Err(_) => return Ok(None),
     };
     let file_len = file.metadata().map_err(|err| err.to_string())?.len();
-    let available_items = file_len.saturating_sub(32) / 8;
+    let available_items = file_len.saturating_sub(64) / 8;
     if count as u64 > available_items || count as u64 > key.len.saturating_add(1) {
         return Ok(None);
     }
@@ -179,6 +224,7 @@ pub fn write_offsets_cache(path: &Path, key: CacheKey, offsets: &[u64]) -> Resul
     write_u32(&mut file, CACHE_VERSION)?;
     write_u64(&mut file, key.len)?;
     write_u64(&mut file, key.modified)?;
+    write_hash(&mut file, &key.content_hash)?;
     write_u64(&mut file, offsets.len() as u64)?;
     for value in offsets {
         write_u64(&mut file, *value)?;
@@ -209,7 +255,8 @@ pub fn read_order_cache(
 
     let len = read_u64(&mut file)?;
     let modified = read_u64(&mut file)?;
-    if len != key.len || modified != key.modified {
+    let content_hash = read_hash(&mut file)?;
+    if len != key.len || modified != key.modified || content_hash != key.content_hash {
         return Ok(None);
     }
 
@@ -225,7 +272,7 @@ pub fn read_order_cache(
         Err(_) => return Ok(None),
     };
     let file_len = file.metadata().map_err(|err| err.to_string())?.len();
-    let available_items = file_len.saturating_sub(37) / 8;
+    let available_items = file_len.saturating_sub(69) / 8;
     if count as u64 > available_items || count as u64 > key.len.saturating_add(1) {
         return Ok(None);
     }
@@ -253,6 +300,7 @@ pub fn write_order_cache(
     write_u32(&mut file, CACHE_VERSION)?;
     write_u64(&mut file, key.len)?;
     write_u64(&mut file, key.modified)?;
+    write_hash(&mut file, &key.content_hash)?;
     write_u32(&mut file, column as u32)?;
     write_u8(&mut file, if ascending { 1 } else { 0 })?;
     write_u64(&mut file, order.len() as u64)?;
@@ -260,6 +308,18 @@ pub fn write_order_cache(
         write_u64(&mut file, *value as u64)?;
     }
     Ok(())
+}
+
+fn read_hash(reader: &mut impl Read) -> Result<[u8; 32], String> {
+    let mut hash = [0u8; 32];
+    reader
+        .read_exact(&mut hash)
+        .map_err(|err| err.to_string())?;
+    Ok(hash)
+}
+
+fn write_hash(writer: &mut impl Write, hash: &[u8; 32]) -> Result<(), String> {
+    writer.write_all(hash).map_err(|err| err.to_string())
 }
 
 fn read_u8(reader: &mut impl Read) -> Result<u8, String> {
@@ -324,6 +384,28 @@ mod tests {
     }
 
     #[test]
+    fn content_changes_invalidate_cache_even_with_matching_metadata() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file_path = dir.path().join("data.csv");
+        std::fs::write(&file_path, b"a,b\n1,2\n").expect("write first csv");
+        let first = cache_key(file_path.to_str().unwrap(), None).expect("first key");
+        let offsets_path = offsets_cache_path(dir.path(), first);
+        write_offsets_cache(&offsets_path, first, &[4]).expect("write offsets");
+
+        std::fs::write(&file_path, b"a,b\n9,8\n").expect("write replacement csv");
+        let mut replacement = cache_key(file_path.to_str().unwrap(), None).expect("second key");
+        assert_ne!(first.content_hash, replacement.content_hash);
+
+        // Simulate a filesystem with a coarse or explicitly preserved mtime
+        // and a colliding cache path. The cache header still rejects the bytes.
+        replacement.hash = first.hash;
+        replacement.modified = first.modified;
+        assert!(read_offsets_cache(&offsets_path, replacement)
+            .expect("read offsets")
+            .is_none());
+    }
+
+    #[test]
     fn corrupt_counts_are_rejected_before_allocation() {
         let dir = tempfile::tempdir().expect("temp dir");
         let file_path = dir.path().join("data.csv");
@@ -332,7 +414,7 @@ mod tests {
         let offsets_path = offsets_cache_path(dir.path(), key);
         write_offsets_cache(&offsets_path, key, &[4]).unwrap();
         let mut bytes = std::fs::read(&offsets_path).unwrap();
-        bytes[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
+        bytes[56..64].copy_from_slice(&u64::MAX.to_le_bytes());
         std::fs::write(&offsets_path, bytes).unwrap();
         assert!(read_offsets_cache(&offsets_path, key).unwrap().is_none());
     }

@@ -10,18 +10,19 @@ use crate::csv::{
     ParseWarning, PreservedComment, MAX_WARNING_COUNT,
 };
 use crate::disk_cache::{
-    cache_key, ensure_cache_dir, offsets_cache_path, order_cache_path, prune_cache_dir,
-    read_offsets_cache, read_order_cache, read_warnings_cache, warnings_cache_path,
-    write_offsets_cache, write_order_cache, write_warnings_cache, CacheKey,
+    cache_key_from_fingerprint, ensure_cache_dir, file_fingerprint, offsets_cache_path,
+    order_cache_path, prune_cache_dir, read_offsets_cache, read_order_cache, read_warnings_cache,
+    warnings_cache_path, write_offsets_cache, write_order_cache, write_warnings_cache, CacheKey,
+    FileFingerprint,
 };
 use crate::fragment::{CsvFragment, ResolvedFragmentRegion};
-use crate::mmap::open_mmap_if_large;
+use crate::mmap::open_immutable_mmap_if_large;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -356,6 +357,7 @@ impl DocumentEdits {
 
 pub struct CsvDocument {
     path: PathBuf,
+    source_fingerprint: FileFingerprint,
     data_path: PathBuf,
     settings: ParseSettings,
     storage_settings: ParseSettings,
@@ -441,6 +443,8 @@ impl CsvDocument {
             .to_str()
             .ok_or_else(|| "CSV paths must be valid UTF-8".to_string())?
             .to_owned();
+        let source_fingerprint = file_fingerprint(&path)?;
+        cancellation.map(CancellationToken::check).transpose()?;
         let mut detected = detect_parse_settings(&path_string).map_err(|e| e.to_string())?;
         if let Some(overrides) = overrides.as_ref() {
             validate_parse_overrides(overrides)?;
@@ -453,9 +457,14 @@ impl CsvDocument {
         let explicit_headers = overrides.as_ref().and_then(|value| value.has_headers);
         let mut settings = apply_parse_overrides(&detected, overrides);
         validate_parse_settings(&settings)?;
-        let prepared = prepare_csv_source_cancellable(&path, &settings, progress, &|| {
+        let mut prepared = prepare_csv_source_cancellable(&path, &settings, progress, &|| {
             cancellation.is_some_and(CancellationToken::is_cancelled)
         })?;
+        if prepared.temporary.is_none() {
+            let temporary = snapshot_csv_source(&path, source_fingerprint, cancellation)?;
+            prepared.path = temporary.path().to_path_buf();
+            prepared.temporary = Some(Arc::new(temporary));
+        }
         let data_path = prepared.path.clone();
         let data_path_string = data_path
             .to_str()
@@ -473,16 +482,22 @@ impl CsvDocument {
             .map_err(|e| e.to_string())?;
         let expected_columns = (!headers.is_empty()).then_some(headers.len());
         let header_warning_count = warnings.len();
-        let mmap = open_mmap_if_large(&data_path_string).map_err(|e| e.to_string())?;
+        let mmap = if prepared.temporary.is_some() {
+            open_immutable_mmap_if_large(&data_path_string).map_err(|e| e.to_string())?
+        } else {
+            None
+        };
         let data_len = std::fs::metadata(&data_path)
             .map(|metadata| metadata.len())
             .unwrap_or_default();
         let (disk_cache_dir, disk_cache_key, cached_offsets, cached_warnings) = match cache_root {
-            Some(root) => match (
-                ensure_cache_dir(root),
-                cache_key(&path_string, Some(settings_cache_hash(&settings))),
-            ) {
-                (Ok(dir), Ok(key)) => {
+            Some(root) => match ensure_cache_dir(root) {
+                Ok(dir) => {
+                    let key = cache_key_from_fingerprint(
+                        &path_string,
+                        Some(settings_cache_hash(&settings)),
+                        source_fingerprint,
+                    );
                     prune_cache_dir(&dir);
                     let offsets = read_offsets_cache(&offsets_cache_path(&dir, key), key)
                         .ok()
@@ -543,17 +558,20 @@ impl CsvDocument {
                 ),
             }
             .map_err(|e| e.to_string())?;
-            if let (Some(dir), Some(key)) = (&disk_cache_dir, disk_cache_key) {
-                let _ = write_offsets_cache(&offsets_cache_path(dir, key), key, &offsets);
-                let _ = write_warnings_cache(
-                    &warnings_cache_path(dir, key),
-                    key,
-                    &warnings[header_warning_count..],
-                );
-            }
             offsets
         };
         cancellation.map(CancellationToken::check).transpose()?;
+        if file_fingerprint(&path)? != source_fingerprint {
+            return Err("CSV changed on disk while it was being opened".to_string());
+        }
+        if let (Some(dir), Some(key)) = (&disk_cache_dir, disk_cache_key) {
+            let _ = write_offsets_cache(&offsets_cache_path(dir, key), key, &offsets);
+            let _ = write_warnings_cache(
+                &warnings_cache_path(dir, key),
+                key,
+                &warnings[header_warning_count..],
+            );
+        }
         warnings.truncate(MAX_WARNING_COUNT);
         let metadata = CsvMetadata {
             headers,
@@ -565,6 +583,7 @@ impl CsvDocument {
 
         Ok(Self {
             path,
+            source_fingerprint,
             data_path,
             settings,
             storage_settings,
@@ -589,6 +608,10 @@ impl CsvDocument {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn source_fingerprint(&self) -> FileFingerprint {
+        self.source_fingerprint
     }
 
     pub fn metadata(&self) -> &CsvMetadata {
@@ -1511,7 +1534,7 @@ impl CsvDocument {
     }
 
     pub fn save(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
-        self.save_with_cancellation(path.as_ref(), None, None)
+        self.save_with_cancellation(path.as_ref(), None, None, false)
     }
 
     pub fn save_cancellable(
@@ -1519,7 +1542,7 @@ impl CsvDocument {
         path: impl AsRef<Path>,
         cancellation: &CancellationToken,
     ) -> Result<(), String> {
-        self.save_with_cancellation(path.as_ref(), Some(cancellation), None)
+        self.save_with_cancellation(path.as_ref(), Some(cancellation), None, false)
     }
 
     pub fn save_cancellable_with_progress(
@@ -1528,7 +1551,16 @@ impl CsvDocument {
         cancellation: &CancellationToken,
         progress: &dyn Fn(usize, usize),
     ) -> Result<(), String> {
-        self.save_with_cancellation(path.as_ref(), Some(cancellation), Some(progress))
+        self.save_with_cancellation(path.as_ref(), Some(cancellation), Some(progress), false)
+    }
+
+    pub fn save_cancellable_with_progress_overwrite_external(
+        &mut self,
+        path: impl AsRef<Path>,
+        cancellation: &CancellationToken,
+        progress: &dyn Fn(usize, usize),
+    ) -> Result<(), String> {
+        self.save_with_cancellation(path.as_ref(), Some(cancellation), Some(progress), true)
     }
 
     fn save_with_cancellation(
@@ -1536,24 +1568,39 @@ impl CsvDocument {
         target: &Path,
         cancellation: Option<&CancellationToken>,
         progress: Option<&dyn Fn(usize, usize)>,
+        overwrite_external_changes: bool,
     ) -> Result<(), String> {
         cancellation.map(CancellationToken::check).transpose()?;
+        let commit_target = resolve_save_target(target)?;
+        let expected_destination = if target == self.path && !overwrite_external_changes {
+            let expected = DestinationState::Existing(self.source_fingerprint);
+            ensure_destination_unchanged(&commit_target, expected)?;
+            expected
+        } else {
+            destination_state(&commit_target)?
+        };
         let cache_root = self.cache_root.clone();
         let effective = self.metadata.effective.clone();
-        let reopen_overrides = ParseOverrides {
+        let original_malformed = self.settings.malformed;
+        let original_malformed_label = effective.malformed.clone();
+        let validation_overrides = ParseOverrides {
             delimiter: Some(effective.delimiter),
             quote: Some(effective.quote),
-            escape: effective.escape,
-            comment: effective.comment,
+            escape: Some(effective.escape.unwrap_or_else(|| "none".to_string())),
+            comment: Some(effective.comment.unwrap_or_else(|| "none".to_string())),
             excel_sep: Some(effective.excel_sep),
             line_ending: Some(effective.line_ending),
             encoding: Some(effective.encoding),
             has_headers: Some(effective.has_headers),
-            malformed: Some(effective.malformed),
+            malformed: Some("strict".to_string()),
             max_field_size: Some(effective.max_field_size),
             max_record_size: Some(effective.max_record_size),
         };
-        let parent = target.parent().unwrap_or_else(|| Path::new("."));
+        let target_string = target
+            .to_str()
+            .ok_or_else(|| "CSV paths must be valid UTF-8".to_string())?
+            .to_owned();
+        let parent = commit_target.parent().unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         let mut temporary = tempfile::Builder::new()
             .prefix(".quickrows-")
@@ -1642,25 +1689,372 @@ impl CsvDocument {
         temporary.as_file().sync_all().map_err(|e| e.to_string())?;
         cancellation.map(CancellationToken::check).transpose()?;
 
-        // Windows does not permit replacing a memory-mapped file. Release our
-        // map before the atomic replacement, then reopen the saved document so
-        // offsets, encoding detection, metadata, and caches match the output.
-        if target == self.path {
-            self.mmap = None;
-        }
-        temporary
-            .persist(target)
-            .map_err(|error| error.error.to_string())?;
-        sync_directory(parent)?;
-        *self = CsvDocument::open_with_cancellation(
-            target,
-            Some(reopen_overrides),
+        // Parse the exact bytes to be committed before replacing the user's
+        // file. This keeps the destination and the current document intact if
+        // an edit exceeds active parse limits or otherwise cannot be reopened.
+        let temporary_path = temporary.path().to_path_buf();
+        let expected_saved_rows = self
+            .row_count()
+            .saturating_sub(self.edits.deleted_rows.len());
+        let mut saved_document = CsvDocument::open_with_cancellation(
+            &temporary_path,
+            Some(validation_overrides),
             None,
+            cancellation,
             None,
-            cache_root.as_deref(),
         )?;
+        if saved_document.row_count() != expected_saved_rows
+            || (self.settings.has_headers
+                && saved_document.metadata.headers != self.metadata.headers)
+            || !saved_document.metadata.warnings.is_empty()
+        {
+            return Err("Saved CSV did not round-trip under the active parse settings".to_string());
+        }
+        saved_document.settings.malformed = original_malformed;
+        saved_document.storage_settings.malformed = original_malformed;
+        saved_document.metadata.effective.malformed = original_malformed_label;
+        cancellation.map(CancellationToken::check).transpose()?;
+        copy_destination_permissions(&commit_target, &temporary_path)?;
+        temporary.as_file().sync_all().map_err(|e| e.to_string())?;
+        saved_document.rebind_saved_path(
+            &temporary_path,
+            target,
+            &target_string,
+            cache_root.as_deref(),
+        );
+
+        // Re-check both the content and symlink route immediately before the
+        // atomic replacement. Missing destinations use a no-clobber rename.
+        commit_temporary(
+            temporary,
+            target,
+            &commit_target,
+            expected_destination,
+            saved_document.source_fingerprint,
+        )?;
+        *self = saved_document;
+        // The rename already committed the save. Some filesystems do not
+        // support directory fsync; that must not leave the UI in a dirty state
+        // after a successful replacement.
+        let _ = sync_directory(parent);
         Ok(())
     }
+
+    fn rebind_saved_path(
+        &mut self,
+        temporary_path: &Path,
+        target: &Path,
+        target_string: &str,
+        cache_root: Option<&Path>,
+    ) {
+        if self.data_path == temporary_path {
+            self.data_path = target.to_path_buf();
+        }
+        self.path = target.to_path_buf();
+        self.cache_root = cache_root.map(Path::to_path_buf);
+        let (disk_cache_dir, disk_cache_key) = match cache_root {
+            Some(root) => match ensure_cache_dir(root) {
+                Ok(dir) => {
+                    let key = cache_key_from_fingerprint(
+                        target_string,
+                        Some(settings_cache_hash(&self.settings)),
+                        self.source_fingerprint,
+                    );
+                    (Some(dir), Some(key))
+                }
+                Err(_) => (None, None),
+            },
+            None => (None, None),
+        };
+        self.disk_cache_dir = disk_cache_dir;
+        self.disk_cache_key = disk_cache_key;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DestinationState {
+    Missing,
+    Existing(FileFingerprint),
+}
+
+fn resolve_save_target(path: &Path) -> Result<PathBuf, String> {
+    fn resolve(path: &Path, remaining_links: usize) -> Result<PathBuf, String> {
+        if remaining_links == 0 {
+            return Err("CSV destination contains too many symbolic links".to_string());
+        }
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            return Ok(canonical);
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let link = std::fs::read_link(path).map_err(|error| error.to_string())?;
+                let linked_path = if link.is_absolute() {
+                    link
+                } else {
+                    path.parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(link)
+                };
+                resolve(&linked_path, remaining_links - 1)
+            }
+            Ok(_) => std::fs::canonicalize(path).map_err(|error| error.to_string()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let file_name = path
+                    .file_name()
+                    .ok_or_else(|| "CSV destination has no file name".to_string())?;
+                let parent = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                Ok(resolve(parent, remaining_links - 1)?.join(file_name))
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    resolve(path, 40)
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn exchange_paths(first: &Path, second: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    #[cfg(target_vendor = "apple")]
+    use std::os::raw::{c_char, c_int, c_uint};
+    use std::os::unix::ffi::OsStrExt;
+
+    let first = CString::new(first.as_os_str().as_bytes())?;
+    let second = CString::new(second.as_os_str().as_bytes())?;
+    #[cfg(target_os = "linux")]
+    unsafe {
+        if libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            first.as_ptr(),
+            libc::AT_FDCWD,
+            second.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        ) == 0
+        {
+            return Ok(());
+        }
+    }
+    #[cfg(target_vendor = "apple")]
+    unsafe {
+        unsafe extern "C" {
+            fn renamex_np(old: *const c_char, new: *const c_char, flags: c_uint) -> c_int;
+        }
+        const RENAME_SWAP: c_uint = 2;
+        if renamex_np(first.as_ptr(), second.as_ptr(), RENAME_SWAP) == 0 {
+            return Ok(());
+        }
+    }
+    let error = std::io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(22) | Some(38) | Some(45) | Some(95)
+    ) {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, error))
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn exchange_paths(_first: &Path, _second: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic file exchange is unavailable on this platform",
+    ))
+}
+
+fn commit_temporary(
+    temporary: tempfile::NamedTempFile,
+    logical_target: &Path,
+    resolved_target: &Path,
+    expected: DestinationState,
+    replacement_fingerprint: FileFingerprint,
+) -> Result<(), String> {
+    let conflict =
+        || "CSV changed on disk; save was cancelled to protect the external changes".to_string();
+    let route_matches =
+        || resolve_save_target(logical_target).is_ok_and(|current| current == resolved_target);
+    if !route_matches() {
+        return Err(conflict());
+    }
+    if expected == DestinationState::Missing {
+        return temporary
+            .persist_noclobber(resolved_target)
+            .map(|_| ())
+            .map_err(|error| {
+                if error.error.kind() == std::io::ErrorKind::AlreadyExists {
+                    conflict()
+                } else {
+                    error.error.to_string()
+                }
+            });
+    }
+
+    ensure_destination_unchanged(resolved_target, expected)?;
+    if !route_matches() {
+        return Err(conflict());
+    }
+
+    match exchange_paths(temporary.path(), resolved_target) {
+        Ok(()) => {
+            let displaced_matches = destination_state(temporary.path()) == Ok(expected);
+            if displaced_matches && route_matches() {
+                // `temporary.path()` now names the old destination. Dropping it
+                // removes that displaced file while the new target stays live.
+                drop(temporary);
+                return Ok(());
+            }
+            if destination_state(resolved_target)
+                != Ok(DestinationState::Existing(replacement_fingerprint))
+            {
+                let recovery = temporary
+                    .into_temp_path()
+                    .keep()
+                    .map_err(|error| error.error.to_string())?;
+                return Err(format!(
+                    "CSV changed during save; the displaced destination is at {}",
+                    recovery.display()
+                ));
+            }
+            if let Err(rollback_error) = exchange_paths(temporary.path(), resolved_target) {
+                let recovery = temporary
+                    .into_temp_path()
+                    .keep()
+                    .map_err(|error| error.error.to_string())?;
+                return Err(format!(
+                    "CSV changed during save and rollback failed ({rollback_error}); the displaced destination is at {}",
+                    recovery.display()
+                ));
+            }
+            // Never unlink the exchanged path after a conflict: a writer could
+            // have replaced the target immediately before the rollback, in
+            // which case its file now occupies this unpredictable temp path.
+            let recovery = temporary
+                .into_temp_path()
+                .keep()
+                .map_err(|error| error.error.to_string())?;
+            Err(format!(
+                "{}; the uncommitted file was preserved at {}",
+                conflict(),
+                recovery.display()
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+            // Portable fallback: preserve atomic replacement and perform the
+            // strongest available content and route checks immediately before it.
+            ensure_destination_unchanged(resolved_target, expected)?;
+            if !route_matches() {
+                return Err(conflict());
+            }
+            temporary
+                .persist(resolved_target)
+                .map(|_| ())
+                .map_err(|error| error.error.to_string())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn destination_state(path: &Path) -> Result<DestinationState, String> {
+    match path.try_exists().map_err(|error| error.to_string())? {
+        true => file_fingerprint(path)
+            .map(DestinationState::Existing)
+            .map_err(|_| "CSV destination changed while preparing to save".to_string()),
+        false => Ok(DestinationState::Missing),
+    }
+}
+
+fn ensure_destination_unchanged(path: &Path, expected: DestinationState) -> Result<(), String> {
+    let conflict =
+        || "CSV changed on disk; save was cancelled to protect the external changes".to_string();
+    match destination_state(path) {
+        Ok(current) if current == expected => Ok(()),
+        Ok(_) | Err(_) => Err(conflict()),
+    }
+}
+
+fn copy_destination_permissions(target: &Path, temporary: &Path) -> Result<(), String> {
+    match std::fs::metadata(target) {
+        Ok(metadata) => std::fs::set_permissions(temporary, metadata.permissions())
+            .map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn file_metadata_matches(path: &Path, expected: FileFingerprint) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    metadata.len() == expected.len && modified == expected.modified
+}
+
+fn snapshot_csv_source(
+    path: &Path,
+    expected: FileFingerprint,
+    cancellation: Option<&CancellationToken>,
+) -> Result<tempfile::NamedTempFile, String> {
+    cancellation.map(CancellationToken::check).transpose()?;
+    let temporary = tempfile::Builder::new()
+        .prefix("quickrows-source-")
+        .suffix(".csv")
+        .tempfile()
+        .map_err(|error| error.to_string())?;
+    let (placeholder, temporary_path) = temporary.into_parts();
+    drop(placeholder);
+    std::fs::remove_file(&temporary_path).map_err(|error| error.to_string())?;
+
+    let snapshot_matches = if reflink_copy::reflink(path, &temporary_path).is_ok() {
+        file_fingerprint(&temporary_path).is_ok_and(|fingerprint| {
+            fingerprint.len == expected.len && fingerprint.content_hash == expected.content_hash
+        })
+    } else {
+        let _ = std::fs::remove_file(&temporary_path);
+        let mut source = std::fs::File::open(path).map_err(|error| error.to_string())?;
+        let mut destination = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .map_err(|error| error.to_string())?;
+        let mut hasher = blake3::Hasher::new();
+        let mut copied = 0u64;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            cancellation.map(CancellationToken::check).transpose()?;
+            let read = source
+                .read(&mut buffer)
+                .map_err(|error| error.to_string())?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            copied = copied.saturating_add(read as u64);
+            destination
+                .write_all(&buffer[..read])
+                .map_err(|error| error.to_string())?;
+        }
+        destination.flush().map_err(|error| error.to_string())?;
+        copied == expected.len && hasher.finalize().as_bytes() == &expected.content_hash
+    };
+    cancellation.map(CancellationToken::check).transpose()?;
+
+    if !snapshot_matches || !file_metadata_matches(path, expected) {
+        return Err("CSV changed on disk while it was being opened".to_string());
+    }
+    let file = std::fs::File::open(&temporary_path).map_err(|error| error.to_string())?;
+    Ok(tempfile::NamedTempFile::from_parts(file, temporary_path))
 }
 
 fn cached_offsets_are_valid(offsets: &[u64], file_len: u64) -> bool {
@@ -2558,6 +2952,27 @@ mod tests {
     }
 
     #[test]
+    fn repaired_field_truncation_does_not_consume_the_record_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("combined-limits.csv");
+        std::fs::write(&path, "aaaa,bb\n").unwrap();
+        let doc = CsvDocument::open(
+            &path,
+            Some(ParseOverrides {
+                has_headers: Some(false),
+                malformed: Some("repair".to_string()),
+                max_field_size: Some(2),
+                max_record_size: Some(4),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(doc.display_rows(0, 1).unwrap()[0].1, vec!["aa", "bb"]);
+    }
+
+    #[test]
     fn explicit_size_limits_apply_in_all_malformed_modes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("limits.csv");
@@ -2832,6 +3247,310 @@ mod tests {
             "name,value\na,1\nb,3\n"
         );
         assert_eq!(doc.display_rows(1, 1).unwrap()[0].1[1], "3");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_preserves_existing_destination_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, mut doc) = document("a,b\nx,1\n");
+        let path = dir.path().join("permissions.csv");
+        std::fs::write(&path, "a,b\nx,1\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        doc.save(&path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_through_symlink_updates_referent_without_replacing_link() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let referent = dir.path().join("actual.csv");
+        let link = dir.path().join("linked.csv");
+        std::fs::write(&referent, "name,value\na,1\n").unwrap();
+        symlink("actual.csv", &link).unwrap();
+
+        let mut doc = CsvDocument::open(&link, None, None).unwrap();
+        doc.edit_cell(0, 1, "2".to_string()).unwrap();
+        doc.save(&link).unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&referent).unwrap(),
+            "name,value\na,2\n"
+        );
+        assert_eq!(doc.path(), link.as_path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_retargeted_during_save_aborts_without_touching_either_referent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.csv");
+        let second = dir.path().join("second.csv");
+        let link = dir.path().join("linked.csv");
+        std::fs::write(&first, "name,value\na,1\n").unwrap();
+        std::fs::write(&second, "name,value\nb,2\n").unwrap();
+        symlink("first.csv", &link).unwrap();
+        let mut doc = CsvDocument::open(&link, None, None).unwrap();
+        doc.edit_cell(0, 1, "edited".to_string()).unwrap();
+        let retargeted = std::cell::Cell::new(false);
+        let link_for_progress = link.clone();
+        let progress = |_, _| {
+            if !retargeted.replace(true) {
+                std::fs::remove_file(&link_for_progress).unwrap();
+                symlink("second.csv", &link_for_progress).unwrap();
+            }
+        };
+
+        let error = doc
+            .save_cancellable_with_progress(&link, &CancellationToken::new(), &progress)
+            .unwrap_err();
+        assert!(error.contains("changed on disk"));
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            "name,value\na,1\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "name,value\nb,2\n"
+        );
+        assert!(doc.is_dirty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_symlink_retargeted_during_save_is_detected() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first_dir = dir.path().join("first");
+        let second_dir = dir.path().join("second");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&second_dir).unwrap();
+        let first = first_dir.join("data.csv");
+        let second = second_dir.join("data.csv");
+        std::fs::write(&first, "name,value\na,1\n").unwrap();
+        std::fs::write(&second, "name,value\nb,2\n").unwrap();
+        let parent_link = dir.path().join("current");
+        symlink("first", &parent_link).unwrap();
+        let logical_path = parent_link.join("data.csv");
+        let mut doc = CsvDocument::open(&logical_path, None, None).unwrap();
+        doc.edit_cell(0, 1, "edited".to_string()).unwrap();
+        let retargeted = std::cell::Cell::new(false);
+        let link_for_progress = parent_link.clone();
+        let progress = |_, _| {
+            if !retargeted.replace(true) {
+                std::fs::remove_file(&link_for_progress).unwrap();
+                symlink("second", &link_for_progress).unwrap();
+            }
+        };
+
+        assert!(doc
+            .save_cancellable_with_progress(&logical_path, &CancellationToken::new(), &progress,)
+            .unwrap_err()
+            .contains("changed on disk"));
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            "name,value\na,1\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "name,value\nb,2\n"
+        );
+    }
+
+    #[test]
+    fn failed_save_validation_leaves_destination_and_edits_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strict.csv");
+        let original = b"a,b\nx,1\n";
+        std::fs::write(&path, original).unwrap();
+        let mut doc = CsvDocument::open(
+            &path,
+            Some(ParseOverrides {
+                has_headers: Some(true),
+                malformed: Some("repair".to_string()),
+                max_field_size: Some(3),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        doc.edit_cell(0, 0, "too-long".to_string()).unwrap();
+
+        assert!(doc.save(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(doc.is_dirty());
+        assert_eq!(doc.display_rows(0, 1).unwrap()[0].1[0], "too-long");
+    }
+
+    #[test]
+    fn headerless_document_can_save_after_all_rows_are_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("headerless.csv");
+        std::fs::write(&path, "1,2\n").unwrap();
+        let mut doc = CsvDocument::open(
+            &path,
+            Some(ParseOverrides {
+                has_headers: Some(false),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        doc.delete_display_row(0).unwrap();
+
+        doc.save(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        assert_eq!(doc.row_count(), 0);
+    }
+
+    #[test]
+    fn save_validation_preserves_disabled_escape_and_comment_settings() {
+        let (dir, mut doc) = document("a,b\nx,1\n");
+        doc.edit_cell(0, 0, "#not-a-comment".to_string()).unwrap();
+        doc.edit_cell(0, 1, "backslash\\\"quote".to_string())
+            .unwrap();
+        let output = dir.path().join("syntax.csv");
+
+        doc.save(&output).unwrap();
+        assert_eq!(doc.row_count(), 1);
+        assert_eq!(
+            doc.display_rows(0, 1).unwrap()[0].1,
+            vec!["#not-a-comment", "backslash\\\"quote"]
+        );
+    }
+
+    #[test]
+    fn external_change_during_save_is_checked_before_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.csv");
+        std::fs::write(&path, "a,b\nx,1\ny,2\n").unwrap();
+        let mut doc = CsvDocument::open(
+            &path,
+            Some(ParseOverrides {
+                has_headers: Some(true),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        doc.edit_cell(0, 1, "edited".to_string()).unwrap();
+        let changed = std::cell::Cell::new(false);
+        let external_path = path.clone();
+        let progress = |_, _| {
+            if !changed.replace(true) {
+                std::fs::write(&external_path, "a,b\nexternal,8\ny,2\n").unwrap();
+            }
+        };
+        let cancellation = CancellationToken::new();
+
+        let error = doc
+            .save_cancellable_with_progress(&path, &cancellation, &progress)
+            .unwrap_err();
+        assert!(error.contains("changed on disk"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "a,b\nexternal,8\ny,2\n"
+        );
+        assert!(doc.is_dirty());
+    }
+
+    #[test]
+    fn concurrent_save_as_destination_change_is_not_overwritten() {
+        let (dir, mut doc) = document("a,b\noriginal,1\n");
+        doc.edit_cell(0, 1, "edited".to_string()).unwrap();
+        let target = dir.path().join("save-as.csv");
+        std::fs::write(&target, "a,b\nbefore,2\n").unwrap();
+        let changed = std::cell::Cell::new(false);
+        let external_target = target.clone();
+        let progress = |_, _| {
+            if !changed.replace(true) {
+                std::fs::write(&external_target, "a,b\nexternal,9\n").unwrap();
+            }
+        };
+        let cancellation = CancellationToken::new();
+
+        let error = doc
+            .save_cancellable_with_progress(&target, &cancellation, &progress)
+            .unwrap_err();
+        assert!(error.contains("changed on disk"));
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "a,b\nexternal,9\n"
+        );
+    }
+
+    #[test]
+    fn explicit_external_overwrite_uses_the_immutable_opened_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overwrite.csv");
+        std::fs::write(&path, "a,b\noriginal,1\nsecond,2\n").unwrap();
+        let mut doc = CsvDocument::open(
+            &path,
+            Some(ParseOverrides {
+                has_headers: Some(true),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        doc.edit_cell(0, 1, "edited".to_string()).unwrap();
+        std::fs::write(&path, "a,b\nexternal,8\nchanged,9\n").unwrap();
+        let cancellation = CancellationToken::new();
+
+        doc.save_cancellable_with_progress_overwrite_external(&path, &cancellation, &|_, _| {})
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "a,b\noriginal,edited\nsecond,2\n"
+        );
+    }
+
+    #[test]
+    fn explicit_external_overwrite_can_restore_a_deleted_source() {
+        let (dir, mut doc) = document("a,b\noriginal,1\n");
+        let path = dir.path().join("sample.csv");
+        doc.edit_cell(0, 1, "restored".to_string()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let cancellation = CancellationToken::new();
+
+        doc.save_cancellable_with_progress_overwrite_external(&path, &cancellation, &|_, _| {})
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "a,b\noriginal,restored\n"
+        );
+    }
+
+    #[test]
+    fn live_source_files_are_read_from_an_immutable_snapshot() {
+        let mut contents = String::from("a,b\n");
+        for row in 0..256 {
+            contents.push_str(&format!("row-{row},value-{row}\n"));
+        }
+        assert!(contents.len() > 1024);
+        let (_dir, doc) = document(&contents);
+        assert!(doc._prepared_source.is_some());
+        assert_ne!(doc.data_path, doc.path);
+        assert!(doc.mmap.is_some());
+        let last_row = doc.display_rows(doc.row_count() - 1, 1).unwrap();
+
+        std::fs::write(&doc.path, "a,b\ntruncated,source\n").unwrap();
+        assert_eq!(doc.display_rows(doc.row_count() - 1, 1).unwrap(), last_row);
     }
 
     #[test]

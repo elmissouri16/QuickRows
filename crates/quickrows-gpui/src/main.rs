@@ -28,9 +28,9 @@ use gpui_component::{
 };
 use gpui_component_assets::Assets;
 use quickrows_core::{
-    AppSettings, CancellationToken, CsvDocument, CsvFragment, Diagnostics, ParseInfo,
-    ParseOverrides, ParseWarning, ResolvedFragmentRegion, RowDensity, SettingsStore, SortDirection,
-    SortSpec, ThemePreference,
+    AppSettings, CancellationToken, CsvDocument, CsvFragment, Diagnostics, FileFingerprint,
+    ParseInfo, ParseOverrides, ParseWarning, ResolvedFragmentRegion, RowDensity, SettingsStore,
+    SortDirection, SortSpec, ThemePreference,
 };
 use selection::RowSelection;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -41,7 +41,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 const BASE_TITLE: &str = "QuickRows";
 const MIN_COLUMN_WIDTH: f32 = 120.0;
@@ -257,7 +257,7 @@ struct LoadedDocument {
     detected_parse_info: ParseInfo,
     parse_info: ParseInfo,
     warnings: Vec<ParseWarning>,
-    file_fingerprint: Option<(u64, SystemTime)>,
+    file_fingerprint: Option<FileFingerprint>,
     dirty: bool,
 }
 
@@ -999,29 +999,71 @@ impl QuickRowsView {
 
     fn track_external_changes(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
+            let mut unchanged_metadata_polls = 0usize;
             loop {
                 cx.background_executor()
                     .timer(Duration::from_secs(2))
                     .await;
+                let probe = match this.update(cx, |this, _| {
+                    let loaded = this.loaded.as_ref()?;
+                    if this.loading || this.external_change_detected {
+                        return None;
+                    }
+                    Some((loaded.path.clone(), loaded.file_fingerprint))
+                }) {
+                    Ok(probe) => probe,
+                    Err(_) => break,
+                };
+                let Some((path, expected)) = probe else {
+                    unchanged_metadata_polls = 0;
+                    continue;
+                };
+
+                let changed = if !file_metadata_matches(&path, expected) {
+                    true
+                } else {
+                    unchanged_metadata_polls = unchanged_metadata_polls.saturating_add(1);
+                    let strong_check_interval = if expected
+                        .is_some_and(|fingerprint| fingerprint.len > 1024 * 1024 * 1024)
+                    {
+                        300
+                    } else {
+                        30
+                    };
+                    if unchanged_metadata_polls < strong_check_interval {
+                        continue;
+                    }
+                    unchanged_metadata_polls = 0;
+                    let probe_path = path.clone();
+                    let current = cx
+                        .background_executor()
+                        .spawn(async move { file_fingerprint(&probe_path) })
+                        .await;
+                    current != expected
+                };
+                if !changed {
+                    continue;
+                }
                 if this
                     .update(cx, |this, cx| {
                         let Some(loaded) = &this.loaded else { return true };
-                        if this.loading || this.external_change_detected {
+                        if loaded.path != path
+                            || loaded.file_fingerprint != expected
+                            || this.loading
+                            || this.external_change_detected
+                        {
                             return true;
                         }
-                        let current = file_fingerprint(&loaded.path);
-                        if current != loaded.file_fingerprint {
-                            this.external_change_detected = true;
-                            this.notice = Some(
-                                if this.is_dirty() {
-                                    "The CSV changed on disk. Save As or reload to avoid overwriting external changes."
-                                } else {
-                                    "The CSV changed on disk. Reload to view the latest version."
-                                }
-                                .into(),
-                            );
-                            cx.notify();
-                        }
+                        this.external_change_detected = true;
+                        this.notice = Some(
+                            if this.is_dirty() {
+                                "The CSV changed on disk. Save As or reload to avoid overwriting external changes."
+                            } else {
+                                "The CSV changed on disk. Reload to view the latest version."
+                            }
+                            .into(),
+                        );
+                        cx.notify();
                         true
                     })
                     .is_err()
@@ -1139,7 +1181,7 @@ impl QuickRowsView {
                         let detected_parse_info = document.metadata().detected.clone();
                         let parse_info = document.metadata().effective.clone();
                         let warnings = document.metadata().warnings.clone();
-                        let file_fingerprint = file_fingerprint(&path);
+                        let file_fingerprint = Some(document_file_fingerprint(&document));
                         this.settings.remember_file(path.clone());
                         this.persist_settings();
                         this.loaded = Some(LoadedDocument {
@@ -1234,7 +1276,7 @@ impl QuickRowsView {
                         let detected_parse_info = document.metadata().detected.clone();
                         let parse_info = document.metadata().effective.clone();
                         let warnings = document.metadata().warnings.clone();
-                        let file_fingerprint = file_fingerprint(&path);
+                        let file_fingerprint = Some(document_file_fingerprint(&document));
                         this.loaded = Some(LoadedDocument {
                             document: Arc::new(Mutex::new(document)),
                             path,
@@ -1467,7 +1509,7 @@ impl QuickRowsView {
 
     fn confirm_external_overwrite(&mut self, cx: &mut Context<Self>) {
         if let Some(path) = self.pending_external_save.take() {
-            self.save_to_unchecked(path, cx);
+            self.save_to_unchecked(path, true, cx);
         }
     }
 
@@ -1562,10 +1604,15 @@ impl QuickRowsView {
             cx.notify();
             return;
         }
-        self.save_to_unchecked(path, cx);
+        self.save_to_unchecked(path, false, cx);
     }
 
-    fn save_to_unchecked(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    fn save_to_unchecked(
+        &mut self,
+        path: PathBuf,
+        overwrite_external_changes: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(loaded) = &self.loaded else { return };
         let document = loaded.document.clone();
         let row_count = loaded.row_count;
@@ -1588,7 +1635,19 @@ impl QuickRowsView {
             let mut document = document
                 .lock()
                 .map_err(|_| "CSV document lock was poisoned".to_string())?;
-            document.save_cancellable_with_progress(&save_path, &cancellation, &update_progress)?;
+            if overwrite_external_changes {
+                document.save_cancellable_with_progress_overwrite_external(
+                    &save_path,
+                    &cancellation,
+                    &update_progress,
+                )?;
+            } else {
+                document.save_cancellable_with_progress(
+                    &save_path,
+                    &cancellation,
+                    &update_progress,
+                )?;
+            }
             Ok::<_, String>(())
         });
         cx.spawn(async move |this, cx| {
@@ -1606,9 +1665,10 @@ impl QuickRowsView {
                                 loaded.detected_parse_info = document.metadata().detected.clone();
                                 loaded.parse_info = document.metadata().effective.clone();
                                 loaded.warnings = document.metadata().warnings.clone();
+                                loaded.file_fingerprint =
+                                    Some(document_file_fingerprint(&document));
                                 loaded.dirty = false;
                             }
-                            loaded.file_fingerprint = file_fingerprint(&path);
                         }
                         this.external_change_detected = false;
                         this.invalidate_row_cache();
@@ -1649,6 +1709,11 @@ impl QuickRowsView {
                     }
                     Err(error) if error.contains("Operation cancelled") => {
                         this.notice = Some("Save cancelled.".into());
+                    }
+                    Err(error) if error.contains("changed on disk") => {
+                        this.external_change_detected = true;
+                        this.error = Some(format!("Unable to save CSV: {error}").into());
+                        this.notice = None;
                     }
                     Err(error) => {
                         this.error = Some(format!("Unable to save CSV: {error}").into());
@@ -6338,9 +6403,28 @@ fn cache_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("quickrows-cache"))
 }
 
-fn file_fingerprint(path: &Path) -> Option<(u64, SystemTime)> {
-    let metadata = std::fs::metadata(path).ok()?;
-    Some((metadata.len(), metadata.modified().ok()?))
+fn document_file_fingerprint(document: &CsvDocument) -> FileFingerprint {
+    document.source_fingerprint()
+}
+
+fn file_metadata_matches(path: &Path, expected: Option<FileFingerprint>) -> bool {
+    let Some(expected) = expected else {
+        return !path.exists();
+    };
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    metadata.len() == expected.len && modified == expected.modified
+}
+
+fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
+    quickrows_core::disk_cache::file_fingerprint(path).ok()
 }
 
 fn display_name(path: &Path) -> String {
