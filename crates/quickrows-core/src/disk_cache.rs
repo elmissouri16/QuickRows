@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const CACHE_VERSION: u32 = 3;
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 3);
+const MAX_CACHE_ALLOCATION_BYTES: u64 = 128 * 1024 * 1024;
 
 const OFFSETS_MAGIC: &[u8; 4] = b"CVOF";
 const ORDER_MAGIC: &[u8; 4] = b"CVSO";
@@ -57,12 +58,12 @@ pub fn file_fingerprint(path: impl AsRef<Path>) -> Result<FileFingerprint, Strin
 }
 
 pub fn cache_key_from_fingerprint(
-    path: &str,
+    path: impl AsRef<Path>,
     settings_hash: Option<u64>,
     fingerprint: FileFingerprint,
 ) -> CacheKey {
     let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
+    path.as_ref().hash(&mut hasher);
     fingerprint.len.hash(&mut hasher);
     fingerprint.modified.hash(&mut hasher);
     fingerprint.content_hash.hash(&mut hasher);
@@ -79,7 +80,8 @@ pub fn cache_key_from_fingerprint(
     }
 }
 
-pub fn cache_key(path: &str, settings_hash: Option<u64>) -> Result<CacheKey, String> {
+pub fn cache_key(path: impl AsRef<Path>, settings_hash: Option<u64>) -> Result<CacheKey, String> {
+    let path = path.as_ref();
     let fingerprint = file_fingerprint(path)?;
     Ok(cache_key_from_fingerprint(path, settings_hash, fingerprint))
 }
@@ -142,12 +144,21 @@ pub fn read_warnings_cache(
     path: &Path,
     key: CacheKey,
 ) -> Result<Option<Vec<ParseWarning>>, String> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+    const MAX_WARNING_CACHE_BYTES: u64 = 4 * 1024 * 1024;
+    let file = match File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.to_string()),
     };
-    if bytes.len() > 4 * 1024 * 1024 {
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if metadata.len() > MAX_WARNING_CACHE_BYTES {
+        return Ok(None);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_WARNING_CACHE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_WARNING_CACHE_BYTES {
         return Ok(None);
     }
     let cache: WarningCache = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
@@ -206,10 +217,17 @@ pub fn read_offsets_cache(path: &Path, key: CacheKey) -> Result<Option<Vec<u64>>
     };
     let file_len = file.metadata().map_err(|err| err.to_string())?.len();
     let available_items = file_len.saturating_sub(64) / 8;
-    if count as u64 > available_items || count as u64 > key.len.saturating_add(1) {
+    if count as u64 > available_items
+        || count as u64 > key.len.saturating_add(1)
+        || (count as u64).saturating_mul(8) > MAX_CACHE_ALLOCATION_BYTES
+    {
         return Ok(None);
     }
-    let mut offsets = vec![0u64; count];
+    let mut offsets = Vec::new();
+    if offsets.try_reserve_exact(count).is_err() {
+        return Ok(None);
+    }
+    offsets.resize(count, 0);
     for item in offsets.iter_mut() {
         *item = read_u64(&mut file)?;
     }
@@ -273,10 +291,16 @@ pub fn read_order_cache(
     };
     let file_len = file.metadata().map_err(|err| err.to_string())?.len();
     let available_items = file_len.saturating_sub(69) / 8;
-    if count as u64 > available_items || count as u64 > key.len.saturating_add(1) {
+    if count as u64 > available_items
+        || count as u64 > key.len.saturating_add(1)
+        || (count as u64).saturating_mul(8) > MAX_CACHE_ALLOCATION_BYTES
+    {
         return Ok(None);
     }
-    let mut order = Vec::with_capacity(count);
+    let mut order = Vec::new();
+    if order.try_reserve_exact(count).is_err() {
+        return Ok(None);
+    }
     for _ in 0..count {
         let value = match usize::try_from(read_u64(&mut file)?) {
             Ok(value) => value,
@@ -363,8 +387,10 @@ fn write_u64(writer: &mut impl Write, value: u64) -> Result<(), String> {
 mod tests {
     use super::{
         cache_key, offsets_cache_path, order_cache_path, read_offsets_cache, read_order_cache,
-        write_offsets_cache, write_order_cache,
+        read_warnings_cache, warnings_cache_path, write_offsets_cache, write_order_cache,
+        MAX_CACHE_ALLOCATION_BYTES,
     };
+    use std::io::{Seek, SeekFrom, Write};
 
     #[test]
     fn offsets_cache_round_trip() {
@@ -372,7 +398,7 @@ mod tests {
         let file_path = dir.path().join("data.csv");
         std::fs::write(&file_path, b"col1,col2\n1,2\n3,4\n").expect("write csv");
 
-        let key = cache_key(file_path.to_str().unwrap(), None).expect("cache key");
+        let key = cache_key(&file_path, None).expect("cache key");
         let offsets_path = offsets_cache_path(dir.path(), key);
         let offsets = vec![0u64, 12, 16];
 
@@ -388,12 +414,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let file_path = dir.path().join("data.csv");
         std::fs::write(&file_path, b"a,b\n1,2\n").expect("write first csv");
-        let first = cache_key(file_path.to_str().unwrap(), None).expect("first key");
+        let first = cache_key(&file_path, None).expect("first key");
         let offsets_path = offsets_cache_path(dir.path(), first);
         write_offsets_cache(&offsets_path, first, &[4]).expect("write offsets");
 
         std::fs::write(&file_path, b"a,b\n9,8\n").expect("write replacement csv");
-        let mut replacement = cache_key(file_path.to_str().unwrap(), None).expect("second key");
+        let mut replacement = cache_key(&file_path, None).expect("second key");
         assert_ne!(first.content_hash, replacement.content_hash);
 
         // Simulate a filesystem with a coarse or explicitly preserved mtime
@@ -410,7 +436,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let file_path = dir.path().join("data.csv");
         std::fs::write(&file_path, b"a,b\n1,2\n").unwrap();
-        let key = cache_key(file_path.to_str().unwrap(), None).unwrap();
+        let key = cache_key(&file_path, None).unwrap();
         let offsets_path = offsets_cache_path(dir.path(), key);
         write_offsets_cache(&offsets_path, key, &[4]).unwrap();
         let mut bytes = std::fs::read(&offsets_path).unwrap();
@@ -420,12 +446,47 @@ mod tests {
     }
 
     #[test]
+    fn oversized_warning_cache_is_rejected_before_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("data.csv");
+        std::fs::write(&file_path, b"a\n1\n").unwrap();
+        let key = cache_key(&file_path, None).unwrap();
+        let warnings_path = warnings_cache_path(dir.path(), key);
+        let file = std::fs::File::create(&warnings_path).unwrap();
+        file.set_len(4 * 1024 * 1024 + 1).unwrap();
+
+        assert!(read_warnings_cache(&warnings_path, key).unwrap().is_none());
+    }
+
+    #[test]
+    fn oversized_offset_allocation_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("data.csv");
+        std::fs::write(&file_path, b"a\n1\n").unwrap();
+        let mut key = cache_key(&file_path, None).unwrap();
+        key.len = u64::MAX;
+        let offsets_path = offsets_cache_path(dir.path(), key);
+        write_offsets_cache(&offsets_path, key, &[]).unwrap();
+        let count = MAX_CACHE_ALLOCATION_BYTES / 8 + 1;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&offsets_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(56)).unwrap();
+        file.write_all(&count.to_le_bytes()).unwrap();
+        file.set_len(64 + count * 8).unwrap();
+
+        assert!(read_offsets_cache(&offsets_path, key).unwrap().is_none());
+    }
+
+    #[test]
     fn order_cache_round_trip_and_mismatch() {
         let dir = tempfile::tempdir().expect("temp dir");
         let file_path = dir.path().join("data.csv");
         std::fs::write(&file_path, b"col1,col2\n1,2\n3,4\n").expect("write csv");
 
-        let key = cache_key(file_path.to_str().unwrap(), None).expect("cache key");
+        let key = cache_key(&file_path, None).expect("cache key");
         let order_path = order_cache_path(dir.path(), key, 2, true);
         let order = vec![2usize, 0, 1];
 

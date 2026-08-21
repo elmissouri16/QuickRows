@@ -3,13 +3,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEBUG_LOG_FILE: &str = "quickrows.log";
 const CRASH_LOG_FILE: &str = "quickrows-crash.log";
 const LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+static LOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug)]
 pub struct Diagnostics {
@@ -66,6 +67,9 @@ impl Diagnostics {
     }
 
     pub fn clear_debug_log(&self) -> Result<(), String> {
+        let _guard = LOG_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         fs::write(self.debug_log_path(), b"").map_err(|e| e.to_string())
     }
 
@@ -85,6 +89,9 @@ impl Diagnostics {
 }
 
 fn append_line(path: &Path, message: &str) -> Result<(), String> {
+    let _guard = LOG_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if fs::metadata(path).map(|meta| meta.len()).unwrap_or(0) > LOG_MAX_BYTES {
         fs::write(path, b"").map_err(|e| e.to_string())?;
     }
@@ -114,6 +121,33 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_debug_writes_do_not_lose_lines() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = Diagnostics::new(directory.path(), true).unwrap();
+        let workers = (0..8)
+            .map(|worker| {
+                let diagnostics = diagnostics.clone();
+                std::thread::spawn(move || {
+                    for line in 0..100 {
+                        diagnostics
+                            .append_debug(&format!("worker {worker} line {line}"))
+                            .unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let lines = fs::read_to_string(diagnostics.debug_log_path())
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(lines, 800);
+    }
 
     #[test]
     fn debug_log_respects_toggle_and_utf8() {

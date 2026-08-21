@@ -569,7 +569,7 @@ fn detect_excel_sep(sample: &str) -> Option<(char, usize)> {
     Some((delimiter, consumed))
 }
 
-fn read_sample(path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+fn read_sample(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut file = File::open(path)?;
     let mut sample = vec![0; SAMPLE_SIZE];
     let read = file.read(&mut sample)?;
@@ -611,15 +611,17 @@ fn looks_like_header(first: &StringRecord, second: &StringRecord) -> bool {
     false
 }
 
-pub fn detect_parse_settings(path: &str) -> Result<DetectedSettings, Box<dyn std::error::Error>> {
+pub fn detect_parse_settings(
+    path: impl AsRef<Path>,
+) -> Result<DetectedSettings, Box<dyn std::error::Error>> {
     detect_parse_settings_for_encoding(path, None)
 }
 
 pub fn detect_parse_settings_for_encoding(
-    path: &str,
+    path: impl AsRef<Path>,
     encoding_override: Option<&str>,
 ) -> Result<DetectedSettings, Box<dyn std::error::Error>> {
-    let sample = read_sample(path)?;
+    let sample = read_sample(path.as_ref())?;
     let (detected_encoding, detected_label, bom_len) = detect_encoding(&sample);
     let forced_encoding = encoding_override
         .map(normalize_encoding_label)
@@ -1296,6 +1298,20 @@ fn stream_canonical_csv<W: Write>(
     canonical.finish()
 }
 
+fn csv_tempfile_near(path: &Path, prefix: &str) -> Result<tempfile::NamedTempFile, String> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix).suffix(".csv");
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        if let Ok(temporary) = builder.tempfile_in(parent) {
+            return Ok(temporary);
+        }
+    }
+    builder.tempfile().map_err(|error| error.to_string())
+}
+
 pub fn prepare_csv_source(
     path: &Path,
     settings: &ParseSettings,
@@ -1322,11 +1338,7 @@ pub fn prepare_csv_source_cancellable(
         });
     }
 
-    let mut temporary = tempfile::Builder::new()
-        .prefix("quickrows-decoded-")
-        .suffix(".csv")
-        .tempfile()
-        .map_err(|error| error.to_string())?;
+    let mut temporary = csv_tempfile_near(path, "quickrows-decoded-")?;
     let mut warnings = Vec::new();
     let mut comments = Vec::new();
     stream_canonical_csv(
@@ -1631,7 +1643,7 @@ fn apply_length_policy(
 }
 
 pub fn detect_headers_for_settings(
-    path: &str,
+    path: impl AsRef<Path>,
     settings: &ParseSettings,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
@@ -1651,7 +1663,7 @@ pub fn detect_headers_for_settings(
 }
 
 pub fn get_headers(
-    path: &str,
+    path: impl AsRef<Path>,
     settings: &ParseSettings,
     warnings: &mut Vec<ParseWarning>,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -1952,11 +1964,11 @@ fn read_chunk_from_reader<R: Read>(
     expected_columns: Option<usize>,
     warnings: &mut Vec<ParseWarning>,
 ) -> Result<Vec<Vec<String>>, Box<dyn std::error::Error>> {
-    let mut rows = Vec::with_capacity(count);
+    let mut rows = Vec::new();
     let mut record = ByteRecord::new();
     let mut row_index: u64 = 0;
     let mut kept_index: usize = 0;
-    let target_end = start + count;
+    let target_end = start.saturating_add(count);
 
     loop {
         match rdr.read_byte_record(&mut record) {
@@ -1983,6 +1995,10 @@ fn read_chunk_from_reader<R: Read>(
                             std::io::ErrorKind::InvalidData,
                             format!("CSV error: record {} has invalid encoding", row_index),
                         )));
+                    }
+                    if settings.malformed == MalformedMode::Skip {
+                        row_index += 1;
+                        continue;
                     }
                 }
 
@@ -2045,7 +2061,7 @@ fn read_chunk_with_offsets_from_reader<R: Read + Seek>(
         return Ok(Vec::new());
     }
 
-    let end = usize::min(start + count, offsets.len());
+    let end = start.saturating_add(count).min(offsets.len());
     let mut record = ByteRecord::new();
     let mut rows = Vec::with_capacity(end - start);
     let mut position = Position::new();
@@ -2082,6 +2098,9 @@ fn read_chunk_with_offsets_from_reader<R: Read + Seek>(
                     std::io::ErrorKind::InvalidData,
                     format!("CSV error: record {} has invalid encoding", row_index),
                 )));
+            }
+            if settings.malformed == MalformedMode::Skip {
+                continue;
             }
         }
 
@@ -2167,6 +2186,9 @@ fn read_rows_by_index_from_reader<R: Read + Seek>(
                     std::io::ErrorKind::InvalidData,
                     format!("CSV error: record {} has invalid encoding", row_index),
                 )));
+            }
+            if settings.malformed == MalformedMode::Skip {
+                continue;
             }
         }
 
@@ -2273,7 +2295,7 @@ fn search_range_with_offsets_from_reader<R: Read + Seek>(
 }
 
 pub fn build_row_offsets(
-    path: &str,
+    path: impl AsRef<Path>,
     settings: &ParseSettings,
     expected_columns: Option<usize>,
     warnings: &mut Vec<ParseWarning>,
@@ -2286,7 +2308,7 @@ pub fn build_row_offsets(
 }
 
 pub fn build_row_offsets_cancellable(
-    path: &str,
+    path: impl AsRef<Path>,
     settings: &ParseSettings,
     expected_columns: Option<usize>,
     warnings: &mut Vec<ParseWarning>,
@@ -2337,7 +2359,7 @@ pub fn build_row_offsets_mmap_cancellable(
 }
 
 pub fn read_chunk(
-    path: &str,
+    path: impl AsRef<Path>,
     start: usize,
     count: usize,
     settings: &ParseSettings,
@@ -2363,7 +2385,7 @@ pub fn read_chunk_mmap(
 }
 
 pub fn read_chunk_with_offsets(
-    path: &str,
+    path: impl AsRef<Path>,
     offsets: &[u64],
     start: usize,
     count: usize,
@@ -2408,7 +2430,7 @@ pub fn read_chunk_with_offsets_mmap(
 }
 
 pub fn read_rows_by_index(
-    path: &str,
+    path: impl AsRef<Path>,
     offsets: &[u64],
     indices: &[usize],
     settings: &ParseSettings,
@@ -2435,7 +2457,7 @@ pub fn read_rows_by_index_mmap(
 }
 
 pub fn search_range_with_offsets(
-    path: &str,
+    path: impl AsRef<Path>,
     offsets: &[u64],
     start: usize,
     end: usize,
@@ -2472,11 +2494,12 @@ pub fn search_range_with_offsets_mmap(
 }
 
 pub fn find_duplicates_hashed(
-    path: &str,
+    path: impl AsRef<Path>,
     offsets: &[u64],
     settings: &ParseSettings,
     column_idx: Option<usize>,
 ) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
+    let path = path.as_ref();
     let file = File::open(path)?;
     let reader = BufReader::new(file);
 
@@ -2887,7 +2910,7 @@ mod tests {
             ("one|two|three", '|', "crlf"),
         ] {
             let file = write_temp_csv(contents);
-            let detected = detect_parse_settings(file.path().to_str().unwrap()).unwrap();
+            let detected = detect_parse_settings(file.path()).unwrap();
             assert_eq!(detected.delimiter, delimiter, "{contents:?}");
             assert_eq!(detected.line_ending, line_ending, "{contents:?}");
         }
@@ -2903,7 +2926,7 @@ mod tests {
             "text\nhello! hello!\ngoodbye? goodbye?\n",
         ] {
             let file = write_temp_csv(contents);
-            let detected = detect_parse_settings(file.path().to_str().unwrap()).unwrap();
+            let detected = detect_parse_settings(file.path()).unwrap();
             assert_eq!(detected.delimiter, ',', "{contents:?}");
         }
     }
@@ -2911,18 +2934,18 @@ mod tests {
     #[test]
     fn all_text_data_is_not_silently_consumed_as_a_header() {
         let file = write_temp_csv("alice,paris\nbob,london\n");
-        let detected = detect_parse_settings(file.path().to_str().unwrap()).unwrap();
+        let detected = detect_parse_settings(file.path()).unwrap();
         assert!(!detected.has_headers);
 
         let single = write_temp_csv("alice,paris\n");
-        let detected = detect_parse_settings(single.path().to_str().unwrap()).unwrap();
+        let detected = detect_parse_settings(single.path()).unwrap();
         assert!(!detected.has_headers);
     }
 
     #[test]
     fn detects_single_quoted_multiline_records_without_counting_embedded_newlines() {
         let file = write_temp_csv("name;note\r\nalpha;'line 1\nline 2'\r\n");
-        let detected = detect_parse_settings(file.path().to_str().unwrap()).unwrap();
+        let detected = detect_parse_settings(file.path()).unwrap();
         assert_eq!(detected.quote, '\'');
         assert_eq!(detected.delimiter, ';');
         assert_eq!(detected.line_ending, "crlf");
@@ -2931,7 +2954,7 @@ mod tests {
     #[test]
     fn apostrophes_in_text_are_not_inferred_as_csv_quotes() {
         let file = write_temp_csv("name,note\nalice,don't guess single quotes\n");
-        let detected = detect_parse_settings(file.path().to_str().unwrap()).unwrap();
+        let detected = detect_parse_settings(file.path()).unwrap();
         assert_eq!(detected.quote, '"');
         assert_eq!(detected.delimiter, ',');
     }
@@ -2939,14 +2962,14 @@ mod tests {
     #[test]
     fn delimiter_detection_handles_quoted_unicode_delimiters_and_truncated_samples() {
         let unicode = write_temp_csv("name§note\nalpha§\"one§two\"\n");
-        let detected = detect_parse_settings(unicode.path().to_str().unwrap()).unwrap();
+        let detected = detect_parse_settings(unicode.path()).unwrap();
         assert_eq!(detected.delimiter, '§');
 
         let mut contents = String::from("name,note\nalpha,\"");
         contents.push_str(&"x".repeat(SAMPLE_SIZE + 512));
         contents.push_str("\"\n");
         let truncated = write_temp_csv(&contents);
-        let detected = detect_parse_settings(truncated.path().to_str().unwrap()).unwrap();
+        let detected = detect_parse_settings(truncated.path()).unwrap();
         assert_eq!(detected.delimiter, ',');
         assert_eq!(detected.line_ending, "lf");
     }
@@ -2954,7 +2977,7 @@ mod tests {
     #[test]
     fn detects_excel_separator_without_treating_it_as_a_header() {
         let file = write_temp_csv("sep=;\r\nname;value\r\nalpha;1\r\n");
-        let detected = detect_parse_settings(file.path().to_str().unwrap()).unwrap();
+        let detected = detect_parse_settings(file.path()).unwrap();
         assert_eq!(detected.delimiter, ';');
         assert!(detected.excel_sep);
         assert!(detected.has_headers);
@@ -2977,12 +3000,48 @@ mod tests {
                 file.write_all(&bytes).unwrap();
             }
             file.flush().unwrap();
-            let detected = detect_parse_settings(file.path().to_str().unwrap()).unwrap();
+            let detected = detect_parse_settings(file.path()).unwrap();
             assert_eq!(detected.encoding_label, label);
             assert_eq!(detected.delimiter, ';');
             assert_eq!(detected.line_ending, "crlf");
             assert!(detected.source_bom);
         }
+    }
+
+    #[test]
+    fn skip_mode_omits_encoding_invalid_records_in_direct_reads() {
+        let mut settings = default_parse_settings();
+        settings.has_headers = false;
+        settings.malformed = MalformedMode::Skip;
+        let mut warnings = Vec::new();
+
+        let rows = read_chunk_mmap(
+            b"good\n\xff\nlast\n",
+            0,
+            10,
+            &settings,
+            Some(1),
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![vec!["good".to_string()], vec!["last".to_string()]]
+        );
+        assert!(warnings.iter().any(|warning| warning.kind == "utf8"));
+    }
+
+    #[test]
+    fn chunk_ranges_saturate_instead_of_overflowing() {
+        let mut settings = default_parse_settings();
+        settings.has_headers = false;
+        let mut warnings = Vec::new();
+
+        let rows =
+            read_chunk_mmap(b"value\n", usize::MAX, 2, &settings, Some(1), &mut warnings).unwrap();
+
+        assert!(rows.is_empty());
     }
 
     #[test]
@@ -3017,20 +3076,14 @@ mod tests {
         let file = write_temp_csv("col1,col2\r\nalpha,1\r\nbeta,2\r\ngamma,3\r\n");
         let settings = default_parse_settings();
         let mut warnings = Vec::new();
-        let offsets = build_row_offsets(
-            file.path().to_str().unwrap(),
-            &settings,
-            Some(2),
-            &mut warnings,
-            None,
-        )
-        .expect("build offsets");
+        let offsets = build_row_offsets(file.path(), &settings, Some(2), &mut warnings, None)
+            .expect("build offsets");
         assert_eq!(offsets.len(), 3);
         assert!(warnings.is_empty());
 
         let mut chunk_warnings = Vec::new();
         let rows = read_chunk_with_offsets(
-            file.path().to_str().unwrap(),
+            file.path(),
             &offsets,
             1,
             1,
@@ -3074,17 +3127,11 @@ mod tests {
         let mut file = write_temp_csv("a,b\nfirst,1\nbad,row,extra\nsecond,2\n");
         let settings = default_parse_settings();
         let mut warnings = Vec::new();
-        let offsets = build_row_offsets(
-            file.path().to_str().unwrap(),
-            &settings,
-            Some(2),
-            &mut warnings,
-            None,
-        )
-        .unwrap();
+        let offsets =
+            build_row_offsets(file.path(), &settings, Some(2), &mut warnings, None).unwrap();
         assert_eq!(offsets.len(), 2);
         let rows = read_chunk_with_offsets(
-            file.path().to_str().unwrap(),
+            file.path(),
             &offsets,
             0,
             2,
@@ -3096,7 +3143,7 @@ mod tests {
         assert_eq!(rows[0][0], "first");
         assert_eq!(rows[1][0], "second");
         let matches = search_range_with_offsets(
-            file.path().to_str().unwrap(),
+            file.path(),
             &offsets,
             0,
             offsets.len(),
@@ -3116,17 +3163,11 @@ mod tests {
         let file = write_temp_csv("col\r\nalpha\r\nalphabet\r\nbeta\r\n");
         let settings = default_parse_settings();
         let mut warnings = Vec::new();
-        let offsets = build_row_offsets(
-            file.path().to_str().unwrap(),
-            &settings,
-            Some(1),
-            &mut warnings,
-            None,
-        )
-        .expect("build offsets");
+        let offsets = build_row_offsets(file.path(), &settings, Some(1), &mut warnings, None)
+            .expect("build offsets");
 
         let whole_word = search_range_with_offsets(
-            file.path().to_str().unwrap(),
+            file.path(),
             &offsets,
             0,
             offsets.len(),
@@ -3140,7 +3181,7 @@ mod tests {
         assert_eq!(whole_word, vec![0]);
 
         let contains = search_range_with_offsets(
-            file.path().to_str().unwrap(),
+            file.path(),
             &offsets,
             0,
             offsets.len(),
@@ -3173,18 +3214,11 @@ mod tests {
             write_temp_csv("id,name\r\n1,Alice\r\n2,Bob\r\n1,Alice\r\n3,Charlie\r\n2,Bob\r\n");
         let settings = default_parse_settings();
         let mut warnings = Vec::new();
-        let offsets = build_row_offsets(
-            file.path().to_str().unwrap(),
-            &settings,
-            Some(2),
-            &mut warnings,
-            None,
-        )
-        .expect("build offsets");
+        let offsets = build_row_offsets(file.path(), &settings, Some(2), &mut warnings, None)
+            .expect("build offsets");
 
-        let duplicates =
-            find_duplicates_hashed(file.path().to_str().unwrap(), &offsets, &settings, None)
-                .expect("find duplicates");
+        let duplicates = find_duplicates_hashed(file.path(), &offsets, &settings, None)
+            .expect("find duplicates");
         assert_eq!(duplicates, vec![0, 1, 2, 4]);
 
         let data = std::fs::read(file.path()).expect("read file");

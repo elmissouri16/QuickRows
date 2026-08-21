@@ -34,6 +34,7 @@ use quickrows_core::{
 };
 use selection::RowSelection;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -71,6 +72,19 @@ impl From<PathBuf> for OpenTarget {
 enum RuntimeRequest {
     Activate,
     Open(OpenTarget),
+}
+
+fn requeue_deferred_runtime_requests(
+    requests: &Mutex<VecDeque<RuntimeRequest>>,
+    current: RuntimeRequest,
+    remaining: VecDeque<RuntimeRequest>,
+) {
+    if let Ok(mut requests) = requests.lock() {
+        for request in remaining.into_iter().rev() {
+            requests.push_front(request);
+        }
+        requests.push_front(current);
+    }
 }
 
 #[derive(Default)]
@@ -391,11 +405,21 @@ fn fragment_regions_to_selection(
     (selected_rows, first_cells)
 }
 
+fn load_settings_for_window(settings_store: &SettingsStore) -> (AppSettings, Option<SharedString>) {
+    match settings_store.load() {
+        Ok(settings) => (settings, None),
+        Err(error) => (
+            AppSettings::default(),
+            Some(format!("Unable to load settings: {error}").into()),
+        ),
+    }
+}
+
 impl QuickRowsView {
     fn new(initial_path: Option<OpenTarget>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         let settings_store = SettingsStore::new(settings_path());
-        let settings = settings_store.load().unwrap_or_default();
+        let (settings, settings_load_error) = load_settings_for_window(&settings_store);
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Find in CSV"));
         let custom_delimiter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Custom delimiter"));
@@ -484,7 +508,7 @@ impl QuickRowsView {
             loading: false,
             operation_kind: None,
             operation_cancellation: None,
-            error: None,
+            error: settings_load_error,
             notice: None,
             external_change_detected: false,
             selected_row: None,
@@ -1087,11 +1111,11 @@ impl QuickRowsView {
                 cx.background_executor()
                     .timer(Duration::from_millis(150))
                     .await;
-                let pending = match requests.lock() {
-                    Ok(mut requests) => requests.drain(..).collect::<Vec<_>>(),
-                    Err(_) => Vec::new(),
+                let mut pending = match requests.lock() {
+                    Ok(mut requests) => requests.drain(..).collect::<VecDeque<_>>(),
+                    Err(_) => VecDeque::new(),
                 };
-                for request in pending {
+                while let Some(request) = pending.pop_front() {
                     match request {
                         RuntimeRequest::Activate => {
                             let _ = window_handle.update(cx, |_, window, cx| {
@@ -1112,9 +1136,11 @@ impl QuickRowsView {
                                 Err(_) => return anyhow::Ok(()),
                             };
                             if deferred {
-                                if let Ok(mut requests) = requests.lock() {
-                                    requests.push_front(RuntimeRequest::Open(path));
-                                }
+                                requeue_deferred_runtime_requests(
+                                    &requests,
+                                    RuntimeRequest::Open(path),
+                                    pending,
+                                );
                                 break;
                             }
                         }
@@ -1437,6 +1463,31 @@ impl QuickRowsView {
         self.operation_cancellation = None;
     }
 
+    fn finish_query_operation(&mut self, kind: OperationKind, request_id: u64) -> bool {
+        let current_request_id = match kind {
+            OperationKind::Search => self.search_request_id,
+            OperationKind::Duplicates => self.duplicate_request_id,
+            _ => return false,
+        };
+        if current_request_id != request_id || self.operation_kind != Some(kind) {
+            return false;
+        }
+        self.finish_cancellable_operation();
+        self.loading = false;
+        true
+    }
+
+    fn cancel_query_operation(&mut self, kind: OperationKind) {
+        if self.operation_kind != Some(kind) {
+            return;
+        }
+        if let Some(cancellation) = &self.operation_cancellation {
+            cancellation.cancel();
+        }
+        self.finish_cancellable_operation();
+        self.loading = false;
+    }
+
     fn cancel_current_operation(&mut self, cx: &mut Context<Self>) {
         if let Some(cancellation) = &self.operation_cancellation {
             cancellation.cancel();
@@ -1739,11 +1790,7 @@ impl QuickRowsView {
     fn clear_search(&mut self, _: &ClearSearch, _window: &mut Window, cx: &mut Context<Self>) {
         self.search_refresh_token = self.search_refresh_token.wrapping_add(1);
         self.search_request_id = self.search_request_id.wrapping_add(1);
-        if self.operation_kind == Some(OperationKind::Search) {
-            if let Some(cancellation) = &self.operation_cancellation {
-                cancellation.cancel();
-            }
-        }
+        self.cancel_query_operation(OperationKind::Search);
         self.search_results.clear();
         self.current_match = 0;
         self.last_search_query = None;
@@ -1899,10 +1946,7 @@ impl QuickRowsView {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
-                let request_is_current = this.search_request_id == request_id;
-                this.finish_cancellable_operation();
-                this.loading = false;
-                if !request_is_current {
+                if !this.finish_query_operation(OperationKind::Search, request_id) {
                     cx.notify();
                     return;
                 }
@@ -2054,10 +2098,7 @@ impl QuickRowsView {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
-                let request_is_current = this.duplicate_request_id == request_id;
-                this.finish_cancellable_operation();
-                this.loading = false;
-                if !request_is_current {
+                if !this.finish_query_operation(OperationKind::Duplicates, request_id) {
                     cx.notify();
                     return;
                 }
@@ -2135,11 +2176,7 @@ impl QuickRowsView {
 
     fn clear_duplicates(&mut self, cx: &mut Context<Self>) {
         self.duplicate_request_id = self.duplicate_request_id.wrapping_add(1);
-        if self.operation_kind == Some(OperationKind::Duplicates) {
-            if let Some(cancellation) = &self.operation_cancellation {
-                cancellation.cancel();
-            }
-        }
+        self.cancel_query_operation(OperationKind::Duplicates);
         self.duplicate_results.clear();
         self.current_duplicate_match = 0;
         self.duplicate_stale = false;
@@ -2157,6 +2194,11 @@ impl QuickRowsView {
 
     fn sort_column(&mut self, column: usize, cx: &mut Context<Self>) {
         if self.modal_active() {
+            return;
+        }
+        if self.editing_cell.is_some() {
+            self.pending_edit_action = Some(PendingEditAction::SortColumn(column));
+            self.commit_cell_edit(cx);
             return;
         }
         if self.pending_cell_commits > 0 {
@@ -2730,7 +2772,7 @@ impl QuickRowsView {
         let end = *rows.end();
         self.selected_rows.select_only_range(start, end);
         self.selected_row = Some(selection.active().row);
-        self.selection_anchor = Some(start);
+        self.selection_anchor = Some(selection.anchor().row);
     }
 
     fn navigate_cell(
@@ -6462,10 +6504,115 @@ fn open_target_from_value(value: &str) -> Option<OpenTarget> {
     })
 }
 
+fn open_target_from_os_value(value: &OsStr) -> Option<OpenTarget> {
+    let path = PathBuf::from(value);
+    if path.is_file() {
+        return Some(path.into());
+    }
+    value.to_str().and_then(open_target_from_value)
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    fn digit(value: u8) -> Option<u8> {
+        match value {
+            b'0'..=b'9' => Some(value - b'0'),
+            b'a'..=b'f' => Some(value - b'a' + 10),
+            b'A'..=b'F' => Some(value - b'A' + 10),
+            _ => None,
+        }
+    }
+    let chunks = value.as_bytes().chunks_exact(2);
+    if !chunks.remainder().is_empty() {
+        return None;
+    }
+    chunks
+        .map(|pair| Some((digit(pair[0])? << 4) | digit(pair[1])?))
+        .collect()
+}
+
+#[cfg(unix)]
+fn encode_os_path(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    encode_hex(path.as_os_str().as_bytes())
+}
+
+#[cfg(unix)]
+fn decode_os_path(value: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    Some(PathBuf::from(OsString::from_vec(decode_hex(value)?)))
+}
+
+#[cfg(windows)]
+fn encode_os_path(path: &Path) -> String {
+    use std::os::windows::ffi::OsStrExt;
+    let bytes = path
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    encode_hex(&bytes)
+}
+
+#[cfg(windows)]
+fn decode_os_path(value: &str) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    let bytes = decode_hex(value)?;
+    let chunks = bytes.chunks_exact(2);
+    if !chunks.remainder().is_empty() {
+        return None;
+    }
+    let wide = chunks
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect::<Vec<_>>();
+    Some(PathBuf::from(OsString::from_wide(&wide)))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn encode_os_path(path: &Path) -> String {
+    encode_hex(path.to_string_lossy().as_bytes())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn decode_os_path(value: &str) -> Option<PathBuf> {
+    String::from_utf8(decode_hex(value)?)
+        .ok()
+        .map(PathBuf::from)
+}
+
+fn encode_open_target(target: &OpenTarget) -> String {
+    let fragment = target
+        .fragment
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    format!("{}|{fragment}", encode_os_path(&target.path))
+}
+
+fn decode_open_target(value: &str) -> Option<OpenTarget> {
+    let (path, fragment) = value.split_once('|').unwrap_or((value, ""));
+    let path = decode_os_path(path)?;
+    path.is_file().then(|| OpenTarget {
+        path,
+        fragment: (!fragment.is_empty())
+            .then(|| parse_fragment(fragment))
+            .flatten(),
+    })
+}
+
 fn initial_paths() -> Vec<OpenTarget> {
     std::env::args_os()
         .skip(1)
-        .filter_map(|value| open_target_from_value(&value.to_string_lossy()))
+        .filter_map(|value| open_target_from_os_value(&value))
         .collect()
 }
 
@@ -6507,7 +6654,9 @@ fn coordinate_instance(
                                 if part == "A" {
                                     requests.push_back(RuntimeRequest::Activate);
                                 } else if let Some(target) =
-                                    part.strip_prefix('P').and_then(open_target_from_value)
+                                    part.strip_prefix('H').and_then(decode_open_target).or_else(
+                                        || part.strip_prefix('P').and_then(open_target_from_value),
+                                    )
                                 {
                                     requests.push_back(RuntimeRequest::Open(target));
                                 }
@@ -6534,12 +6683,8 @@ fn coordinate_instance(
                     .map_err(|error| error.to_string())?;
             } else {
                 for target in paths {
-                    stream.write_all(b"P").map_err(|error| error.to_string())?;
-                    let mut value = target.path.to_string_lossy().into_owned();
-                    if let Some(fragment) = target.fragment.as_ref() {
-                        value.push('#');
-                        value.push_str(&fragment.to_string());
-                    }
+                    stream.write_all(b"H").map_err(|error| error.to_string())?;
+                    let value = encode_open_target(target);
                     stream
                         .write_all(value.as_bytes())
                         .and_then(|_| stream.write_all(&[0]))
@@ -6580,9 +6725,13 @@ fn main() {
         pending.extend(paths.into_iter().skip(1).map(RuntimeRequest::Open));
     }
     migrate_legacy_settings();
-    let initial_settings = SettingsStore::new(settings_path())
-        .load()
-        .unwrap_or_default();
+    let initial_settings = match SettingsStore::new(settings_path()).load() {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("Unable to load QuickRows settings: {error}");
+            AppSettings::default()
+        }
+    };
     let diagnostics_directory = diagnostics_path();
     let (diagnostics, diagnostics_error) =
         match Diagnostics::new(diagnostics_directory.clone(), false) {
@@ -6706,7 +6855,14 @@ fn main() {
                 let window_handle = window.window_handle();
                 view.update(cx, |view, cx| {
                     view.self_weak = Some(weak_view.clone());
-                    view.error = diagnostics_error_for_window.clone().map(Into::into);
+                    if let Some(diagnostics_error) = diagnostics_error_for_window.clone() {
+                        view.error = Some(match view.error.take() {
+                            Some(settings_error) => {
+                                format!("{settings_error}; {diagnostics_error}").into()
+                            }
+                            None => diagnostics_error.into(),
+                        });
+                    }
                     view.track_runtime_requests(requests_for_window.clone(), window_handle, cx);
                     view.track_external_changes(cx);
                 });

@@ -21,6 +21,10 @@ impl CellSelection {
         }
     }
 
+    pub(crate) fn anchor(self) -> CellPosition {
+        self.anchor
+    }
+
     pub(crate) fn active(self) -> CellPosition {
         self.active
     }
@@ -70,6 +74,15 @@ mod tests {
         assert_eq!(selection.dimensions(), (8, 4));
         assert!(selection.contains(7, 4));
         assert!(!selection.contains(11, 4));
+    }
+
+    #[test]
+    fn reverse_selection_preserves_its_anchor() {
+        let mut selection = CellSelection::single(10, 5);
+        selection.set_active(3, 2);
+
+        assert_eq!(selection.anchor(), CellPosition { row: 10, column: 5 });
+        assert_eq!(selection.active(), CellPosition { row: 3, column: 2 });
     }
 
     #[test]

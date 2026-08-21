@@ -1,11 +1,13 @@
 #[cfg(test)]
 mod tests {
     use super::super::{
-        ContextMenuCommand, LoadedDocument, QuickRowsView, ShowShortcuts, TableContextMenuKind,
+        ContextMenuCommand, EditingCell, LoadedDocument, OpenTarget, OperationKind,
+        PendingEditAction, QuickRowsView, RuntimeRequest, ShowShortcuts, TableContextMenuKind,
         context_menu_command, context_menu_item_count, counted_noun, display_header_label,
         file_fingerprint, format_count, fragment_regions_to_selection, is_valid_syntax_character,
-        open_target_from_value, parse_diagnostic_rows, parse_effective_changes, parse_summary,
-        path_from_open_value, query_result_label, toolbar_shows_labels, validate_syntax_overrides,
+        load_settings_for_window, open_target_from_value, parse_diagnostic_rows,
+        parse_effective_changes, parse_summary, path_from_open_value, query_result_label,
+        requeue_deferred_runtime_requests, toolbar_shows_labels, validate_syntax_overrides,
     };
 
     #[gpui::test]
@@ -28,6 +30,106 @@ mod tests {
         cx.dispatch_keystroke(*window, Keystroke::parse("ctrl-g").unwrap());
         window
             .update(cx, |view, _, _| assert!(view.show_shortcuts))
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn stale_query_completion_does_not_clear_the_current_operation(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| QuickRowsView::new(None, window, cx))
+            })
+            .unwrap()
+        });
+        window
+            .update(cx, |view, _, _| {
+                let cancellation = quickrows_core::CancellationToken::new();
+                view.loading = true;
+                view.search_request_id = 2;
+                view.operation_kind = Some(OperationKind::Search);
+                view.operation_cancellation = Some(cancellation.clone());
+
+                assert!(!view.finish_query_operation(OperationKind::Search, 1));
+                assert!(view.loading);
+                assert!(view.operation_cancellation.is_some());
+                assert!(!cancellation.is_cancelled());
+
+                assert!(view.finish_query_operation(OperationKind::Search, 2));
+                assert!(!view.loading);
+                assert!(view.operation_cancellation.is_none());
+
+                let cancellation = quickrows_core::CancellationToken::new();
+                view.loading = true;
+                view.search_request_id = 3;
+                view.operation_kind = Some(OperationKind::Search);
+                view.operation_cancellation = Some(cancellation.clone());
+                view.search_request_id = view.search_request_id.wrapping_add(1);
+                view.cancel_query_operation(OperationKind::Search);
+                assert!(cancellation.is_cancelled());
+                assert!(!view.loading);
+                assert!(view.operation_cancellation.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn sorting_commits_an_active_cell_edit_before_reordering(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sort-edit.csv");
+        std::fs::write(&path, "name,value\nb,2\na,1\n").unwrap();
+        let document = quickrows_core::CsvDocument::open(&path, None, None).unwrap();
+        let headers = document.metadata().headers.clone();
+        let row_count = document.row_count();
+        let parse_info = document.metadata().effective.clone();
+        let detected_parse_info = document.metadata().detected.clone();
+        let document = Arc::new(Mutex::new(document));
+
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| QuickRowsView::new(None, window, cx))
+            })
+            .unwrap()
+        });
+        window
+            .update(cx, |view, window, cx| {
+                view.loaded = Some(LoadedDocument {
+                    document: document.clone(),
+                    path: path.clone(),
+                    headers,
+                    row_count,
+                    detected_parse_info,
+                    parse_info,
+                    warnings: Vec::new(),
+                    file_fingerprint: super::super::file_fingerprint(&path),
+                    dirty: false,
+                });
+                view.editing_cell = Some(EditingCell {
+                    display_row: 0,
+                    source_row: 0,
+                    column: 1,
+                    initial_value: "2".to_string(),
+                });
+                view.edit_input.update(cx, |input, cx| {
+                    input.set_value("edited".to_string(), window, cx)
+                });
+
+                view.sort_column(0, cx);
+
+                assert!(view.editing_cell.is_none());
+                assert_eq!(view.pending_cell_commits, 1);
+                assert!(matches!(
+                    view.pending_edit_action,
+                    Some(PendingEditAction::SortColumn(0))
+                ));
+                assert!(document.lock().unwrap().sort_spec().is_none());
+            })
             .unwrap();
     }
 
@@ -78,6 +180,76 @@ mod tests {
                 assert!(view.show_settings);
             })
             .unwrap();
+    }
+
+    #[test]
+    fn corrupt_settings_are_reported_to_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{broken").unwrap();
+        let store = quickrows_core::SettingsStore::new(path);
+
+        let (settings, error) = load_settings_for_window(&store);
+
+        assert_eq!(
+            settings.column_width,
+            quickrows_core::AppSettings::default().column_width
+        );
+        assert!(error.unwrap().contains("Unable to load settings"));
+    }
+
+    #[test]
+    fn deferred_runtime_request_preserves_the_remaining_batch() {
+        use std::collections::VecDeque;
+        use std::sync::Mutex;
+
+        let current = OpenTarget::from(std::path::PathBuf::from("first.csv"));
+        let remaining_open = OpenTarget::from(std::path::PathBuf::from("second.csv"));
+        let later_open = OpenTarget::from(std::path::PathBuf::from("third.csv"));
+        let requests = Mutex::new(VecDeque::from([RuntimeRequest::Open(later_open)]));
+        requeue_deferred_runtime_requests(
+            &requests,
+            RuntimeRequest::Open(current),
+            VecDeque::from([
+                RuntimeRequest::Activate,
+                RuntimeRequest::Open(remaining_open),
+            ]),
+        );
+
+        let mut requests = requests.into_inner().unwrap();
+        assert!(
+            matches!(requests.pop_front(), Some(RuntimeRequest::Open(target)) if target.path == std::path::Path::new("first.csv"))
+        );
+        assert!(matches!(
+            requests.pop_front(),
+            Some(RuntimeRequest::Activate)
+        ));
+        assert!(
+            matches!(requests.pop_front(), Some(RuntimeRequest::Open(target)) if target.path == std::path::Path::new("second.csv"))
+        );
+        assert!(
+            matches!(requests.pop_front(), Some(RuntimeRequest::Open(target)) if target.path == std::path::Path::new("third.csv"))
+        );
+        assert!(requests.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_paths_survive_cli_and_instance_encoding() {
+        use super::super::{decode_open_target, encode_open_target, open_target_from_os_value};
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut name = b"rows-".to_vec();
+        name.push(0xff);
+        name.extend_from_slice(b".csv");
+        let path = dir.path().join(std::ffi::OsString::from_vec(name));
+        std::fs::write(&path, "a,b\n1,2\n").unwrap();
+
+        let target = open_target_from_os_value(path.as_os_str()).unwrap();
+        assert_eq!(target.path, path);
+        let encoded = encode_open_target(&target);
+        assert_eq!(decode_open_target(&encoded).unwrap().path, target.path);
     }
 
     #[test]
