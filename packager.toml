@@ -1,0 +1,28 @@
+"$schema" = "https://raw.githubusercontent.com/crabnebula-dev/cargo-packager/master/schema.json"
+name = "quickrows"
+productName = "QuickRows"
+version = "0.1.1"
+identifier = "com.el.csv-viewer"
+description = "Fast native CSV viewer for large files."
+longDescription = "QuickRows opens and explores large CSV files without loading the complete file into memory."
+homepage = "https://github.com/elmissouri16/quickrows"
+category = "Utility"
+formats = ["default"]
+outDir = "target/release"
+beforePackagingCommand = "cargo build --release -p quickrows-gpui --locked"
+icons = [
+    "assets/icons/32x32.png",
+    "assets/icons/128x128.png",
+    "assets/icons/128x128@2x.png",
+    "assets/icons/icon.icns",
+    "assets/icons/icon.ico",
+]
+binaries = [{ path = "quickrows", main = true }]
+fileAssociations = [
+    { extensions = ["csv"], mimeType = "text/csv", description = "CSV File", name = "CSV File", role = "viewer" },
+]
+
+[dmg]
+windowSize = { width = 660, height = 400 }
+appPosition = { x = 180, y = 170 }
+appFolderPosition = { x = 480, y = 170 }

@@ -1,0 +1,48 @@
+name: Package smoke
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux package dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libvulkan-dev libfontconfig-dev libasound2-dev libssl-dev libgtk-3-dev
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked
+      - name: Build and verify macOS DMG
+        if: runner.os == 'macOS'
+        run: scripts/macos-dmg.sh --build-only --skip-tool-install
+      - name: Build platform package
+        if: runner.os != 'macOS'
+        run: cargo packager --release --config packager.toml
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: quickrows-${{ runner.os }}
+          if-no-files-found: error
+          path: |
+            target/release/*.dmg
+            target/release/*.app.tar.gz
+            target/release/*.msi
+            target/release/*.exe
+            target/release/*.deb
+            target/release/*.AppImage
+            target/release/*.tar.gz

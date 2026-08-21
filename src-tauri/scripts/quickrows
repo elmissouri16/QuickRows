@@ -1,7 +1,0 @@
-#!/bin/sh
-
-if command -v setsid >/dev/null 2>&1; then
-  setsid -f csv-viewer "$@" >/dev/null 2>&1
-else
-  nohup csv-viewer "$@" >/dev/null 2>&1 &
-fi

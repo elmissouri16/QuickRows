@@ -1,40 +1,41 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `src/`: React + TypeScript frontend (`App.tsx`, `App.css`, `hooks/`, `assets/`).
-- `public/`: static assets served by Vite.
-- `src-tauri/`: Rust backend and Tauri configuration.
-  - `src-tauri/src/lib.rs`: Tauri commands and menu wiring.
-  - `src-tauri/src/csv_*.rs`: CSV parsing, caching, and search utilities.
-- Reference architecture/performance notes live in `instructions.md`.
+- `crates/quickrows-core/`: UI-independent CSV engine, settings, and tests.
+- `crates/quickrows-gpui/`: native GPUI + GPUI Component application.
+- `assets/`: desktop application icons and source artwork.
+- `docs/`: CSV compatibility and release-validation documentation.
+- `scripts/`: packaging and large-fixture helpers.
+- `packager.toml`: native package and CSV file-association configuration.
 
 ## Build, Test, and Development Commands
-- `npm run dev`: start the Vite dev server (frontend only).
-- `npm run build`: type-check (`tsc`) and build the frontend bundle.
-- `npm run preview`: serve the production build locally.
-- `npm run tauri dev`: run the full desktop app with Tauri (frontend + Rust).
-- `npm run tauri build`: package the Tauri desktop app.
+- `cargo run -p quickrows-gpui`: run the native GPUI app.
+- `cargo check --workspace`: type-check the complete workspace.
+- `cargo test --workspace`: run the shared engine and native state tests.
+- `cargo fmt --all -- --check`: verify Rust formatting.
+- `cargo packager --release --config packager.toml`: package the native app.
 
 ## Coding Style & Naming Conventions
-- Indentation: 2 spaces for `.ts/.tsx`, 4 spaces for `.css` and `.rs` (match existing files).
-- React components use `PascalCase`; hooks use `useX` (e.g., `useDebounce` in `src/hooks/`).
-- CSS class names use kebab-case (e.g., `.table-row`, `.find-panel`).
-- No formatter/linter scripts are configured; keep edits consistent with adjacent code.
+- Use four-space indentation for Rust and match adjacent code for configuration files.
+- Use `snake_case` for Rust functions/modules and `PascalCase` for types and GPUI views.
+- Use GPUI Component primitives and semantic theme roles instead of custom control colors.
+- Keep CSV parsing, search, sort, editing, and save behavior in `quickrows-core`.
 
 ## Testing Guidelines
-- No automated test runner is configured.
-- Validate changes manually:
-  - `npm run tauri dev` for full app behavior.
-  - `npm run dev` for frontend-only layout checks.
+- Add focused unit tests for CSV and state-model changes.
+- Run `cargo test --workspace` and `cargo check --workspace` before submitting changes.
+- For UI changes, run `cargo run -p quickrows-gpui` and inspect the affected surface manually.
+- For large-file changes, generate the million-row fixture and follow `test-data/README.md`.
 
 ## Commit & Pull Request Guidelines
-- Git history only shows an `init` commit; no enforced convention observed.
-- Use short, imperative commit subjects (e.g., “Add row-number toggle”).
+- Use short, imperative commit subjects.
 - PRs should include:
   - A concise summary of changes.
+  - Validation commands and results.
   - Screenshots/GIFs for UI updates.
   - Linked issues if applicable.
 
 ## Configuration & Tips
-- Settings persistence uses `localStorage` in the frontend.
-- CSV-heavy operations are expected to run in Rust (see `src-tauri/src/`).
+- Settings use native JSON persistence through `quickrows-core`.
+- Packaging and file associations are owned by `packager.toml`.
+- Public releases must complete `docs/release-checklist.md`.

@@ -1,0 +1,24 @@
+[package]
+name = "quickrows-gpui"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+description = "Fast native CSV viewer built with GPUI"
+
+[[bin]]
+name = "quickrows"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+directories = "6"
+gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
+gpui-component = "=0.5.1"
+gpui-component-assets = "=0.5.1"
+quickrows-core.workspace = true
+percent-encoding = "2"
+url = "2"
+
+[dev-dependencies]
+gpui = { version = "=0.2.2", features = ["runtime_shaders", "test-support"] }
+tempfile.workspace = true
