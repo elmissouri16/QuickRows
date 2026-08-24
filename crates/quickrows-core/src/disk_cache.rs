@@ -3,14 +3,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
-use std::io::{Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
+const CACHE_IO_BUFFER_BYTES: usize = 1024 * 1024;
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 3);
 const MAX_CACHE_ALLOCATION_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_WARNING_CACHE_BYTES: u64 = 4 * 1024 * 1024;
+const OFFSETS_HEADER_BYTES: u64 = 64;
+const ORDER_HEADER_BYTES: u64 = 69;
+const PAYLOAD_CHECKSUM_BYTES: u64 = 32;
 
 const OFFSETS_MAGIC: &[u8; 4] = b"CVOF";
 const ORDER_MAGIC: &[u8; 4] = b"CVSO";
@@ -131,20 +136,69 @@ pub fn warnings_cache_path(dir: &Path, key: CacheKey) -> PathBuf {
     dir.join(format!("warnings_{:016x}.json", key.hash))
 }
 
+// Cache files are disposable, so a flushed same-directory rename is sufficient:
+// readers see either the previous complete file or the new complete file.
+fn write_cache_atomically(
+    path: &Path,
+    write_contents: impl FnOnce(&mut BufWriter<&mut File>) -> Result<(), String>,
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".quickrows-cache-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(|error| error.to_string())?;
+    {
+        let mut writer = BufWriter::with_capacity(CACHE_IO_BUFFER_BYTES, temporary.as_file_mut());
+        write_contents(&mut writer)?;
+        writer.flush().map_err(|error| error.to_string())?;
+    }
+    temporary
+        .persist(path)
+        .map_err(|error| error.error.to_string())?;
+    Ok(())
+}
+
+fn validate_cache_payload(
+    path: &Path,
+    key: CacheKey,
+    count: usize,
+    cache_name: &str,
+) -> Result<u64, String> {
+    let stored_count = u64::try_from(count).map_err(|error| error.to_string())?;
+    let payload_bytes = stored_count
+        .checked_mul(std::mem::size_of::<u64>() as u64)
+        .ok_or_else(|| format!("{cache_name} cache size overflowed"))?;
+    if stored_count > key.len.saturating_add(1) || payload_bytes > MAX_CACHE_ALLOCATION_BYTES {
+        let _ = fs::remove_file(path);
+        return Err(format!("{cache_name} cache exceeds the maximum cache size"));
+    }
+    Ok(stored_count)
+}
+
 #[derive(Deserialize, Serialize)]
 struct WarningCache {
     version: u32,
     len: u64,
     modified: u64,
     content_hash: [u8; 32],
+    warnings_checksum: [u8; 32],
     warnings: Vec<ParseWarning>,
+}
+
+fn warnings_checksum(warnings: &[ParseWarning]) -> Result<[u8; 32], String> {
+    let bytes = serde_json::to_vec(warnings).map_err(|error| error.to_string())?;
+    Ok(*blake3::hash(&bytes).as_bytes())
 }
 
 pub fn read_warnings_cache(
     path: &Path,
     key: CacheKey,
 ) -> Result<Option<Vec<ParseWarning>>, String> {
-    const MAX_WARNING_CACHE_BYTES: u64 = 4 * 1024 * 1024;
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -166,6 +220,7 @@ pub fn read_warnings_cache(
         || cache.len != key.len
         || cache.modified != key.modified
         || cache.content_hash != key.content_hash
+        || warnings_checksum(&cache.warnings)? != cache.warnings_checksum
     {
         return Ok(None);
     }
@@ -182,17 +237,88 @@ pub fn write_warnings_cache(
         len: key.len,
         modified: key.modified,
         content_hash: key.content_hash,
+        warnings_checksum: warnings_checksum(warnings)?,
         warnings: warnings.to_vec(),
     };
     let bytes = serde_json::to_vec(&cache).map_err(|error| error.to_string())?;
-    fs::write(path, bytes).map_err(|error| error.to_string())
+    if bytes.len() as u64 > MAX_WARNING_CACHE_BYTES {
+        let _ = fs::remove_file(path);
+        return Err("Warning cache exceeds the maximum cache size".to_string());
+    }
+    write_cache_atomically(path, |writer| {
+        writer.write_all(&bytes).map_err(|error| error.to_string())
+    })
+}
+
+fn read_u64_payload<T>(
+    reader: &mut impl Read,
+    count: usize,
+    mut convert: impl FnMut(u64) -> Option<T>,
+) -> Result<Option<Vec<T>>, String> {
+    let mut values = Vec::new();
+    if values.try_reserve_exact(count).is_err() {
+        return Ok(None);
+    }
+    let items_per_batch = CACHE_IO_BUFFER_BYTES / std::mem::size_of::<u64>();
+    let mut bytes = vec![0u8; count.min(items_per_batch) * std::mem::size_of::<u64>()];
+    let mut hasher = blake3::Hasher::new();
+    let mut remaining = count;
+    while remaining > 0 {
+        let item_count = remaining.min(items_per_batch);
+        let byte_count = item_count * std::mem::size_of::<u64>();
+        let batch = &mut bytes[..byte_count];
+        reader
+            .read_exact(batch)
+            .map_err(|error| error.to_string())?;
+        hasher.update(batch);
+        for encoded in batch.chunks_exact(std::mem::size_of::<u64>()) {
+            let value = u64::from_le_bytes(encoded.try_into().expect("u64-sized cache chunk"));
+            let Some(value) = convert(value) else {
+                return Ok(None);
+            };
+            values.push(value);
+        }
+        remaining -= item_count;
+    }
+    let expected_checksum = read_hash(reader)?;
+    if expected_checksum != *hasher.finalize().as_bytes() {
+        return Ok(None);
+    }
+    Ok(Some(values))
+}
+
+fn write_u64_payload(
+    writer: &mut impl Write,
+    values: impl IntoIterator<Item = u64>,
+) -> Result<(), String> {
+    let mut bytes = Vec::with_capacity(CACHE_IO_BUFFER_BYTES);
+    let mut hasher = blake3::Hasher::new();
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+        if bytes.len() >= CACHE_IO_BUFFER_BYTES {
+            hasher.update(&bytes);
+            writer
+                .write_all(&bytes)
+                .map_err(|error| error.to_string())?;
+            bytes.clear();
+        }
+    }
+    if !bytes.is_empty() {
+        hasher.update(&bytes);
+        writer
+            .write_all(&bytes)
+            .map_err(|error| error.to_string())?;
+    }
+    write_hash(writer, hasher.finalize().as_bytes())
 }
 
 pub fn read_offsets_cache(path: &Path, key: CacheKey) -> Result<Option<Vec<u64>>, String> {
-    let mut file = match File::open(path) {
+    let file = match File::open(path) {
         Ok(file) => file,
         Err(_) => return Ok(None),
     };
+    let file_len = file.metadata().map_err(|err| err.to_string())?.len();
+    let mut file = BufReader::with_capacity(CACHE_IO_BUFFER_BYTES, file);
 
     let mut magic = [0u8; 4];
     if file.read_exact(&mut magic).is_err() || magic != *OFFSETS_MAGIC {
@@ -211,43 +337,40 @@ pub fn read_offsets_cache(path: &Path, key: CacheKey) -> Result<Option<Vec<u64>>
         return Ok(None);
     }
 
-    let count = match usize::try_from(read_u64(&mut file)?) {
+    let stored_count = read_u64(&mut file)?;
+    let count = match usize::try_from(stored_count) {
         Ok(count) => count,
         Err(_) => return Ok(None),
     };
-    let file_len = file.metadata().map_err(|err| err.to_string())?.len();
-    let available_items = file_len.saturating_sub(64) / 8;
-    if count as u64 > available_items
-        || count as u64 > key.len.saturating_add(1)
-        || (count as u64).saturating_mul(8) > MAX_CACHE_ALLOCATION_BYTES
+    let Some(payload_bytes) = stored_count.checked_mul(std::mem::size_of::<u64>() as u64) else {
+        return Ok(None);
+    };
+    let expected_file_len = OFFSETS_HEADER_BYTES
+        .checked_add(payload_bytes)
+        .and_then(|length| length.checked_add(PAYLOAD_CHECKSUM_BYTES));
+    if stored_count > key.len.saturating_add(1)
+        || payload_bytes > MAX_CACHE_ALLOCATION_BYTES
+        || expected_file_len != Some(file_len)
     {
         return Ok(None);
     }
-    let mut offsets = Vec::new();
-    if offsets.try_reserve_exact(count).is_err() {
-        return Ok(None);
-    }
-    offsets.resize(count, 0);
-    for item in offsets.iter_mut() {
-        *item = read_u64(&mut file)?;
-    }
 
-    Ok(Some(offsets))
+    read_u64_payload(&mut file, count, Some)
 }
 
 pub fn write_offsets_cache(path: &Path, key: CacheKey, offsets: &[u64]) -> Result<(), String> {
-    let mut file = File::create(path).map_err(|err| err.to_string())?;
-    file.write_all(OFFSETS_MAGIC)
-        .map_err(|err| err.to_string())?;
-    write_u32(&mut file, CACHE_VERSION)?;
-    write_u64(&mut file, key.len)?;
-    write_u64(&mut file, key.modified)?;
-    write_hash(&mut file, &key.content_hash)?;
-    write_u64(&mut file, offsets.len() as u64)?;
-    for value in offsets {
-        write_u64(&mut file, *value)?;
-    }
-    Ok(())
+    let count = validate_cache_payload(path, key, offsets.len(), "Offset")?;
+    write_cache_atomically(path, |writer| {
+        writer
+            .write_all(OFFSETS_MAGIC)
+            .map_err(|err| err.to_string())?;
+        write_u32(writer, CACHE_VERSION)?;
+        write_u64(writer, key.len)?;
+        write_u64(writer, key.modified)?;
+        write_hash(writer, &key.content_hash)?;
+        write_u64(writer, count)?;
+        write_u64_payload(writer, offsets.iter().copied())
+    })
 }
 
 pub fn read_order_cache(
@@ -256,10 +379,12 @@ pub fn read_order_cache(
     column: usize,
     ascending: bool,
 ) -> Result<Option<Vec<usize>>, String> {
-    let mut file = match File::open(path) {
+    let file = match File::open(path) {
         Ok(file) => file,
         Err(_) => return Ok(None),
     };
+    let file_len = file.metadata().map_err(|err| err.to_string())?.len();
+    let mut file = BufReader::with_capacity(CACHE_IO_BUFFER_BYTES, file);
 
     let mut magic = [0u8; 4];
     if file.read_exact(&mut magic).is_err() || magic != *ORDER_MAGIC {
@@ -279,37 +404,34 @@ pub fn read_order_cache(
     }
 
     let stored_column = read_u32(&mut file)? as usize;
-    let stored_direction = read_u8(&mut file)?;
-    let stored_ascending = stored_direction == 1;
+    let stored_ascending = match read_u8(&mut file)? {
+        0 => false,
+        1 => true,
+        _ => return Ok(None),
+    };
     if stored_column != column || stored_ascending != ascending {
         return Ok(None);
     }
 
-    let count = match usize::try_from(read_u64(&mut file)?) {
+    let stored_count = read_u64(&mut file)?;
+    let count = match usize::try_from(stored_count) {
         Ok(count) => count,
         Err(_) => return Ok(None),
     };
-    let file_len = file.metadata().map_err(|err| err.to_string())?.len();
-    let available_items = file_len.saturating_sub(69) / 8;
-    if count as u64 > available_items
-        || count as u64 > key.len.saturating_add(1)
-        || (count as u64).saturating_mul(8) > MAX_CACHE_ALLOCATION_BYTES
+    let Some(payload_bytes) = stored_count.checked_mul(std::mem::size_of::<u64>() as u64) else {
+        return Ok(None);
+    };
+    let expected_file_len = ORDER_HEADER_BYTES
+        .checked_add(payload_bytes)
+        .and_then(|length| length.checked_add(PAYLOAD_CHECKSUM_BYTES));
+    if stored_count > key.len.saturating_add(1)
+        || payload_bytes > MAX_CACHE_ALLOCATION_BYTES
+        || expected_file_len != Some(file_len)
     {
         return Ok(None);
     }
-    let mut order = Vec::new();
-    if order.try_reserve_exact(count).is_err() {
-        return Ok(None);
-    }
-    for _ in 0..count {
-        let value = match usize::try_from(read_u64(&mut file)?) {
-            Ok(value) => value,
-            Err(_) => return Ok(None),
-        };
-        order.push(value);
-    }
 
-    Ok(Some(order))
+    read_u64_payload(&mut file, count, |value| usize::try_from(value).ok())
 }
 
 pub fn write_order_cache(
@@ -319,19 +441,27 @@ pub fn write_order_cache(
     ascending: bool,
     order: &[usize],
 ) -> Result<(), String> {
-    let mut file = File::create(path).map_err(|err| err.to_string())?;
-    file.write_all(ORDER_MAGIC).map_err(|err| err.to_string())?;
-    write_u32(&mut file, CACHE_VERSION)?;
-    write_u64(&mut file, key.len)?;
-    write_u64(&mut file, key.modified)?;
-    write_hash(&mut file, &key.content_hash)?;
-    write_u32(&mut file, column as u32)?;
-    write_u8(&mut file, if ascending { 1 } else { 0 })?;
-    write_u64(&mut file, order.len() as u64)?;
-    for value in order {
-        write_u64(&mut file, *value as u64)?;
-    }
-    Ok(())
+    let stored_column = match u32::try_from(column) {
+        Ok(column) => column,
+        Err(error) => {
+            let _ = fs::remove_file(path);
+            return Err(error.to_string());
+        }
+    };
+    let count = validate_cache_payload(path, key, order.len(), "Sort")?;
+    write_cache_atomically(path, |writer| {
+        writer
+            .write_all(ORDER_MAGIC)
+            .map_err(|err| err.to_string())?;
+        write_u32(writer, CACHE_VERSION)?;
+        write_u64(writer, key.len)?;
+        write_u64(writer, key.modified)?;
+        write_hash(writer, &key.content_hash)?;
+        write_u32(writer, stored_column)?;
+        write_u8(writer, if ascending { 1 } else { 0 })?;
+        write_u64(writer, count)?;
+        write_u64_payload(writer, order.iter().map(|&value| value as u64))
+    })
 }
 
 fn read_hash(reader: &mut impl Read) -> Result<[u8; 32], String> {
@@ -387,9 +517,10 @@ fn write_u64(writer: &mut impl Write, value: u64) -> Result<(), String> {
 mod tests {
     use super::{
         cache_key, offsets_cache_path, order_cache_path, read_offsets_cache, read_order_cache,
-        read_warnings_cache, warnings_cache_path, write_offsets_cache, write_order_cache,
-        MAX_CACHE_ALLOCATION_BYTES,
+        read_warnings_cache, validate_cache_payload, warnings_cache_path, write_cache_atomically,
+        write_offsets_cache, write_order_cache, write_warnings_cache, MAX_CACHE_ALLOCATION_BYTES,
     };
+    use crate::csv::ParseWarning;
     use std::io::{Seek, SeekFrom, Write};
 
     #[test]
@@ -407,6 +538,131 @@ mod tests {
             .expect("read offsets")
             .expect("offsets");
         assert_eq!(loaded, offsets);
+    }
+
+    #[test]
+    fn offsets_cache_rejects_modified_truncated_and_extended_payloads() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file_path = dir.path().join("data.csv");
+        std::fs::write(&file_path, b"col1,col2\n1,2\n3,4\n").expect("write csv");
+        let key = cache_key(&file_path, None).expect("cache key");
+        let offsets_path = offsets_cache_path(dir.path(), key);
+        let offsets = vec![0u64, 12, 16];
+        write_offsets_cache(&offsets_path, key, &offsets).expect("write offsets");
+        let valid = std::fs::read(&offsets_path).unwrap();
+
+        let mut modified = valid.clone();
+        modified[64] ^= 0xff;
+        std::fs::write(&offsets_path, modified).unwrap();
+        assert!(read_offsets_cache(&offsets_path, key).unwrap().is_none());
+
+        std::fs::write(&offsets_path, &valid[..valid.len() - 1]).unwrap();
+        assert!(read_offsets_cache(&offsets_path, key).unwrap().is_none());
+
+        let mut extended = valid;
+        extended.push(0);
+        std::fs::write(&offsets_path, extended).unwrap();
+        assert!(read_offsets_cache(&offsets_path, key).unwrap().is_none());
+    }
+
+    #[test]
+    fn zeroed_offset_count_cannot_turn_a_populated_csv_into_an_empty_cache() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file_path = dir.path().join("data.csv");
+        std::fs::write(&file_path, b"col1,col2\n1,2\n3,4\n").expect("write csv");
+        let key = cache_key(&file_path, None).expect("cache key");
+        let offsets_path = offsets_cache_path(dir.path(), key);
+        write_offsets_cache(&offsets_path, key, &[12, 16]).expect("write offsets");
+        let mut bytes = std::fs::read(&offsets_path).unwrap();
+        bytes[56..64].copy_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&offsets_path, bytes).unwrap();
+
+        assert!(read_offsets_cache(&offsets_path, key).unwrap().is_none());
+    }
+
+    #[test]
+    fn buffered_cache_round_trip_crosses_multiple_io_buffers() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file_path = dir.path().join("data.csv");
+        std::fs::write(&file_path, b"col1\n1\n").expect("write csv");
+        let mut key = cache_key(&file_path, None).expect("cache key");
+        key.len = u64::MAX;
+        let offsets_path = offsets_cache_path(dir.path(), key);
+        let offsets = (0..200_000u64).collect::<Vec<_>>();
+
+        write_offsets_cache(&offsets_path, key, &offsets).expect("write offsets");
+        let loaded = read_offsets_cache(&offsets_path, key)
+            .expect("read offsets")
+            .expect("offsets");
+        assert_eq!(loaded, offsets);
+    }
+
+    #[test]
+    fn failed_atomic_cache_write_preserves_existing_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("cache.bin");
+        std::fs::write(&path, b"existing cache").expect("write existing cache");
+
+        let error = write_cache_atomically(&path, |writer| {
+            writer
+                .write_all(b"partial replacement")
+                .map_err(|error| error.to_string())?;
+            Err("injected cache write failure".to_string())
+        })
+        .expect_err("cache write should fail");
+
+        assert_eq!(error, "injected cache write failure");
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing cache");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn atomic_cache_write_replaces_existing_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("cache.bin");
+        std::fs::write(&path, b"existing cache").expect("write existing cache");
+
+        write_cache_atomically(&path, |writer| {
+            writer
+                .write_all(b"replacement cache")
+                .map_err(|error| error.to_string())
+        })
+        .expect("replace cache");
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement cache");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_atomic_persist_removes_the_temporary_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let occupied = dir.path().join("occupied");
+        std::fs::create_dir(&occupied).expect("create occupied destination");
+
+        assert!(write_cache_atomically(&occupied, |writer| {
+            writer
+                .write_all(b"replacement cache")
+                .map_err(|error| error.to_string())
+        })
+        .is_err());
+
+        assert!(occupied.is_dir());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn oversized_cache_write_removes_an_existing_unusable_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file_path = dir.path().join("data.csv");
+        std::fs::write(&file_path, b"a\n").unwrap();
+        let mut key = cache_key(&file_path, None).unwrap();
+        key.len = u64::MAX;
+        let path = offsets_cache_path(dir.path(), key);
+        std::fs::write(&path, b"stale cache").unwrap();
+        let oversized_count = (MAX_CACHE_ALLOCATION_BYTES / 8 + 1) as usize;
+
+        assert!(validate_cache_payload(&path, key, oversized_count, "Offset").is_err());
+        assert!(!path.exists());
     }
 
     #[test]
@@ -443,6 +699,38 @@ mod tests {
         bytes[56..64].copy_from_slice(&u64::MAX.to_le_bytes());
         std::fs::write(&offsets_path, bytes).unwrap();
         assert!(read_offsets_cache(&offsets_path, key).unwrap().is_none());
+    }
+
+    #[test]
+    fn warnings_cache_rejects_valid_json_with_modified_diagnostics() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file_path = dir.path().join("data.csv");
+        std::fs::write(&file_path, b"a\n1\n").unwrap();
+        let key = cache_key(&file_path, None).unwrap();
+        let warnings_path = warnings_cache_path(dir.path(), key);
+        let warnings = vec![ParseWarning {
+            record: Some(123),
+            line: Some(4),
+            byte: Some(8),
+            field: Some(1),
+            kind: "test".to_string(),
+            message: "test warning".to_string(),
+            expected_len: Some(2),
+            len: Some(3),
+        }];
+        write_warnings_cache(&warnings_path, key, &warnings).unwrap();
+        assert_eq!(
+            read_warnings_cache(&warnings_path, key).unwrap().unwrap()[0].record,
+            Some(123)
+        );
+
+        let bytes = std::fs::read(&warnings_path).unwrap();
+        let json = String::from_utf8(bytes).unwrap();
+        let modified = json.replacen("\"record\":123", "\"record\":124", 1);
+        assert_ne!(modified, json);
+        std::fs::write(&warnings_path, modified).unwrap();
+
+        assert!(read_warnings_cache(&warnings_path, key).unwrap().is_none());
     }
 
     #[test]
@@ -501,5 +789,20 @@ mod tests {
 
         let wrong_direction = read_order_cache(&order_path, key, 2, false).expect("read order");
         assert!(wrong_direction.is_none());
+
+        let mut invalid_direction = std::fs::read(&order_path).unwrap();
+        invalid_direction[60] = 2;
+        std::fs::write(&order_path, invalid_direction).unwrap();
+        assert!(read_order_cache(&order_path, key, 2, false)
+            .expect("read invalid direction")
+            .is_none());
+
+        write_order_cache(&order_path, key, 2, true, &order).unwrap();
+        let mut corrupted = std::fs::read(&order_path).unwrap();
+        corrupted[69] ^= 0xff;
+        std::fs::write(&order_path, corrupted).unwrap();
+        assert!(read_order_cache(&order_path, key, 2, true)
+            .expect("read corrupted order")
+            .is_none());
     }
 }

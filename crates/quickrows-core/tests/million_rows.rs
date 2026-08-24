@@ -19,6 +19,7 @@ fn million_row_open_query_sort_copy_delete_restore_and_save() {
     assert!(source.is_file(), "generate {} first", source.display());
     let temp = tempfile::tempdir().unwrap();
     let cancellation = CancellationToken::new();
+    let total_started = Instant::now();
     let open_started = Instant::now();
     let mut document = CsvDocument::open_cancellable_cached(
         &source,
@@ -56,6 +57,7 @@ fn million_row_open_query_sort_copy_delete_restore_and_save() {
     );
     assert_eq!(all_matches, matches);
 
+    let sort_started = Instant::now();
     document
         .sort_cancellable(
             Some(SortSpec {
@@ -65,29 +67,45 @@ fn million_row_open_query_sort_copy_delete_restore_and_save() {
             &cancellation,
         )
         .unwrap();
+    eprintln!("million-row sort: {:?}", sort_started.elapsed());
+
+    let copy_started = Instant::now();
     let copied = document
         .serialize_display_rows_cancellable(&(0..10_000).collect::<Vec<_>>(), &cancellation)
         .unwrap();
+    eprintln!(
+        "million-row copy 10,000: {:?} ({} bytes)",
+        copy_started.elapsed(),
+        copied.len()
+    );
     assert!(!copied.is_empty());
 
     let rows = (0..document.row_count()).collect::<Vec<_>>();
+    let delete_started = Instant::now();
     assert_eq!(
         document
             .set_display_rows_deleted_cancellable(&rows, true, &cancellation)
             .unwrap(),
         rows.len()
     );
+    eprintln!("million-row delete: {:?}", delete_started.elapsed());
+
+    let restore_started = Instant::now();
     assert_eq!(
         document
             .set_display_rows_deleted_cancellable(&rows, false, &cancellation)
             .unwrap(),
         rows.len()
     );
+    eprintln!("million-row restore: {:?}", restore_started.elapsed());
 
     document
         .edit_cell(0, 0, "stress-edited".to_string())
         .unwrap();
     let output = temp.path().join("saved-million.csv");
+    let save_started = Instant::now();
     document.save_cancellable(&output, &cancellation).unwrap();
+    eprintln!("million-row save: {:?}", save_started.elapsed());
     assert!(output.metadata().unwrap().len() > 50 * 1024 * 1024);
+    eprintln!("million-row total: {:?}", total_started.elapsed());
 }

@@ -22,7 +22,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -35,6 +35,7 @@ use std::sync::{
 const DEFAULT_CACHE_CHUNKS: usize = 8;
 const SORT_CHUNK_SIZE: usize = 10_000;
 const INDEX_CHUNK_SIZE: usize = 10_000;
+const SAVE_IO_BUFFER_BYTES: usize = 1024 * 1024;
 const INDEX_MAX_CARDINALITY: usize = 500_000;
 
 fn line_ending(settings: &ParseSettings) -> &'static str {
@@ -79,9 +80,14 @@ fn push_csv_record(output: &mut String, fields: &[String], settings: &ParseSetti
     }
 }
 
-fn encode_csv_text(text: &str, settings: &ParseSettings) -> Result<Vec<u8>, String> {
+fn encode_csv_text_into(
+    text: &str,
+    settings: &ParseSettings,
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
+    output.clear();
     if settings.encoding == encoding_rs::UTF_16LE || settings.encoding == encoding_rs::UTF_16BE {
-        let mut output = Vec::with_capacity(text.len().saturating_mul(2).saturating_add(2));
+        output.reserve(text.len().saturating_mul(2).saturating_add(2));
         if settings.source_bom {
             if settings.encoding == encoding_rs::UTF_16LE {
                 output.extend_from_slice(&[0xff, 0xfe]);
@@ -97,7 +103,7 @@ fn encode_csv_text(text: &str, settings: &ParseSettings) -> Result<Vec<u8>, Stri
             };
             output.extend_from_slice(&bytes);
         }
-        return Ok(output);
+        return Ok(());
     }
 
     let (encoded, _, had_errors) = settings.encoding.encode(text);
@@ -107,12 +113,48 @@ fn encode_csv_text(text: &str, settings: &ParseSettings) -> Result<Vec<u8>, Stri
             settings.encoding_label
         ));
     }
-    let mut output = Vec::with_capacity(encoded.len() + 3);
+    output.reserve(encoded.len().saturating_add(3));
     if settings.source_bom && settings.encoding == encoding_rs::UTF_8 {
         output.extend_from_slice(&[0xef, 0xbb, 0xbf]);
     }
     output.extend_from_slice(encoded.as_ref());
-    Ok(output)
+    Ok(())
+}
+
+fn write_encoded_csv_text<W: Write + ?Sized>(
+    output: &mut W,
+    text: &str,
+    settings: &ParseSettings,
+    encoded: &mut Vec<u8>,
+) -> Result<(), String> {
+    if settings.encoding == encoding_rs::UTF_8 {
+        if settings.source_bom {
+            output
+                .write_all(&[0xef, 0xbb, 0xbf])
+                .map_err(|error| error.to_string())?;
+        }
+        return output
+            .write_all(text.as_bytes())
+            .map_err(|error| error.to_string());
+    }
+
+    encode_csv_text_into(text, settings, encoded)?;
+    output.write_all(encoded).map_err(|error| error.to_string())
+}
+
+fn write_csv_record<W: Write + ?Sized>(
+    output: &mut W,
+    fields: &[String],
+    csv_settings: &ParseSettings,
+    encoding_settings: &ParseSettings,
+    terminator: &str,
+    record: &mut String,
+    encoded: &mut Vec<u8>,
+) -> Result<(), String> {
+    record.clear();
+    push_csv_record(record, fields, csv_settings);
+    record.push_str(terminator);
+    write_encoded_csv_text(output, record, encoding_settings, encoded)
 }
 
 #[derive(Debug)]
@@ -505,6 +547,7 @@ impl CsvDocument {
             },
             None => (None, None, None, None),
         };
+        let loaded_offsets_from_cache = cached_offsets.is_some();
         let offsets = if let Some(offsets) = cached_offsets {
             if let Some(cached_warnings) = cached_warnings {
                 warnings.extend(cached_warnings);
@@ -553,13 +596,17 @@ impl CsvDocument {
         if file_fingerprint(&path)? != source_fingerprint {
             return Err("CSV changed on disk while it was being opened".to_string());
         }
-        if let (Some(dir), Some(key)) = (&disk_cache_dir, disk_cache_key) {
-            let _ = write_offsets_cache(&offsets_cache_path(dir, key), key, &offsets);
-            let _ = write_warnings_cache(
-                &warnings_cache_path(dir, key),
-                key,
-                &warnings[header_warning_count..],
-            );
+        // A valid cache hit is already complete. Rewriting it would serialize every
+        // row offset again and turn warm opens into the slowest path.
+        if !loaded_offsets_from_cache {
+            if let (Some(dir), Some(key)) = (&disk_cache_dir, disk_cache_key) {
+                let _ = write_offsets_cache(&offsets_cache_path(dir, key), key, &offsets);
+                let _ = write_warnings_cache(
+                    &warnings_cache_path(dir, key),
+                    key,
+                    &warnings[header_warning_count..],
+                );
+            }
         }
         warnings.truncate(MAX_WARNING_COUNT);
         let metadata = CsvMetadata {
@@ -1591,86 +1638,99 @@ impl CsvDocument {
         let mut temporary = temporary_builder
             .tempfile_in(parent)
             .map_err(|e| e.to_string())?;
-        if self.settings.source_bom {
-            let bom: &[u8] = if self.settings.encoding == encoding_rs::UTF_16LE {
-                &[0xff, 0xfe]
-            } else if self.settings.encoding == encoding_rs::UTF_16BE {
-                &[0xfe, 0xff]
-            } else if self.settings.encoding == encoding_rs::UTF_8 {
-                &[0xef, 0xbb, 0xbf]
-            } else {
-                &[]
-            };
-            temporary
-                .as_file_mut()
-                .write_all(bom)
-                .map_err(|e| e.to_string())?;
-        }
         let mut record_settings = self.settings.clone();
         record_settings.source_bom = false;
         let terminator = line_ending(&self.settings);
-        if self.settings.excel_sep {
-            let directive = format!("sep={}{}", self.settings.delimiter, terminator);
-            let encoded = encode_csv_text(&directive, &record_settings)?;
-            temporary
-                .as_file_mut()
-                .write_all(&encoded)
-                .map_err(|error| error.to_string())?;
-        }
-        let write_record = |output: &mut dyn Write, fields: &[String]| -> Result<(), String> {
-            let mut record = String::new();
-            push_csv_record(&mut record, fields, &self.settings);
-            record.push_str(terminator);
-            let encoded = encode_csv_text(&record, &record_settings)?;
-            output
-                .write_all(&encoded)
-                .map_err(|error| error.to_string())
-        };
         let mut comments = self.comments.iter().peekable();
-        let mut write_comments =
-            |output: &mut dyn Write, before_record: usize| -> Result<(), String> {
+        {
+            let mut output =
+                BufWriter::with_capacity(SAVE_IO_BUFFER_BYTES, temporary.as_file_mut());
+            if self.settings.source_bom {
+                let bom: &[u8] = if self.settings.encoding == encoding_rs::UTF_16LE {
+                    &[0xff, 0xfe]
+                } else if self.settings.encoding == encoding_rs::UTF_16BE {
+                    &[0xfe, 0xff]
+                } else if self.settings.encoding == encoding_rs::UTF_8 {
+                    &[0xef, 0xbb, 0xbf]
+                } else {
+                    &[]
+                };
+                output.write_all(bom).map_err(|e| e.to_string())?;
+            }
+
+            let mut record = String::new();
+            let mut encoded = Vec::new();
+            let mut comment_text = String::new();
+            if self.settings.excel_sep {
+                comment_text.push_str("sep=");
+                comment_text.push(self.settings.delimiter);
+                comment_text.push_str(terminator);
+                write_encoded_csv_text(&mut output, &comment_text, &record_settings, &mut encoded)?;
+                comment_text.clear();
+            }
+
+            let mut write_comments = |output: &mut dyn Write,
+                                      before_record: usize,
+                                      text: &mut String,
+                                      encoded: &mut Vec<u8>|
+             -> Result<(), String> {
                 while comments
                     .peek()
                     .is_some_and(|comment| comment.before_record <= before_record)
                 {
                     let comment = comments.next().expect("peeked comment must exist");
-                    let text = format!("{}{}", comment.text, terminator);
-                    let encoded = encode_csv_text(&text, &record_settings)?;
-                    output
-                        .write_all(&encoded)
-                        .map_err(|error| error.to_string())?;
+                    text.clear();
+                    text.push_str(&comment.text);
+                    text.push_str(terminator);
+                    write_encoded_csv_text(output, text, &record_settings, encoded)?;
                 }
                 Ok(())
             };
 
-        write_comments(temporary.as_file_mut(), 0)?;
-        if self.settings.has_headers && !self.metadata.headers.is_empty() {
-            write_record(temporary.as_file_mut(), &self.metadata.headers)?;
-        }
-        for start in (0..self.row_count()).step_by(INDEX_CHUNK_SIZE) {
-            cancellation.map(CancellationToken::check).transpose()?;
-            let end = start.saturating_add(INDEX_CHUNK_SIZE).min(self.row_count());
-            let source_rows = (start..end).collect::<Vec<_>>();
-            for (source_row, mut row) in source_rows
-                .iter()
-                .copied()
-                .zip(self.read_source_rows(&source_rows)?)
-            {
+            write_comments(&mut output, 0, &mut comment_text, &mut encoded)?;
+            if self.settings.has_headers && !self.metadata.headers.is_empty() {
+                write_csv_record(
+                    &mut output,
+                    &self.metadata.headers,
+                    &self.settings,
+                    &record_settings,
+                    terminator,
+                    &mut record,
+                    &mut encoded,
+                )?;
+            }
+            let mut source_rows = Vec::with_capacity(INDEX_CHUNK_SIZE);
+            for start in (0..self.row_count()).step_by(INDEX_CHUNK_SIZE) {
                 cancellation.map(CancellationToken::check).transpose()?;
-                let source_record = source_row + usize::from(self.settings.has_headers);
-                write_comments(temporary.as_file_mut(), source_record)?;
-                if self.edits.is_deleted(source_row) {
-                    continue;
+                let end = start.saturating_add(INDEX_CHUNK_SIZE).min(self.row_count());
+                source_rows.clear();
+                source_rows.extend(start..end);
+                let rows = self.read_source_rows(&source_rows)?;
+                for (source_row, mut row) in source_rows.iter().copied().zip(rows) {
+                    cancellation.map(CancellationToken::check).transpose()?;
+                    let source_record = source_row + usize::from(self.settings.has_headers);
+                    write_comments(&mut output, source_record, &mut comment_text, &mut encoded)?;
+                    if self.edits.is_deleted(source_row) {
+                        continue;
+                    }
+                    self.edits.apply(source_row, &mut row);
+                    write_csv_record(
+                        &mut output,
+                        &row,
+                        &self.settings,
+                        &record_settings,
+                        terminator,
+                        &mut record,
+                        &mut encoded,
+                    )?;
                 }
-                self.edits.apply(source_row, &mut row);
-                write_record(temporary.as_file_mut(), &row)?;
+                if let Some(progress) = progress {
+                    progress(end, self.row_count());
+                }
             }
-            if let Some(progress) = progress {
-                progress(end, self.row_count());
-            }
+            write_comments(&mut output, usize::MAX, &mut comment_text, &mut encoded)?;
+            output.flush().map_err(|error| error.to_string())?;
         }
-        write_comments(temporary.as_file_mut(), usize::MAX)?;
-        temporary.as_file().sync_all().map_err(|e| e.to_string())?;
         cancellation.map(CancellationToken::check).transpose()?;
 
         // Parse the exact bytes to be committed before replacing the user's
@@ -3266,6 +3326,44 @@ mod tests {
     }
 
     #[test]
+    fn save_flushes_multiple_output_buffers() {
+        const ROW_COUNT: usize = 20_000;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("buffered.csv");
+        let mut contents = String::with_capacity(SAVE_IO_BUFFER_BYTES * 3);
+        let payload = "x".repeat(128);
+        contents.push_str("id,value\n");
+        for row in 0..ROW_COUNT {
+            contents.push_str(&row.to_string());
+            contents.push(',');
+            contents.push_str(&payload);
+            contents.push('\n');
+        }
+        std::fs::write(&path, contents).unwrap();
+        let mut document = CsvDocument::open(
+            &path,
+            Some(ParseOverrides {
+                has_headers: Some(true),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        document
+            .edit_cell(ROW_COUNT - 1, 1, "updated".to_string())
+            .unwrap();
+        let output = dir.path().join("buffered-output.csv");
+
+        document.save(&output).unwrap();
+
+        assert!(std::fs::metadata(output).unwrap().len() > (SAVE_IO_BUFFER_BYTES * 2) as u64);
+        assert_eq!(
+            document.display_rows(ROW_COUNT - 1, 1).unwrap()[0].1[1],
+            "updated"
+        );
+    }
+
+    #[test]
     fn serializes_display_rows_with_csv_settings_and_without_trailing_terminator() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("semicolon.csv");
@@ -3937,19 +4035,36 @@ mod tests {
             has_headers: Some(true),
             ..Default::default()
         };
-        let mut doc =
-            CsvDocument::open_cached(&path, Some(overrides.clone()), None, &cache_root).unwrap();
-        doc.sort(Some(SortSpec {
+        let sort = SortSpec {
             column: 0,
             direction: SortDirection::Ascending,
-        }))
-        .unwrap();
-        let cache_dir = cache_root.join("csv-index-cache");
-        let entries = std::fs::read_dir(&cache_dir).unwrap().count();
-        assert!(entries >= 2, "offset and sort caches should both exist");
+        };
+        let mut document =
+            CsvDocument::open_cached(&path, Some(overrides.clone()), None, &cache_root).unwrap();
+        document.sort(Some(sort)).unwrap();
+        let cache_dir = document.disk_cache_dir.clone().unwrap();
+        let cache_key = document.disk_cache_key.unwrap();
+        let offsets_path = offsets_cache_path(&cache_dir, cache_key);
+        let warnings_path = warnings_cache_path(&cache_dir, cache_key);
+        let order_path = order_cache_path(&cache_dir, cache_key, sort.column, true);
+        assert!(offsets_path.is_file());
+        assert!(warnings_path.is_file());
+        assert!(order_path.is_file());
+
+        let order_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&order_path)
+            .unwrap();
+        let marker = std::time::SystemTime::now() + std::time::Duration::from_secs(60 * 60);
+        order_file
+            .set_times(std::fs::FileTimes::new().set_modified(marker))
+            .unwrap();
+        let marked_modified = order_file.metadata().unwrap().modified().unwrap();
+        drop(order_file);
+        drop(document);
 
         let progress = std::cell::Cell::new(0);
-        let reopened = CsvDocument::open_cached(
+        let mut reopened = CsvDocument::open_cached(
             &path,
             Some(overrides),
             Some(&|rows| progress.set(rows)),
@@ -3957,6 +4072,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(progress.get(), reopened.row_count());
+        reopened.sort(Some(sort)).unwrap();
+        assert_eq!(reopened.display_rows(0, 2).unwrap()[0].1[0], "a");
+        assert_eq!(
+            std::fs::metadata(order_path).unwrap().modified().unwrap(),
+            marked_modified
+        );
+    }
+
+    #[test]
+    fn cached_open_does_not_rewrite_valid_offset_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cached.csv");
+        let cache_root = dir.path().join("cache");
+        std::fs::write(&path, "name,value\nb,2\na,1\n").unwrap();
+        let overrides = ParseOverrides {
+            has_headers: Some(true),
+            ..Default::default()
+        };
+        let document =
+            CsvDocument::open_cached(&path, Some(overrides.clone()), None, &cache_root).unwrap();
+        let cache_dir = document.disk_cache_dir.clone().unwrap();
+        let cache_key = document.disk_cache_key.unwrap();
+        let offsets_path = offsets_cache_path(&cache_dir, cache_key);
+        drop(document);
+
+        let offsets = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&offsets_path)
+            .unwrap();
+        let marker = std::time::SystemTime::now() + std::time::Duration::from_secs(60 * 60);
+        offsets
+            .set_times(std::fs::FileTimes::new().set_modified(marker))
+            .unwrap();
+        let marked_modified = offsets.metadata().unwrap().modified().unwrap();
+        drop(offsets);
+
+        let reopened = CsvDocument::open_cached(&path, Some(overrides), None, &cache_root).unwrap();
+        assert_eq!(reopened.row_count(), 2);
+        assert_eq!(
+            std::fs::metadata(offsets_path).unwrap().modified().unwrap(),
+            marked_modified
+        );
     }
 
     #[test]
