@@ -21,3 +21,23 @@ Suggested stress pass:
 8. Delete and restore a large selection.
 9. Save As, reopen, and verify record count and CRLF/quoted fields.
 10. Repeat open and sort to verify persistent offset/sort cache reuse.
+
+Run the permanent core performance probe in the optimized benchmark profile:
+
+```bash
+cargo bench -p quickrows-core --bench million_rows
+```
+
+It reports JSON lines containing median timings for uncached, cold-cache, and
+warm-cache opens; clean sorting; clean and dirty searches; and save-after-edit.
+The default is seven samples per operation and three save samples. Override them
+for a quick local pass with `QUICKROWS_BENCH_SAMPLES` and
+`QUICKROWS_BENCH_SAVE_SAMPLES`. Set `QUICKROWS_MILLION_FIXTURE` to benchmark a
+fixture outside `test-data/`.
+
+For stable comparisons, use the same release toolchain and fixture, close other
+I/O-heavy applications, and record both elapsed time and peak resident memory.
+Treat median regressions above 10% or peak-memory growth above the greater of
+10% and 16 MiB as requiring investigation rather than as automatic proof of a
+code regression on shared CI hardware. The latest pinned-machine reference
+results are recorded in [`docs/performance.md`](../docs/performance.md).

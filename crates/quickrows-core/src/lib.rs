@@ -12,6 +12,7 @@ pub mod fragment;
 pub mod mmap;
 pub mod ops;
 pub mod settings;
+mod source_snapshot;
 
 pub use cache::CsvCache;
 pub use csv::{

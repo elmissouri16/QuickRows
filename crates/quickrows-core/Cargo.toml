@@ -21,3 +21,7 @@ tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[[bench]]
+name = "million_rows"
+harness = false

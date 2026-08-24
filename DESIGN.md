@@ -22,6 +22,8 @@ Buttons in the document command bar and Find/Duplicates strips use compact geome
 - Ghost: routine document commands, scope, navigation, clear, close, and settings utilities.
 - Default: the empty-workspace file-entry action, Save as the document-state action, and stateful query toggles.
 
+Multi-value Find and Duplicates scopes use compact ghost dropdown pickers. Binary query options such as match case and whole word remain compact default toggles.
+
 The native window title owns document identity; do not repeat the filename in the command bar. The command bar stays on one line and groups commands as File, Selection, and Analysis. Below 900 px, familiar actions become icon-only controls with text tooltips instead of wrapping onto another line.
 
 Use GPUI Component's existing `Button` modifiers rather than custom button colors or a parallel wrapper component.

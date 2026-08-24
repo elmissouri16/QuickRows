@@ -46,6 +46,10 @@ use std::time::Duration;
 
 const BASE_TITLE: &str = "QuickRows";
 const MIN_COLUMN_WIDTH: f32 = 120.0;
+const ROW_INDEX_WIDTH: f32 = 72.0;
+const TABLE_SCROLLBAR_THICKNESS: f32 = 16.0;
+const MIN_TABLE_WIDTH: f32 = 640.0;
+const COLUMN_OVERSCAN_WIDTH: f32 = MIN_COLUMN_WIDTH * 2.0;
 const COLUMN_RESIZE_HANDLE_WIDTH: f32 = 8.0;
 const DELETE_CONFIRM_THRESHOLD: usize = 1_000;
 const COPY_CONFIRM_THRESHOLD: usize = 5_000;
@@ -98,7 +102,7 @@ struct QueryProgress {
 #[derive(Clone)]
 struct CachedRow {
     source_row: usize,
-    cells: Vec<String>,
+    cells: Arc<[SharedString]>,
     deleted: bool,
 }
 
@@ -120,6 +124,50 @@ struct ColumnResize {
     column: usize,
     start_x: f32,
     start_width: f32,
+}
+
+#[derive(Clone)]
+struct ColumnLayout {
+    widths: Arc<[f32]>,
+    offsets: Arc<[f32]>,
+}
+
+impl ColumnLayout {
+    fn from_settings(column_count: usize, settings: &AppSettings) -> Self {
+        let widths = (0..column_count)
+            .map(|column| {
+                settings
+                    .column_widths
+                    .get(column)
+                    .copied()
+                    .unwrap_or(settings.column_width)
+                    .max(MIN_COLUMN_WIDTH)
+            })
+            .collect::<Vec<_>>();
+        let mut offsets = Vec::with_capacity(column_count.saturating_add(1));
+        offsets.push(0.0);
+        for width in &widths {
+            let next = (offsets.last().copied().unwrap_or_default() + width).min(f32::MAX);
+            offsets.push(next);
+        }
+        Self {
+            widths: Arc::from(widths),
+            offsets: Arc::from(offsets),
+        }
+    }
+
+    fn width(&self, column: usize) -> f32 {
+        self.widths.get(column).copied().unwrap_or_default()
+    }
+
+    fn total_width(&self) -> f32 {
+        self.offsets.last().copied().unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ColumnRenderPlan {
+    runs: Vec<std::ops::Range<usize>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -213,6 +261,12 @@ enum RowMutation {
 }
 
 #[derive(Clone, Copy)]
+enum QueryScopeKind {
+    Search,
+    Duplicates,
+}
+
+#[derive(Clone, Copy)]
 enum SettingsChoice {
     Theme(ThemePreference),
     Density(RowDensity),
@@ -266,7 +320,8 @@ enum PendingDestructiveAction {
 struct LoadedDocument {
     document: Arc<Mutex<CsvDocument>>,
     path: PathBuf,
-    headers: Vec<String>,
+    headers: Arc<[String]>,
+    header_labels: Arc<[SharedString]>,
     row_count: usize,
     detected_parse_info: ParseInfo,
     parse_info: ParseInfo,
@@ -344,6 +399,7 @@ struct QuickRowsView {
     open_request_id: u64,
     row_scroll: UniformListScrollHandle,
     column_scroll: ScrollHandle,
+    column_layout: Option<ColumnLayout>,
 }
 
 fn fragment_regions_to_selection(
@@ -571,6 +627,7 @@ impl QuickRowsView {
             open_request_id: 0,
             row_scroll: UniformListScrollHandle::new(),
             column_scroll: ScrollHandle::new(),
+            column_layout: None,
         };
         if let Some(path) = view.pending_initial_path.take() {
             view.open_path(path, cx);
@@ -602,6 +659,7 @@ impl QuickRowsView {
                 .resize(column + 1, default_width);
         }
         self.settings.column_widths[column] = width.max(MIN_COLUMN_WIDTH);
+        self.column_layout = None;
     }
 
     fn begin_column_resize(&mut self, column: usize, start_x: f32, cx: &mut Context<Self>) {
@@ -706,7 +764,12 @@ impl QuickRowsView {
                     start + offset,
                     CachedRow {
                         source_row,
-                        cells,
+                        cells: Arc::from(
+                            cells
+                                .into_iter()
+                                .map(SharedString::from)
+                                .collect::<Vec<_>>(),
+                        ),
                         deleted,
                     },
                 )
@@ -976,14 +1039,10 @@ impl QuickRowsView {
                     if this.loading && this.operation_kind == Some(kind) && request_is_current {
                         match kind {
                             OperationKind::Search => {
-                                this.search_results.extend(pending);
-                                this.search_results.sort_unstable();
-                                this.search_results.dedup();
+                                merge_sorted_unique(&mut this.search_results, pending);
                             }
                             OperationKind::Duplicates => {
-                                this.duplicate_results.extend(pending);
-                                this.duplicate_results.sort_unstable();
-                                this.duplicate_results.dedup();
+                                merge_sorted_unique(&mut this.duplicate_results, pending);
                             }
                             _ => {}
                         }
@@ -1203,6 +1262,8 @@ impl QuickRowsView {
                         let show_header_prompt =
                             prompt_if_no_headers && !document.metadata().detected.has_headers;
                         let headers = document.metadata().headers.clone();
+                        let header_labels = cache_header_labels(&headers);
+                        let headers = Arc::from(headers);
                         let row_count = document.row_count();
                         let detected_parse_info = document.metadata().detected.clone();
                         let parse_info = document.metadata().effective.clone();
@@ -1214,6 +1275,7 @@ impl QuickRowsView {
                             document: Arc::new(Mutex::new(document)),
                             path,
                             headers,
+                            header_labels,
                             row_count,
                             detected_parse_info,
                             parse_info,
@@ -1298,6 +1360,8 @@ impl QuickRowsView {
                         let show_header_prompt =
                             prompt_if_no_headers && !document.metadata().detected.has_headers;
                         let headers = document.metadata().headers.clone();
+                        let header_labels = cache_header_labels(&headers);
+                        let headers = Arc::from(headers);
                         let row_count = document.row_count();
                         let detected_parse_info = document.metadata().detected.clone();
                         let parse_info = document.metadata().effective.clone();
@@ -1307,6 +1371,7 @@ impl QuickRowsView {
                             document: Arc::new(Mutex::new(document)),
                             path,
                             headers,
+                            header_labels,
                             row_count,
                             detected_parse_info,
                             parse_info,
@@ -1413,6 +1478,7 @@ impl QuickRowsView {
         self.search_request_id = self.search_request_id.wrapping_add(1);
         self.duplicate_request_id = self.duplicate_request_id.wrapping_add(1);
         self.loaded = None;
+        self.column_layout = None;
         self.clear_cell_editor();
         self.invalidate_row_cache();
         self.clear_selection();
@@ -1539,6 +1605,7 @@ impl QuickRowsView {
         match self.pending_destructive.take() {
             Some(PendingDestructiveAction::Open(path)) => {
                 self.loaded = None;
+                self.column_layout = None;
                 self.open_path(path, cx);
             }
             Some(PendingDestructiveAction::Reload) => {
@@ -1711,7 +1778,9 @@ impl QuickRowsView {
                         if let Some(loaded) = &mut this.loaded {
                             loaded.path = path.clone();
                             if let Ok(document) = loaded.document.lock() {
-                                loaded.headers = document.metadata().headers.clone();
+                                let headers = document.metadata().headers.clone();
+                                loaded.header_labels = cache_header_labels(&headers);
+                                loaded.headers = Arc::from(headers);
                                 loaded.row_count = document.row_count();
                                 loaded.detected_parse_info = document.metadata().detected.clone();
                                 loaded.parse_info = document.metadata().effective.clone();
@@ -1748,6 +1817,7 @@ impl QuickRowsView {
                             }
                             Some(PendingDestructiveAction::Clear) => {
                                 this.loaded = None;
+                                this.column_layout = None;
                                 this.invalidate_row_cache();
                                 this.clear_selection();
                                 this.show_find = false;
@@ -1852,13 +1922,11 @@ impl QuickRowsView {
         self.duplicate_check_has_completed = false;
     }
 
-    fn cycle_search_column(&mut self, cx: &mut Context<Self>) {
-        let column_count = self
-            .loaded
-            .as_ref()
-            .map(|loaded| loaded.headers.len())
-            .unwrap_or(0);
-        self.search_column = next_column_scope(self.search_column, column_count);
+    fn select_search_column(&mut self, column: Option<usize>, cx: &mut Context<Self>) {
+        if self.loading || self.search_column == column {
+            return;
+        }
+        self.search_column = column;
         self.schedule_search(cx);
     }
 
@@ -2002,7 +2070,7 @@ impl QuickRowsView {
     }
 
     fn next_search_result(&mut self, cx: &mut Context<Self>) {
-        if !self.search_stale && !self.search_results.is_empty() {
+        if !self.loading && !self.search_stale && !self.search_results.is_empty() {
             self.current_match = (self.current_match + 1) % self.search_results.len();
             self.select_current_match();
             cx.notify();
@@ -2010,7 +2078,7 @@ impl QuickRowsView {
     }
 
     fn previous_search_result(&mut self, cx: &mut Context<Self>) {
-        if !self.search_stale && !self.search_results.is_empty() {
+        if !self.loading && !self.search_stale && !self.search_results.is_empty() {
             self.current_match = if self.current_match == 0 {
                 self.search_results.len() - 1
             } else {
@@ -2047,13 +2115,11 @@ impl QuickRowsView {
         cx.notify();
     }
 
-    fn cycle_duplicate_column(&mut self, cx: &mut Context<Self>) {
-        let column_count = self
-            .loaded
-            .as_ref()
-            .map(|loaded| loaded.headers.len())
-            .unwrap_or(0);
-        self.duplicate_column = next_column_scope(self.duplicate_column, column_count);
+    fn select_duplicate_column(&mut self, column: Option<usize>, cx: &mut Context<Self>) {
+        if self.loading || self.duplicate_column == column {
+            return;
+        }
+        self.duplicate_column = column;
         self.duplicate_stale = !self.duplicate_results.is_empty();
         self.duplicate_check_has_completed = false;
         cx.notify();
@@ -2152,7 +2218,7 @@ impl QuickRowsView {
     }
 
     fn previous_duplicate(&mut self, cx: &mut Context<Self>) {
-        if self.duplicate_stale || self.duplicate_results.is_empty() {
+        if self.loading || self.duplicate_stale || self.duplicate_results.is_empty() {
             return;
         }
         self.current_duplicate_match = if self.current_duplicate_match == 0 {
@@ -2165,7 +2231,7 @@ impl QuickRowsView {
     }
 
     fn next_duplicate(&mut self, cx: &mut Context<Self>) {
-        if self.duplicate_stale || self.duplicate_results.is_empty() {
+        if self.loading || self.duplicate_stale || self.duplicate_results.is_empty() {
             return;
         }
         self.current_duplicate_match =
@@ -2540,9 +2606,9 @@ impl QuickRowsView {
             .row_cache
             .get_mut(&editing.display_row)
             .filter(|row| row.source_row == editing.source_row)
-            && let Some(cell) = row.cells.get_mut(editing.column)
+            && let Some(cell) = Arc::make_mut(&mut row.cells).get_mut(editing.column)
         {
-            *cell = value.clone();
+            *cell = SharedString::from(value.clone());
         }
         self.cell_commit_queue.push_back(CellCommit {
             editing,
@@ -2618,10 +2684,10 @@ impl QuickRowsView {
                                 .row_cache
                                 .get_mut(&display_row)
                                 .filter(|row| row.source_row == source_row)
-                                && let Some(cell) = row.cells.get_mut(column)
-                                && *cell == committed_value
+                                && let Some(cell) = Arc::make_mut(&mut row.cells).get_mut(column)
+                                && cell.as_ref() == committed_value
                             {
-                                *cell = initial_value;
+                                *cell = SharedString::from(initial_value);
                             }
                             if this.cell_commit_queue.is_empty() && this.editing_cell.is_none() {
                                 this.editing_cell = Some(editing);
@@ -4628,25 +4694,45 @@ impl QuickRowsView {
             return self.render_empty(cx);
         };
         let headers = loaded.headers.clone();
+        let header_labels = loaded.header_labels.clone();
         let row_count = loaded.row_count;
+        let filename = display_name(&loaded.path);
+        let loaded_dirty = loaded.dirty;
+        let viewport_width =
+            (f32::from(window.viewport_size().width) - TABLE_SCROLLBAR_THICKNESS).max(0.0);
         let show_toolbar_labels = toolbar_shows_labels(f32::from(window.viewport_size().width));
         let show_index = self.settings.show_index;
         let row_height = self.settings.row_density.height();
-        let column_widths = self.settings.column_widths.clone();
-        let default_width = self.settings.column_width.max(MIN_COLUMN_WIDTH);
-        let table_width = (headers
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                column_widths
-                    .get(index)
-                    .copied()
-                    .unwrap_or(default_width)
-                    .max(MIN_COLUMN_WIDTH)
-            })
-            .sum::<f32>()
-            + if show_index { 72.0 } else { 0.0 })
-        .max(640.0);
+        if self
+            .column_layout
+            .as_ref()
+            .is_none_or(|layout| layout.widths.len() != headers.len())
+        {
+            self.column_layout = Some(ColumnLayout::from_settings(headers.len(), &self.settings));
+        }
+        let column_layout = self
+            .column_layout
+            .as_ref()
+            .expect("column layout is initialized")
+            .clone();
+        let leading_width = if show_index { ROW_INDEX_WIDTH } else { 0.0 };
+        let table_width = (leading_width + column_layout.total_width())
+            .min(f32::MAX)
+            .max(MIN_TABLE_WIDTH);
+        let scroll_left = (-f32::from(self.column_scroll.offset().x))
+            .clamp(0.0, (table_width - viewport_width).max(0.0));
+        let column_plan = column_render_plan(
+            &column_layout,
+            scroll_left,
+            viewport_width,
+            leading_width,
+            [
+                self.editing_cell.as_ref().map(|editing| editing.column),
+                self.resizing_column.as_ref().map(|resize| resize.column),
+            ]
+            .into_iter()
+            .flatten(),
+        );
         let selected_rows = self.selected_rows.clone();
         let selected_count = selected_rows.len();
         let cell_selection = self.cell_selection;
@@ -4693,10 +4779,10 @@ impl QuickRowsView {
                     .copied()
             })
             .flatten();
-        let filename = display_name(&loaded.path);
-        let dirty = loaded.dirty || self.pending_cell_commits > 0 || self.editing_draft_dirty;
-        let search_scope = column_scope_label(self.search_column, &headers);
-        let duplicate_scope = column_scope_label(self.duplicate_column, &headers);
+        let dirty = loaded_dirty || self.pending_cell_commits > 0 || self.editing_draft_dirty;
+        let search_scope = column_scope_label(self.search_column, &header_labels);
+        let duplicate_scope = column_scope_label(self.duplicate_column, &header_labels);
+        let query_view = self.self_weak.clone();
         let cell_search = (self.active_highlight == Some(ActiveHighlight::Search)
             && !self.search_stale)
             .then(|| {
@@ -4717,6 +4803,32 @@ impl QuickRowsView {
             BASE_TITLE
         ));
 
+        let header_columns = virtual_column_children(&column_layout, &column_plan, |index| {
+            header_cell(header_labels[index].clone(), column_layout.width(index), cx)
+                .id(("header", index))
+                .relative()
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| this.sort_column(index, cx)))
+                .child(
+                    div()
+                        .id(("column-resizer", index))
+                        .absolute()
+                        .right_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(COLUMN_RESIZE_HANDLE_WIDTH))
+                        .cursor_col_resize()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.begin_column_resize(index, f32::from(event.position.x), cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_click(|_, _, cx| cx.stop_propagation()),
+                )
+                .into_any_element()
+        });
         let header_content = h_flex()
             .w(px(table_width))
             .h(px(row_height))
@@ -4724,47 +4836,15 @@ impl QuickRowsView {
             .border_b_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().secondary.opacity(0.65))
-            .when(show_index, |this| this.child(header_cell("#", 72.0, cx)))
-            .children(headers.iter().enumerate().map(|(index, label)| {
-                let width = column_widths
-                    .get(index)
-                    .copied()
-                    .unwrap_or(default_width)
-                    .max(120.0);
-                let label = display_header_label(label, index);
-                header_cell(&label, width, cx)
-                    .id(("header", index))
-                    .relative()
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| this.sort_column(index, cx)))
-                    .child(
-                        div()
-                            .id(("column-resizer", index))
-                            .absolute()
-                            .right_0()
-                            .top_0()
-                            .bottom_0()
-                            .w(px(COLUMN_RESIZE_HANDLE_WIDTH))
-                            .cursor_col_resize()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                    this.begin_column_resize(
-                                        index,
-                                        f32::from(event.position.x),
-                                        cx,
-                                    );
-                                    cx.stop_propagation();
-                                }),
-                            )
-                            .on_click(|_, _, cx| cx.stop_propagation()),
-                    )
-            }));
+            .when(show_index, |this| {
+                this.child(header_cell("#", ROW_INDEX_WIDTH, cx))
+            })
+            .children(header_columns);
 
-        // GPUI Component's data table pattern shares one horizontal handle
-        // between the header, body, drag scrollbar, and ScrollableMask. Both
-        // surfaces are translated by GPUI at paint time, so virtual rows cannot
-        // lag behind the header while a scrollbar or trackpad gesture is active.
+        // GPUI Component's ScrollableMask and Scrollbar both notify the current
+        // view whenever they update this shared handle. Each wheel or thumb
+        // movement therefore rebuilds the virtual column plan before paint, and
+        // the header and body consume that same plan.
         let header = div()
             .id("table-header-scroll")
             .w_full()
@@ -4787,17 +4867,7 @@ impl QuickRowsView {
                         let can_edit = cached.is_some() && !is_deleted;
                         let editing_cell = this.editing_cell.clone();
                         let edit_input = this.edit_input.clone();
-                        let cells =
-                            cached
-                                .as_ref()
-                                .map(|row| row.cells.clone())
-                                .unwrap_or_else(|| {
-                                    let mut cells = vec![String::new(); headers.len()];
-                                    if let Some(first) = cells.first_mut() {
-                                        *first = "Loading…".to_string();
-                                    }
-                                    cells
-                                });
+                        let cells = cached.as_ref().map(|row| row.cells.clone());
                         let is_selected = selected_rows.contains(display_row);
                         let is_search_match =
                             source_row.is_some_and(|row| search_rows.contains(&row));
@@ -4852,7 +4922,7 @@ impl QuickRowsView {
                                     .map(|source_row| source_row + 1)
                                     .unwrap_or(display_row + 1);
                                 row.child(
-                                    body_cell(&index.to_string(), 72.0, cx)
+                                    body_cell(index.to_string(), ROW_INDEX_WIDTH, cx)
                                         .id(("row-index", display_row))
                                         .on_mouse_down(
                                             MouseButton::Right,
@@ -4872,85 +4942,97 @@ impl QuickRowsView {
                                         ),
                                 )
                             })
-                            .children(cells.into_iter().enumerate().map(|(index, value)| {
-                                let width = column_widths
-                                    .get(index)
-                                    .copied()
-                                    .unwrap_or(default_width)
-                                    .max(120.0);
-                                let is_cell_match = cell_search.as_ref().is_some_and(
-                                    |(query, column, match_case, whole_word)| {
-                                        column.is_none_or(|column| column == index)
-                                            && cell_matches_search(
-                                                &value,
-                                                query,
-                                                *match_case,
-                                                *whole_word,
+                            .children(virtual_column_children(
+                                &column_layout,
+                                &column_plan,
+                                |index| {
+                                    let value = cells
+                                        .as_ref()
+                                        .and_then(|cells| cells.get(index))
+                                        .cloned()
+                                        .unwrap_or_else(|| {
+                                            if cells.is_none() && index == 0 {
+                                                SharedString::from("Loading…")
+                                            } else {
+                                                SharedString::from("")
+                                            }
+                                        });
+                                    let width = column_layout.width(index);
+                                    let is_cell_match = cell_search.as_ref().is_some_and(
+                                        |(query, column, match_case, whole_word)| {
+                                            column.is_none_or(|column| column == index)
+                                                && cell_matches_search(
+                                                    value.as_ref(),
+                                                    query,
+                                                    *match_case,
+                                                    *whole_word,
+                                                )
+                                        },
+                                    );
+                                    let is_cell_selected =
+                                        cell_selection.is_some_and(|selection| {
+                                            selection.contains(display_row, index)
+                                        });
+                                    let is_editing = editing_cell.as_ref().is_some_and(|editing| {
+                                        editing.display_row == display_row
+                                            && editing.source_row
+                                                == source_row.unwrap_or(display_row)
+                                            && editing.column == index
+                                    });
+                                    if is_editing {
+                                        body_cell_frame(width, cx)
+                                            .id(SharedString::from(format!(
+                                                "cell-{display_row}-{index}-editor"
+                                            )))
+                                            .border_1()
+                                            .border_color(cx.theme().accent)
+                                            .child(
+                                                Input::new(&edit_input)
+                                                    .appearance(false)
+                                                    .bordered(false)
+                                                    .focus_bordered(false)
+                                                    .disabled(this.loading),
                                             )
-                                    },
-                                );
-                                let is_cell_selected = cell_selection.is_some_and(|selection| {
-                                    selection.contains(display_row, index)
-                                });
-                                let is_editing = editing_cell.as_ref().is_some_and(|editing| {
-                                    editing.display_row == display_row
-                                        && editing.source_row == source_row.unwrap_or(display_row)
-                                        && editing.column == index
-                                });
-                                if is_editing {
-                                    body_cell_frame(width, cx)
-                                        .id(SharedString::from(format!(
-                                            "cell-{display_row}-{index}-editor"
-                                        )))
-                                        .border_1()
-                                        .border_color(cx.theme().accent)
-                                        .child(
-                                            Input::new(&edit_input)
-                                                .appearance(false)
-                                                .bordered(false)
-                                                .focus_bordered(false)
-                                                .disabled(this.loading),
-                                        )
-                                        .into_any_element()
-                                } else {
-                                    let editor_value = value.clone();
-                                    let keyboard_value = value.clone();
-                                    let context_value = value.clone();
-                                    let source_row = source_row.unwrap_or(display_row);
-                                    body_cell(&value, width, cx)
-                                        .when(is_cell_match, |cell| {
-                                            cell.bg(cx.theme().info.opacity(0.32))
-                                                .border_1()
-                                                .border_color(cx.theme().info)
-                                        })
-                                        .when(is_cell_selected, |cell| {
-                                            cell.bg(cx.theme().selection)
-                                                .border_1()
-                                                .border_color(cx.theme().accent)
-                                        })
-                                        .id(SharedString::from(format!(
-                                            "cell-{display_row}-{index}"
-                                        )))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(
-                                                move |this, event: &MouseDownEvent, _, cx| {
-                                                    this.begin_cell_selection(
-                                                        display_row,
-                                                        index,
-                                                        event,
-                                                        cx,
-                                                    );
-                                                    cx.stop_propagation();
-                                                },
-                                            ),
-                                        )
-                                        .on_mouse_move(cx.listener(move |this, _, _, cx| {
-                                            this.drag_cell_selection(display_row, index, cx);
-                                        }))
-                                        .on_click(|_, _, cx| cx.stop_propagation())
-                                        .when(can_edit, |cell| {
-                                            cell.cursor_text()
+                                            .into_any_element()
+                                    } else {
+                                        let editor_value = value.clone();
+                                        let keyboard_value = value.clone();
+                                        let context_value = value.clone();
+                                        let source_row = source_row.unwrap_or(display_row);
+                                        body_cell(value, width, cx)
+                                            .when(is_cell_match, |cell| {
+                                                cell.bg(cx.theme().info.opacity(0.32))
+                                                    .border_1()
+                                                    .border_color(cx.theme().info)
+                                            })
+                                            .when(is_cell_selected, |cell| {
+                                                cell.bg(cx.theme().selection)
+                                                    .border_1()
+                                                    .border_color(cx.theme().accent)
+                                            })
+                                            .id(SharedString::from(format!(
+                                                "cell-{display_row}-{index}"
+                                            )))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    move |this, event: &MouseDownEvent, _, cx| {
+                                                        this.begin_cell_selection(
+                                                            display_row,
+                                                            index,
+                                                            event,
+                                                            cx,
+                                                        );
+                                                        cx.stop_propagation();
+                                                    },
+                                                ),
+                                            )
+                                            .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                                                this.drag_cell_selection(display_row, index, cx);
+                                            }))
+                                            .on_click(|_, _, cx| cx.stop_propagation())
+                                            .when(can_edit, |cell| {
+                                                cell.cursor_text()
                                                 .tab_index(0)
                                                 .on_click(cx.listener(
                                                     move |this,
@@ -4962,7 +5044,7 @@ impl QuickRowsView {
                                                                 display_row,
                                                                 source_row,
                                                                 index,
-                                                                editor_value.clone(),
+                                                                editor_value.to_string(),
                                                                 window,
                                                                 cx,
                                                             );
@@ -4980,39 +5062,40 @@ impl QuickRowsView {
                                                                 display_row,
                                                                 source_row,
                                                                 index,
-                                                                keyboard_value.clone(),
+                                                                keyboard_value.to_string(),
                                                                 window,
                                                                 cx,
                                                             );
                                                         }
                                                     },
                                                 ))
-                                        })
-                                        .on_mouse_down(
-                                            MouseButton::Right,
-                                            cx.listener(
-                                                move |this, event: &MouseDownEvent, _, cx| {
-                                                    this.context_cell = Some((
-                                                        display_row,
-                                                        source_row,
-                                                        index,
-                                                        context_value.clone(),
-                                                    ));
-                                                    this.table_context_menu =
-                                                        Some(TableContextMenu {
-                                                            position: event.position,
-                                                            kind: TableContextMenuKind::Cell {
-                                                                can_edit,
-                                                            },
-                                                            focused_item: 0,
-                                                        });
-                                                    cx.notify();
-                                                },
-                                            ),
-                                        )
-                                        .into_any_element()
-                                }
-                            }))
+                                            })
+                                            .on_mouse_down(
+                                                MouseButton::Right,
+                                                cx.listener(
+                                                    move |this, event: &MouseDownEvent, _, cx| {
+                                                        this.context_cell = Some((
+                                                            display_row,
+                                                            source_row,
+                                                            index,
+                                                            context_value.to_string(),
+                                                        ));
+                                                        this.table_context_menu =
+                                                            Some(TableContextMenu {
+                                                                position: event.position,
+                                                                kind: TableContextMenuKind::Cell {
+                                                                    can_edit,
+                                                                },
+                                                                focused_item: 0,
+                                                            });
+                                                        cx.notify();
+                                                    },
+                                                ),
+                                            )
+                                            .into_any_element()
+                                    }
+                                },
+                            ))
                     })
                     .collect::<Vec<_>>()
             }),
@@ -5188,16 +5271,17 @@ impl QuickRowsView {
                                 .text_color(cx.theme().accent)
                                 .child("FIND"),
                         )
-                        .child(
-                            Button::new("search-scope")
-                                .compact()
-                                .ghost()
-                                .label(search_scope)
-                                .disabled(self.loading)
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.cycle_search_column(cx)),
-                                ),
-                        )
+                        .child(query_scope_dropdown(
+                            "search-scope",
+                            search_scope,
+                            header_labels.clone(),
+                            self.search_column,
+                            self.loading,
+                            QueryScopeKind::Search,
+                            query_view.clone().expect(
+                                "QuickRows view identity is initialized before rendering query controls",
+                            ),
+                        ))
                         .child(Input::new(&self.search_input).flex_1().min_w(px(180.0)))
                         .child(
                             Button::new("search-match-case")
@@ -5238,7 +5322,11 @@ impl QuickRowsView {
                                 .compact()
                                 .ghost()
                                 .label("↑")
-                                .disabled(self.search_stale || self.search_results.is_empty())
+                                .disabled(
+                                    self.loading
+                                        || self.search_stale
+                                        || self.search_results.is_empty(),
+                                )
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.previous_match(&PreviousMatch, window, cx)
                                 })),
@@ -5248,7 +5336,11 @@ impl QuickRowsView {
                                 .compact()
                                 .ghost()
                                 .label("↓")
-                                .disabled(self.search_stale || self.search_results.is_empty())
+                                .disabled(
+                                    self.loading
+                                        || self.search_stale
+                                        || self.search_results.is_empty(),
+                                )
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.next_match(&NextMatch, window, cx)
                                 })),
@@ -5312,16 +5404,17 @@ impl QuickRowsView {
                                 .text_color(cx.theme().accent)
                                 .child("DUPLICATES"),
                         )
-                        .child(
-                            Button::new("duplicate-scope")
-                                .compact()
-                                .ghost()
-                                .label(duplicate_scope)
-                                .disabled(self.loading)
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.cycle_duplicate_column(cx)),
-                                ),
-                        )
+                        .child(query_scope_dropdown(
+                            "duplicate-scope",
+                            duplicate_scope,
+                            header_labels.clone(),
+                            self.duplicate_column,
+                            self.loading,
+                            QueryScopeKind::Duplicates,
+                            query_view.clone().expect(
+                                "QuickRows view identity is initialized before rendering query controls",
+                            ),
+                        ))
                         .child(
                             Button::new("run-duplicates")
                                 .compact()
@@ -5366,7 +5459,11 @@ impl QuickRowsView {
                                 .compact()
                                 .ghost()
                                 .label("↑")
-                                .disabled(self.duplicate_stale || self.duplicate_results.is_empty())
+                                .disabled(
+                                    self.loading
+                                        || self.duplicate_stale
+                                        || self.duplicate_results.is_empty(),
+                                )
                                 .on_click(
                                     cx.listener(|this, _, _, cx| this.previous_duplicate(cx)),
                                 ),
@@ -5376,7 +5473,11 @@ impl QuickRowsView {
                                 .compact()
                                 .ghost()
                                 .label("↓")
-                                .disabled(self.duplicate_stale || self.duplicate_results.is_empty())
+                                .disabled(
+                                    self.loading
+                                        || self.duplicate_stale
+                                        || self.duplicate_results.is_empty(),
+                                )
                                 .on_click(cx.listener(|this, _, _, cx| this.next_duplicate(cx))),
                         )
                         .child(
@@ -5910,6 +6011,55 @@ fn settings_section_title(label: &'static str, cx: &App) -> gpui::AnyElement {
         .into_any_element()
 }
 
+fn query_scope_dropdown(
+    id: &'static str,
+    label: SharedString,
+    headers: Arc<[SharedString]>,
+    selected: Option<usize>,
+    disabled: bool,
+    kind: QueryScopeKind,
+    view: WeakEntity<QuickRowsView>,
+) -> impl IntoElement {
+    Button::new(id)
+        .compact()
+        .ghost()
+        .label(format!("{label}  ▾"))
+        .disabled(disabled)
+        .dropdown_menu(move |menu, _, _| {
+            let entire_row_view = view.clone();
+            let menu = menu.item(
+                PopupMenuItem::new("Entire row")
+                    .checked(selected.is_none())
+                    .on_click(move |_, _, cx| {
+                        let _ = entire_row_view.update(cx, |this, cx| match kind {
+                            QueryScopeKind::Search => this.select_search_column(None, cx),
+                            QueryScopeKind::Duplicates => this.select_duplicate_column(None, cx),
+                        });
+                    }),
+            );
+            headers
+                .iter()
+                .enumerate()
+                .fold(menu, |menu, (column, label)| {
+                    let view = view.clone();
+                    menu.item(
+                        PopupMenuItem::new(label.clone())
+                            .checked(selected == Some(column))
+                            .on_click(move |_, _, cx| {
+                                let _ = view.update(cx, |this, cx| match kind {
+                                    QueryScopeKind::Search => {
+                                        this.select_search_column(Some(column), cx)
+                                    }
+                                    QueryScopeKind::Duplicates => {
+                                        this.select_duplicate_column(Some(column), cx)
+                                    }
+                                });
+                            }),
+                    )
+                })
+        })
+}
+
 fn settings_dropdown(
     id: &'static str,
     label: impl Into<SharedString>,
@@ -6149,6 +6299,50 @@ fn counted_noun(count: usize, singular: &'static str, plural: &'static str) -> &
     if count == 1 { singular } else { plural }
 }
 
+fn merge_sorted_unique(target: &mut Vec<usize>, mut incoming: Vec<usize>) {
+    if incoming.is_empty() {
+        return;
+    }
+    incoming.sort_unstable();
+    incoming.dedup();
+    if target.is_empty() {
+        *target = incoming;
+        return;
+    }
+    if target.last() < incoming.first() {
+        target.extend(incoming);
+        return;
+    }
+
+    let mut merged = Vec::with_capacity(target.len().saturating_add(incoming.len()));
+    let (mut left, mut right) = (0, 0);
+    while left < target.len() || right < incoming.len() {
+        let value = match (target.get(left), incoming.get(right)) {
+            (Some(left_value), Some(right_value)) if left_value <= right_value => {
+                left += 1;
+                *left_value
+            }
+            (Some(_), Some(right_value)) => {
+                right += 1;
+                *right_value
+            }
+            (Some(left_value), None) => {
+                left += 1;
+                *left_value
+            }
+            (None, Some(right_value)) => {
+                right += 1;
+                *right_value
+            }
+            (None, None) => break,
+        };
+        if merged.last().copied() != Some(value) {
+            merged.push(value);
+        }
+    }
+    *target = merged;
+}
+
 fn query_result_label(
     current: usize,
     result_count: usize,
@@ -6168,14 +6362,6 @@ fn query_result_label(
     }
 }
 
-fn next_column_scope(current: Option<usize>, column_count: usize) -> Option<usize> {
-    match current {
-        None if column_count > 0 => Some(0),
-        Some(column) if column + 1 < column_count => Some(column + 1),
-        _ => None,
-    }
-}
-
 fn display_header_label(header: &str, column: usize) -> String {
     let label = header.split_whitespace().collect::<Vec<_>>().join(" ");
     if label.is_empty() {
@@ -6185,13 +6371,23 @@ fn display_header_label(header: &str, column: usize) -> String {
     }
 }
 
-fn column_scope_label(column: Option<usize>, headers: &[String]) -> String {
+fn cache_header_labels(headers: &[String]) -> Arc<[SharedString]> {
+    Arc::from(
+        headers
+            .iter()
+            .enumerate()
+            .map(|(column, header)| SharedString::from(display_header_label(header, column)))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn column_scope_label(column: Option<usize>, headers: &[SharedString]) -> SharedString {
     match column {
         Some(column) => headers
             .get(column)
-            .map(|header| display_header_label(header, column))
-            .unwrap_or_else(|| format!("Column {}", column + 1)),
-        None => "Entire row".to_string(),
+            .cloned()
+            .unwrap_or_else(|| SharedString::from(format!("Column {}", column + 1))),
+        None => SharedString::from("Entire row"),
     }
 }
 
@@ -6371,7 +6567,103 @@ fn parse_warning_location(warning: &ParseWarning) -> String {
     parts.join(" · ")
 }
 
-fn header_cell(label: &str, width: f32, cx: &App) -> gpui::Div {
+fn column_render_plan(
+    layout: &ColumnLayout,
+    scroll_left: f32,
+    viewport_width: f32,
+    leading_width: f32,
+    pinned_columns: impl IntoIterator<Item = usize>,
+) -> ColumnRenderPlan {
+    let column_count = layout.widths.len();
+    if column_count == 0 {
+        return ColumnRenderPlan::default();
+    }
+
+    let scroll_left = if scroll_left.is_finite() {
+        scroll_left.max(0.0)
+    } else {
+        0.0
+    };
+    let viewport_width = if viewport_width.is_finite() {
+        viewport_width.max(0.0)
+    } else {
+        0.0
+    };
+    let leading_width = if leading_width.is_finite() {
+        leading_width.max(0.0)
+    } else {
+        0.0
+    };
+    let total_width = layout.total_width();
+    let left = (scroll_left - leading_width - COLUMN_OVERSCAN_WIDTH)
+        .max(0.0)
+        .min(total_width);
+    let right = (scroll_left + viewport_width - leading_width + COLUMN_OVERSCAN_WIDTH)
+        .max(0.0)
+        .min(total_width);
+
+    let first = layout.offsets[1..].partition_point(|end| *end <= left);
+    let end = layout.offsets[..column_count].partition_point(|start| *start < right);
+    let mut runs = Vec::new();
+    if first < end {
+        runs.push(first..end);
+    }
+    runs.extend(
+        pinned_columns
+            .into_iter()
+            .filter(|column| *column < column_count)
+            .map(|column| column..column + 1),
+    );
+    runs.sort_unstable_by_key(|run| run.start);
+
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(runs.len());
+    for run in runs {
+        if let Some(previous) = merged.last_mut()
+            && run.start <= previous.end
+        {
+            previous.end = previous.end.max(run.end);
+        } else {
+            merged.push(run);
+        }
+    }
+    ColumnRenderPlan { runs: merged }
+}
+
+fn column_spacer(width: f32) -> gpui::Div {
+    div()
+        .w(px(width))
+        .min_w(px(width))
+        .max_w(px(width))
+        .h_full()
+        .flex_none()
+}
+
+fn virtual_column_children(
+    layout: &ColumnLayout,
+    plan: &ColumnRenderPlan,
+    mut render_column: impl FnMut(usize) -> gpui::AnyElement,
+) -> Vec<gpui::AnyElement> {
+    let mut children = Vec::new();
+    let mut cursor = 0;
+    for run in &plan.runs {
+        let start = run.start.min(layout.widths.len()).max(cursor);
+        let end = run.end.min(layout.widths.len()).max(start);
+        if start > cursor {
+            children.push(
+                column_spacer(layout.offsets[start] - layout.offsets[cursor]).into_any_element(),
+            );
+        }
+        children.extend((start..end).map(&mut render_column));
+        cursor = end;
+    }
+    if cursor < layout.widths.len() {
+        children
+            .push(column_spacer(layout.total_width() - layout.offsets[cursor]).into_any_element());
+    }
+    children
+}
+
+fn header_cell(label: impl Into<SharedString>, width: f32, cx: &App) -> gpui::Div {
     div()
         .w(px(width))
         .min_w(px(width))
@@ -6386,7 +6678,7 @@ fn header_cell(label: &str, width: f32, cx: &App) -> gpui::Div {
         .overflow_hidden()
         .whitespace_nowrap()
         .text_ellipsis()
-        .child(label.to_string())
+        .child(label.into())
 }
 
 fn body_cell_frame(width: f32, cx: &App) -> gpui::Div {
@@ -6403,11 +6695,11 @@ fn body_cell_frame(width: f32, cx: &App) -> gpui::Div {
         .overflow_hidden()
 }
 
-fn body_cell(value: &str, width: f32, cx: &App) -> gpui::Div {
+fn body_cell(value: impl Into<SharedString>, width: f32, cx: &App) -> gpui::Div {
     body_cell_frame(width, cx)
         .px_2()
         .text_ellipsis()
-        .child(value.to_string())
+        .child(value.into())
 }
 
 fn settings_path() -> PathBuf {

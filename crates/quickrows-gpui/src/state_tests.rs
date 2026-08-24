@@ -1,13 +1,15 @@
 #[cfg(test)]
 mod tests {
     use super::super::{
-        ContextMenuCommand, EditingCell, LoadedDocument, OpenTarget, OperationKind,
-        PendingEditAction, QuickRowsView, RuntimeRequest, ShowShortcuts, TableContextMenuKind,
-        context_menu_command, context_menu_item_count, counted_noun, display_header_label,
-        file_fingerprint, format_count, fragment_regions_to_selection, is_valid_syntax_character,
-        load_settings_for_window, open_target_from_value, parse_diagnostic_rows,
-        parse_effective_changes, parse_summary, path_from_open_value, query_result_label,
-        requeue_deferred_runtime_requests, toolbar_shows_labels, validate_syntax_overrides,
+        CachedRow, ColumnLayout, ContextMenuCommand, EditingCell, LoadedDocument, OpenTarget,
+        OperationKind, PendingEditAction, QuickRowsView, RuntimeRequest, ShowShortcuts,
+        TableContextMenuKind, cache_header_labels, column_render_plan, context_menu_command,
+        context_menu_item_count, counted_noun, display_header_label, file_fingerprint,
+        format_count, fragment_regions_to_selection, is_valid_syntax_character,
+        load_settings_for_window, merge_sorted_unique, open_target_from_value,
+        parse_diagnostic_rows, parse_effective_changes, parse_summary, path_from_open_value,
+        query_result_label, requeue_deferred_runtime_requests, toolbar_shows_labels,
+        validate_syntax_overrides,
     };
 
     #[gpui::test]
@@ -76,6 +78,71 @@ mod tests {
     }
 
     #[gpui::test]
+    fn query_scope_pickers_select_columns_directly(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| QuickRowsView::new(None, window, cx))
+            })
+            .unwrap()
+        });
+        window
+            .update(cx, |view, _, cx| {
+                view.search_results = vec![4];
+                view.search_has_completed = true;
+                let initial_refresh = view.search_refresh_token;
+
+                view.select_search_column(Some(7), cx);
+
+                assert_eq!(view.search_column, Some(7));
+                assert_eq!(view.search_refresh_token, initial_refresh.wrapping_add(1));
+                assert!(view.search_stale);
+                assert!(!view.search_has_completed);
+
+                view.search_has_completed = true;
+                view.search_stale = false;
+                let unchanged_refresh = view.search_refresh_token;
+                view.select_search_column(Some(7), cx);
+                assert_eq!(view.search_refresh_token, unchanged_refresh);
+                assert!(!view.search_stale);
+                assert!(view.search_has_completed);
+
+                view.select_search_column(None, cx);
+                assert_eq!(view.search_column, None);
+                assert_eq!(view.search_refresh_token, unchanged_refresh.wrapping_add(1));
+
+                view.duplicate_results = vec![9];
+                view.duplicate_check_has_completed = true;
+                view.select_duplicate_column(Some(6), cx);
+                assert_eq!(view.duplicate_column, Some(6));
+                assert!(view.duplicate_stale);
+                assert!(!view.duplicate_check_has_completed);
+
+                view.duplicate_stale = false;
+                view.duplicate_check_has_completed = true;
+                view.select_duplicate_column(Some(6), cx);
+                assert!(!view.duplicate_stale);
+                assert!(view.duplicate_check_has_completed);
+
+                view.select_duplicate_column(None, cx);
+                assert_eq!(view.duplicate_column, None);
+                assert!(view.duplicate_stale);
+                assert!(!view.duplicate_check_has_completed);
+
+                view.loading = true;
+                let blocked_refresh = view.search_refresh_token;
+                view.select_search_column(Some(2), cx);
+                view.select_duplicate_column(Some(3), cx);
+                assert_eq!(view.search_column, None);
+                assert_eq!(view.search_refresh_token, blocked_refresh);
+                assert_eq!(view.duplicate_column, None);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn sorting_commits_an_active_cell_edit_before_reordering(cx: &mut gpui::TestAppContext) {
         use gpui::AppContext as _;
         use std::sync::{Arc, Mutex};
@@ -85,6 +152,8 @@ mod tests {
         std::fs::write(&path, "name,value\nb,2\na,1\n").unwrap();
         let document = quickrows_core::CsvDocument::open(&path, None, None).unwrap();
         let headers = document.metadata().headers.clone();
+        let header_labels = cache_header_labels(&headers);
+        let headers = Arc::from(headers);
         let row_count = document.row_count();
         let parse_info = document.metadata().effective.clone();
         let detected_parse_info = document.metadata().detected.clone();
@@ -103,6 +172,7 @@ mod tests {
                     document: document.clone(),
                     path: path.clone(),
                     headers,
+                    header_labels,
                     row_count,
                     detected_parse_info,
                     parse_info,
@@ -145,6 +215,8 @@ mod tests {
         std::fs::write(&path, "name,value\nalpha,1\n").unwrap();
         let document = quickrows_core::CsvDocument::open(&path, None, None).unwrap();
         let headers = document.metadata().headers.clone();
+        let header_labels = cache_header_labels(&headers);
+        let headers = Arc::from(headers);
         let row_count = document.row_count();
         let mut detected = document.metadata().detected.clone();
         detected.has_headers = false;
@@ -167,6 +239,7 @@ mod tests {
                     document: Arc::new(Mutex::new(document)),
                     path: path.clone(),
                     headers,
+                    header_labels,
                     row_count,
                     detected_parse_info: detected,
                     parse_info: effective,
@@ -459,6 +532,18 @@ mod tests {
     }
 
     #[test]
+    fn incremental_query_results_merge_in_source_order_without_duplicates() {
+        let mut results = vec![1, 4, 8];
+        merge_sorted_unique(&mut results, vec![7, 4, 2, 7]);
+        assert_eq!(results, vec![1, 2, 4, 7, 8]);
+
+        merge_sorted_unique(&mut results, vec![10, 9]);
+        assert_eq!(results, vec![1, 2, 4, 7, 8, 9, 10]);
+        merge_sorted_unique(&mut results, Vec::new());
+        assert_eq!(results, vec![1, 2, 4, 7, 8, 9, 10]);
+    }
+
+    #[test]
     fn query_result_labels_distinguish_pending_and_completed_empty_states() {
         assert_eq!(query_result_label(0, 0, false, "No matches"), None);
         assert_eq!(
@@ -473,6 +558,81 @@ mod tests {
             query_result_label(999_999, 1_000_000, true, "No matches"),
             Some("1,000,000 of 1,000,000".to_string())
         );
+    }
+
+    #[test]
+    fn column_layout_caches_clamped_widths_and_prefix_offsets() {
+        let mut settings = quickrows_core::AppSettings::default();
+        settings.column_width = 100.0;
+        settings.column_widths = vec![80.0, 150.0, 200.0];
+        let layout = ColumnLayout::from_settings(4, &settings);
+
+        assert_eq!(&*layout.widths, &[120.0, 150.0, 200.0, 120.0]);
+        assert_eq!(&*layout.offsets, &[0.0, 120.0, 270.0, 470.0, 590.0]);
+        assert_eq!(layout.total_width(), 590.0);
+
+        let empty = ColumnLayout::from_settings(0, &settings);
+        assert!(empty.widths.is_empty());
+        assert_eq!(&*empty.offsets, &[0.0]);
+
+        settings.column_widths = vec![f32::MAX, f32::MAX];
+        let saturated = ColumnLayout::from_settings(2, &settings);
+        assert_eq!(saturated.total_width(), f32::MAX);
+    }
+
+    #[test]
+    fn column_render_plan_windows_columns_and_keeps_pins_global() {
+        let mut settings = quickrows_core::AppSettings::default();
+        settings.column_width = 120.0;
+        settings.column_widths.clear();
+        let layout = ColumnLayout::from_settings(10, &settings);
+
+        assert_eq!(
+            column_render_plan(&layout, 0.0, 120.0, 0.0, []).runs,
+            vec![0..3]
+        );
+        assert_eq!(
+            column_render_plan(&layout, 360.0, 120.0, 0.0, []).runs,
+            vec![1..6]
+        );
+        assert_eq!(
+            column_render_plan(&layout, 1_080.0, 120.0, 0.0, []).runs,
+            vec![7..10]
+        );
+        assert_eq!(
+            column_render_plan(&layout, 0.0, 120.0, 72.0, []).runs,
+            vec![0..3]
+        );
+
+        let pinned = column_render_plan(&layout, 480.0, 120.0, 0.0, [0, 7, 9]);
+        assert_eq!(pinned.runs, vec![0..1, 2..8, 9..10]);
+        assert_eq!(
+            pinned
+                .runs
+                .iter()
+                .flat_map(|run| run.clone())
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3, 4, 5, 6, 7, 9]
+        );
+    }
+
+    #[test]
+    fn cached_row_clones_share_cells_until_an_optimistic_edit() {
+        use gpui::SharedString;
+        use std::sync::Arc;
+
+        let mut cached = CachedRow {
+            source_row: 4,
+            cells: Arc::from([SharedString::from("alpha"), SharedString::from("beta")]),
+            deleted: false,
+        };
+        let rendered = cached.clone();
+        assert!(Arc::ptr_eq(&cached.cells, &rendered.cells));
+
+        Arc::make_mut(&mut cached.cells)[1] = SharedString::from("edited");
+        assert!(!Arc::ptr_eq(&cached.cells, &rendered.cells));
+        assert_eq!(cached.cells[1].as_ref(), "edited");
+        assert_eq!(rendered.cells[1].as_ref(), "beta");
     }
 
     #[test]

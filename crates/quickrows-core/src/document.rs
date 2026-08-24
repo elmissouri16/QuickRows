@@ -2,30 +2,37 @@ use crate::cache::CsvCache;
 use crate::csv::{
     apply_parse_overrides, build_row_offsets, build_row_offsets_cancellable,
     build_row_offsets_mmap, build_row_offsets_mmap_cancellable, detect_headers_for_settings,
-    detect_parse_settings, detect_parse_settings_for_encoding, get_headers,
-    parse_info_from_settings, prepare_csv_source_cancellable, read_chunk_with_offsets,
-    read_chunk_with_offsets_mmap, read_rows_by_index, read_rows_by_index_mmap,
+    detect_parse_settings_for_encoding, get_headers, parse_info_from_settings,
+    prepare_csv_source_cancellable, prepare_saved_csv_source_cancellable, read_chunk_with_offsets,
+    read_chunk_with_offsets_mmap, read_column_range_with_offsets,
+    read_column_range_with_offsets_mmap, read_rows_by_index, read_rows_by_index_mmap,
     search_range_with_offsets, search_range_with_offsets_mmap, settings_cache_hash,
     validate_parse_overrides, validate_parse_settings, ParseInfo, ParseOverrides, ParseSettings,
-    ParseWarning, PreservedComment, MAX_WARNING_COUNT,
+    ParseWarning, PreparedCsvSource, PreservedComment, MAX_WARNING_COUNT,
 };
+#[cfg(test)]
+use crate::disk_cache::file_fingerprint;
 use crate::disk_cache::{
-    cache_key_from_fingerprint, ensure_cache_dir, file_fingerprint, offsets_cache_path,
-    order_cache_path, prune_cache_dir, read_offsets_cache, read_order_cache, read_warnings_cache,
+    cache_key_from_fingerprint, ensure_cache_dir, offsets_cache_path, order_cache_path,
+    prune_cache_dir, read_offsets_cache, read_order_cache, read_warnings_cache,
     warnings_cache_path, write_offsets_cache, write_order_cache, write_warnings_cache, CacheKey,
     FileFingerprint,
 };
 use crate::fragment::{CsvFragment, ResolvedFragmentRegion};
 use crate::mmap::open_immutable_mmap_if_large;
+use crate::source_snapshot::{
+    capture_open_file_state, file_fingerprint_cancellable, snapshot_csv_source,
+    verify_open_file_state, verify_path_references_open_file, OpenFileState, SourceSnapshot,
+};
 use memmap2::Mmap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 
@@ -37,6 +44,49 @@ const SORT_CHUNK_SIZE: usize = 10_000;
 const INDEX_CHUNK_SIZE: usize = 10_000;
 const SAVE_IO_BUFFER_BYTES: usize = 1024 * 1024;
 const INDEX_MAX_CARDINALITY: usize = 500_000;
+const SORT_MERGE_CHUNK_SIZE: usize = 65_536;
+const SORT_CANCELLATION_INTERVAL: usize = 4_096;
+
+static NEXT_DOCUMENT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_document_generation() -> u64 {
+    NEXT_DOCUMENT_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+struct FingerprintingWriter<W: Write> {
+    inner: W,
+    hasher: blake3::Hasher,
+    len: u64,
+}
+
+impl<W: Write> FingerprintingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: blake3::Hasher::new(),
+            len: 0,
+        }
+    }
+
+    fn finish(mut self) -> Result<(W, u64, [u8; 32]), String> {
+        self.flush().map_err(|error| error.to_string())?;
+        let hash = *self.hasher.finalize().as_bytes();
+        Ok((self.inner, self.len, hash))
+    }
+}
+
+impl<W: Write> Write for FingerprintingWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        self.hasher.update(&buffer[..written]);
+        self.len = self.len.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
 
 fn line_ending(settings: &ParseSettings) -> &'static str {
     match settings.line_ending.as_str() {
@@ -214,6 +264,83 @@ fn compact_index(index: &mut ColumnSearchIndex) {
     index.shrink_to_fit();
 }
 
+fn sort_projected_order<C, O>(
+    values: &[String],
+    ascending: bool,
+    chunk_size: usize,
+    check_cancellation: &C,
+    observe_comparison: &O,
+) -> Result<Vec<usize>, String>
+where
+    C: Fn() -> Result<(), String> + Sync,
+    O: Fn() + Sync,
+{
+    debug_assert!(chunk_size > 0);
+    let compare_rows = |left: &usize, right: &usize| {
+        observe_comparison();
+        let value_order = if ascending {
+            values[*left].cmp(&values[*right])
+        } else {
+            values[*right].cmp(&values[*left])
+        };
+        value_order.then_with(|| left.cmp(right))
+    };
+    let mut order = (0..values.len()).collect::<Vec<_>>();
+    order
+        .par_chunks_mut(chunk_size)
+        .try_for_each(|chunk| -> Result<(), String> {
+            check_cancellation()?;
+            chunk.sort_unstable_by(&compare_rows);
+            check_cancellation()
+        })?;
+
+    let mut scratch = vec![0usize; order.len()];
+    let mut source_is_order = true;
+    let mut width = chunk_size;
+    while width < order.len() {
+        check_cancellation()?;
+        let pair_width = width.saturating_mul(2);
+        let (source, destination) = if source_is_order {
+            (&order[..], &mut scratch[..])
+        } else {
+            (&scratch[..], &mut order[..])
+        };
+        source
+            .par_chunks(pair_width)
+            .zip(destination.par_chunks_mut(pair_width))
+            .try_for_each(|(source, destination)| -> Result<(), String> {
+                check_cancellation()?;
+                let right_start = width.min(source.len());
+                let mut left = 0usize;
+                let mut right = right_start;
+                let mut output = 0usize;
+                while left < right_start && right < source.len() {
+                    if output % SORT_CANCELLATION_INTERVAL == 0 {
+                        check_cancellation()?;
+                    }
+                    if compare_rows(&source[left], &source[right]).is_le() {
+                        destination[output] = source[left];
+                        left += 1;
+                    } else {
+                        destination[output] = source[right];
+                        right += 1;
+                    }
+                    output += 1;
+                }
+                destination[output..output + right_start - left]
+                    .copy_from_slice(&source[left..right_start]);
+                output += right_start - left;
+                destination[output..output + source.len() - right]
+                    .copy_from_slice(&source[right..]);
+                check_cancellation()
+            })?;
+        source_is_order = !source_is_order;
+        width = pair_width;
+    }
+    check_cancellation()?;
+    Ok(if source_is_order { order } else { scratch })
+}
+
 pub struct SearchIndexBuild {
     path: PathBuf,
     settings: ParseSettings,
@@ -222,11 +349,14 @@ pub struct SearchIndexBuild {
     _prepared_source: Option<Arc<tempfile::NamedTempFile>>,
     column_count: usize,
     edits: DocumentEdits,
+    generation: u64,
     revision: u64,
 }
 
+#[derive(Debug)]
 pub struct BuiltSearchIndex {
     columns: Vec<Option<ColumnSearchIndex>>,
+    generation: u64,
     revision: u64,
 }
 
@@ -284,12 +414,16 @@ impl SearchIndexBuild {
             if let Some(progress) = progress {
                 progress(end, row_count);
             }
+            cancellation.check()?;
         }
+        cancellation.check()?;
         for index in columns.iter_mut().flatten() {
             compact_index(index);
         }
+        cancellation.check()?;
         Ok(BuiltSearchIndex {
             columns,
+            generation: self.generation,
             revision: self.revision,
         })
     }
@@ -383,6 +517,13 @@ impl DocumentEdits {
         self.deleted_rows.clear();
     }
 
+    fn edited_cell(&self, source_row: usize, column: usize) -> Option<&str> {
+        self.cells
+            .get(&source_row)
+            .and_then(|edits| edits.get(&column))
+            .map(String::as_str)
+    }
+
     fn apply(&self, source_row: usize, row: &mut [String]) {
         if let Some(edits) = self.cells.get(&source_row) {
             for (&column, value) in edits {
@@ -417,6 +558,7 @@ pub struct CsvDocument {
     cache_root: Option<PathBuf>,
     disk_cache_dir: Option<PathBuf>,
     disk_cache_key: Option<CacheKey>,
+    generation: u64,
     revision: u64,
 }
 
@@ -477,28 +619,35 @@ impl CsvDocument {
         cache_root: Option<&Path>,
     ) -> Result<Self, String> {
         cancellation.map(CancellationToken::check).transpose()?;
+        let is_cancelled = || cancellation.is_some_and(CancellationToken::is_cancelled);
         let path = path.to_path_buf();
-        let source_fingerprint = file_fingerprint(&path)?;
-        cancellation.map(CancellationToken::check).transpose()?;
-        let mut detected = detect_parse_settings(&path).map_err(|e| e.to_string())?;
         if let Some(overrides) = overrides.as_ref() {
             validate_parse_overrides(overrides)?;
-            if let Some(encoding) = overrides.encoding.as_deref() {
-                detected = detect_parse_settings_for_encoding(&path, Some(encoding))
-                    .map_err(|error| error.to_string())?;
-            }
         }
+        let SourceSnapshot {
+            temporary,
+            fingerprint: source_fingerprint,
+        } = snapshot_csv_source(&path, &is_cancelled)?;
+        // All parsing and cache work below uses the immutable capture. A final
+        // cancellable live fingerprint rejects source changes before open returns.
+        let immutable_source = Arc::new(temporary);
+        let immutable_path = immutable_source.path().to_path_buf();
+        let encoding_override = overrides
+            .as_ref()
+            .and_then(|overrides| overrides.encoding.as_deref());
+        let detected = detect_parse_settings_for_encoding(&immutable_path, encoding_override)
+            .map_err(|error| error.to_string())?;
         let detected_settings = apply_parse_overrides(&detected, None);
         let explicit_headers = overrides.as_ref().and_then(|value| value.has_headers);
         let mut settings = apply_parse_overrides(&detected, overrides);
         validate_parse_settings(&settings)?;
-        let mut prepared = prepare_csv_source_cancellable(&path, &settings, progress, &|| {
-            cancellation.is_some_and(CancellationToken::is_cancelled)
-        })?;
+        let mut prepared =
+            prepare_csv_source_cancellable(&immutable_path, &settings, progress, &is_cancelled)?;
         if prepared.temporary.is_none() {
-            let temporary = snapshot_csv_source(&path, source_fingerprint, cancellation)?;
-            prepared.path = temporary.path().to_path_buf();
-            prepared.temporary = Some(Arc::new(temporary));
+            prepared.path = immutable_path;
+            prepared.temporary = Some(immutable_source);
+        } else {
+            drop(immutable_source);
         }
         let data_path = prepared.path.clone();
         let mut storage_settings = prepared.settings.clone();
@@ -593,7 +742,7 @@ impl CsvDocument {
             offsets
         };
         cancellation.map(CancellationToken::check).transpose()?;
-        if file_fingerprint(&path)? != source_fingerprint {
+        if file_fingerprint_cancellable(&path, &is_cancelled)? != source_fingerprint {
             return Err("CSV changed on disk while it was being opened".to_string());
         }
         // A valid cache hit is already complete. Rewriting it would serialize every
@@ -638,6 +787,62 @@ impl CsvDocument {
             cache_root: cache_root.map(Path::to_path_buf),
             disk_cache_dir,
             disk_cache_key,
+            generation: next_document_generation(),
+            revision: 0,
+        })
+    }
+
+    fn from_saved_build(
+        raw_path: &Path,
+        source_fingerprint: FileFingerprint,
+        settings: ParseSettings,
+        detected_settings: ParseSettings,
+        prepared: PreparedCsvSource,
+        headers: Vec<String>,
+        offsets: Vec<u64>,
+    ) -> Result<Self, String> {
+        let PreparedCsvSource {
+            path: data_path,
+            settings: storage_settings,
+            temporary,
+            mut warnings,
+            comments,
+        } = prepared;
+        let mmap = if temporary.is_some() {
+            open_immutable_mmap_if_large(&data_path).map_err(|error| error.to_string())?
+        } else {
+            None
+        };
+        warnings.truncate(MAX_WARNING_COUNT);
+        let metadata = CsvMetadata {
+            headers,
+            detected: parse_info_from_settings(&detected_settings),
+            effective: parse_info_from_settings(&settings),
+            warnings,
+            row_count: offsets.len(),
+        };
+        Ok(Self {
+            path: raw_path.to_path_buf(),
+            source_fingerprint,
+            data_path,
+            settings,
+            storage_settings,
+            metadata,
+            offsets,
+            mmap,
+            _prepared_source: temporary,
+            comments,
+            cache: CsvCache::new(DEFAULT_CACHE_CHUNKS),
+            sorted_order: None,
+            sorted_inverse: None,
+            sort_spec: None,
+            search_index: None,
+            indexed_search_column: None,
+            edits: DocumentEdits::default(),
+            cache_root: None,
+            disk_cache_dir: None,
+            disk_cache_key: None,
+            generation: next_document_generation(),
             revision: 0,
         })
     }
@@ -728,6 +933,74 @@ impl CsvDocument {
             ),
         }
         .map_err(|e| e.to_string())
+    }
+
+    fn read_source_column_range(
+        &self,
+        start: usize,
+        end: usize,
+        column: usize,
+    ) -> Result<Vec<Option<String>>, String> {
+        let mut warnings = Vec::new();
+        match self.mmap.as_deref() {
+            Some(mmap) => read_column_range_with_offsets_mmap(
+                &mmap[..],
+                &self.offsets,
+                start,
+                end,
+                column,
+                &self.storage_settings,
+                self.expected_columns(),
+                &mut warnings,
+            ),
+            None => read_column_range_with_offsets(
+                &self.data_path,
+                &self.offsets,
+                start,
+                end,
+                column,
+                &self.storage_settings,
+                self.expected_columns(),
+                &mut warnings,
+            ),
+        }
+        .map_err(|error| error.to_string())
+    }
+
+    fn search_source_range(
+        &self,
+        start: usize,
+        end: usize,
+        column: Option<usize>,
+        query: &str,
+        match_case: bool,
+        whole_word: bool,
+    ) -> Result<Vec<usize>, String> {
+        match self.mmap.as_deref() {
+            Some(mmap) => search_range_with_offsets_mmap(
+                &mmap[..],
+                &self.offsets,
+                start,
+                end,
+                column,
+                query,
+                match_case,
+                whole_word,
+                &self.storage_settings,
+            ),
+            None => search_range_with_offsets(
+                &self.data_path,
+                &self.offsets,
+                start,
+                end,
+                column,
+                query,
+                match_case,
+                whole_word,
+                &self.storage_settings,
+            ),
+        }
+        .map_err(|error| error.to_string())
     }
 
     pub fn display_rows(
@@ -926,12 +1199,13 @@ impl CsvDocument {
             _prepared_source: self._prepared_source.clone(),
             column_count: self.metadata.headers.len(),
             edits: self.edits.clone(),
+            generation: self.generation,
             revision: self.revision,
         }
     }
 
     pub fn install_search_index(&mut self, index: BuiltSearchIndex) -> bool {
-        if index.revision != self.revision {
+        if index.generation != self.generation || index.revision != self.revision {
             return false;
         }
         self.search_index = Some(index.columns);
@@ -981,9 +1255,11 @@ impl CsvDocument {
                 }
             }
         }
+        cancellation.map(CancellationToken::check).transpose()?;
         for index in columns.iter_mut().flatten() {
             compact_index(index);
         }
+        cancellation.map(CancellationToken::check).transpose()?;
         self.search_index = Some(columns);
         self.indexed_search_column = None;
         Ok(())
@@ -1007,22 +1283,26 @@ impl CsvDocument {
             return Ok(());
         }
 
-        // Keep at most one lazily-built column. This makes the setting useful
-        // for repeated searches without multiplying memory by the CSV width.
-        self.search_index = None;
-        self.indexed_search_column = None;
+        // Build off to the side so cancellation or a read failure preserves
+        // whichever complete index is currently installed. A successful build
+        // still retains at most this one lazily-built column.
         let mut index = HashMap::new();
         let mut exceeded_cardinality = false;
         for start in (0..self.row_count()).step_by(INDEX_CHUNK_SIZE) {
             cancellation.check()?;
             let end = (start + INDEX_CHUNK_SIZE).min(self.row_count());
-            let indices = (start..end).collect::<Vec<_>>();
-            for (source_row, mut row) in (start..end).zip(self.read_source_rows(&indices)?) {
+            let projected = self.read_source_column_range(start, end, column)?;
+            for (offset, source_value) in projected.into_iter().enumerate() {
+                let source_row = start + offset;
                 if self.edits.is_deleted(source_row) {
                     continue;
                 }
-                self.edits.apply(source_row, &mut row);
-                if let Some(value) = row.into_iter().nth(column) {
+                let value = self
+                    .edits
+                    .edited_cell(source_row, column)
+                    .map(str::to_owned)
+                    .or(source_value);
+                if let Some(value) = value {
                     index_value(&mut index, value.to_lowercase(), source_row);
                     if index.len() > INDEX_MAX_CARDINALITY {
                         exceeded_cardinality = true;
@@ -1033,11 +1313,13 @@ impl CsvDocument {
             if let Some(progress) = progress {
                 progress(end, self.row_count());
             }
+            cancellation.check()?;
             if exceeded_cardinality {
                 break;
             }
         }
 
+        cancellation.check()?;
         let mut columns = (0..self.metadata.headers.len())
             .map(|_| None)
             .collect::<Vec<Option<ColumnSearchIndex>>>();
@@ -1045,6 +1327,7 @@ impl CsvDocument {
             compact_index(&mut index);
             columns[column] = Some(index);
         }
+        cancellation.check()?;
         self.search_index = Some(columns);
         self.indexed_search_column = Some(column);
         Ok(())
@@ -1169,36 +1452,75 @@ impl CsvDocument {
         }
 
         if !self.edits.is_dirty() {
-            let path = &self.data_path;
             let mut matches = Vec::new();
             for start in (0..self.row_count()).step_by(INDEX_CHUNK_SIZE) {
                 cancellation.map(CancellationToken::check).transpose()?;
                 let end = (start + INDEX_CHUNK_SIZE).min(self.row_count());
-                let chunk_matches = match self.mmap.as_deref() {
-                    Some(mmap) => search_range_with_offsets_mmap(
-                        &mmap[..],
-                        &self.offsets,
-                        start,
-                        end,
-                        column,
-                        query,
-                        match_case,
-                        whole_word,
-                        &self.storage_settings,
-                    ),
-                    None => search_range_with_offsets(
-                        path,
-                        &self.offsets,
-                        start,
-                        end,
-                        column,
-                        query,
-                        match_case,
-                        whole_word,
-                        &self.storage_settings,
-                    ),
+                let chunk_matches =
+                    self.search_source_range(start, end, column, query, match_case, whole_word)?;
+                if let Some(progress) = progress {
+                    progress(&chunk_matches, end, self.row_count());
                 }
-                .map_err(|error| error.to_string())?;
+                matches.extend(chunk_matches);
+            }
+            return Ok(matches);
+        }
+
+        if let Some(column) = column {
+            let normalized_query = (!match_case).then(|| query.to_lowercase());
+            let query_for_edits = normalized_query.as_deref().unwrap_or(query);
+            let mut edited_matches = Vec::new();
+            for (index, (&source_row, row_edits)) in self.edits.cells.iter().enumerate() {
+                if index % INDEX_CHUNK_SIZE == 0 {
+                    cancellation.map(CancellationToken::check).transpose()?;
+                }
+                if self.edits.is_deleted(source_row) {
+                    continue;
+                }
+                let Some(value) = row_edits.get(&column) else {
+                    continue;
+                };
+                let is_match = if match_case {
+                    if whole_word {
+                        value == query_for_edits
+                    } else {
+                        value.contains(query_for_edits)
+                    }
+                } else {
+                    let value = value.to_lowercase();
+                    if whole_word {
+                        value == query_for_edits
+                    } else {
+                        value.contains(query_for_edits)
+                    }
+                };
+                if is_match {
+                    edited_matches.push(source_row);
+                }
+            }
+            edited_matches.sort_unstable();
+
+            let mut matches = Vec::new();
+            for start in (0..self.row_count()).step_by(INDEX_CHUNK_SIZE) {
+                cancellation.map(CancellationToken::check).transpose()?;
+                let end = (start + INDEX_CHUNK_SIZE).min(self.row_count());
+                let mut chunk_matches = self.search_source_range(
+                    start,
+                    end,
+                    Some(column),
+                    query,
+                    match_case,
+                    whole_word,
+                )?;
+                chunk_matches.retain(|source_row| {
+                    !self.edits.is_deleted(*source_row)
+                        && self.edits.edited_cell(*source_row, column).is_none()
+                });
+                let first_edit = edited_matches.partition_point(|source_row| *source_row < start);
+                let after_last_edit =
+                    edited_matches.partition_point(|source_row| *source_row < end);
+                chunk_matches.extend_from_slice(&edited_matches[first_edit..after_last_edit]);
+                chunk_matches.sort_unstable();
                 if let Some(progress) = progress {
                     progress(&chunk_matches, end, self.row_count());
                 }
@@ -1394,48 +1716,61 @@ impl CsvDocument {
                     .flatten()
                     .filter(|order| cached_order_is_valid(order, self.row_count()))
                 {
-                    self.install_sorted_order(order, spec);
                     if let Some(progress) = progress {
                         progress(self.row_count(), self.row_count());
                     }
+                    cancellation.map(CancellationToken::check).transpose()?;
+                    self.install_sorted_order(order, spec);
                     return Ok(());
                 }
             }
         }
 
-        let mut values: Vec<(usize, String)> = Vec::with_capacity(self.row_count());
-        let mut start = 0;
-        while start < self.row_count() {
+        let mut values = Vec::with_capacity(self.row_count());
+        for start in (0..self.row_count()).step_by(SORT_CHUNK_SIZE) {
             cancellation.map(CancellationToken::check).transpose()?;
-            let rows = self.display_rows(start, SORT_CHUNK_SIZE)?;
-            if rows.is_empty() {
-                break;
+            let end = start.saturating_add(SORT_CHUNK_SIZE).min(self.row_count());
+            let projected = self.read_source_column_range(start, end, spec.column)?;
+            for (offset, source_value) in projected.into_iter().enumerate() {
+                let source_row = start + offset;
+                let value = self
+                    .edits
+                    .edited_cell(source_row, spec.column)
+                    .map(str::to_owned)
+                    .or(source_value)
+                    .unwrap_or_default();
+                values.push(value);
             }
-            for (source_row, row) in rows {
-                let value = row.get(spec.column).map(String::as_str).unwrap_or_default();
-                values.push((source_row, value.to_string()));
-            }
-            start += SORT_CHUNK_SIZE;
             if let Some(progress) = progress {
-                progress(start.min(self.row_count()), self.row_count());
+                progress(end, self.row_count());
             }
+            cancellation.map(CancellationToken::check).transpose()?;
         }
-        match spec.direction {
-            SortDirection::Ascending => {
-                values.par_sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
-            }
-            SortDirection::Descending => {
-                values.par_sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)))
-            }
-        }
-        cancellation.map(CancellationToken::check).transpose()?;
-        let order = values.into_iter().map(|(row, _)| row).collect::<Vec<_>>();
+
+        // Rayon cannot interrupt a single monolithic parallel sort. Sort
+        // bounded chunks instead, then merge them in cancellable stages so an
+        // in-flight request observes cancellation without waiting for all
+        // O(n log n) comparisons to finish.
+        let ascending = spec.direction == SortDirection::Ascending;
+        let check_cancellation = || -> Result<(), String> {
+            cancellation.map(CancellationToken::check).transpose()?;
+            Ok(())
+        };
+        let order = sort_projected_order(
+            &values,
+            ascending,
+            SORT_MERGE_CHUNK_SIZE,
+            &check_cancellation,
+            &|| {},
+        )?;
         if !self.edits.is_dirty() {
             if let (Some(dir), Some(key)) = (&self.disk_cache_dir, self.disk_cache_key) {
+                check_cancellation()?;
                 let path = order_cache_path(dir, key, spec.column, ascending);
                 let _ = write_order_cache(&path, key, spec.column, ascending, &order);
             }
         }
+        check_cancellation()?;
         self.install_sorted_order(order, spec);
         Ok(())
     }
@@ -1612,7 +1947,6 @@ impl CsvDocument {
         let cache_root = self.cache_root.clone();
         let effective = self.metadata.effective.clone();
         let original_malformed = self.settings.malformed;
-        let original_malformed_label = effective.malformed.clone();
         let validation_overrides = ParseOverrides {
             delimiter: Some(effective.delimiter),
             quote: Some(effective.quote),
@@ -1642,9 +1976,9 @@ impl CsvDocument {
         record_settings.source_bom = false;
         let terminator = line_ending(&self.settings);
         let mut comments = self.comments.iter().peekable();
-        {
-            let mut output =
-                BufWriter::with_capacity(SAVE_IO_BUFFER_BYTES, temporary.as_file_mut());
+        let (serialized_len, serialized_hash) = {
+            let buffered = BufWriter::with_capacity(SAVE_IO_BUFFER_BYTES, temporary.as_file_mut());
+            let mut output = FingerprintingWriter::new(buffered);
             if self.settings.source_bom {
                 let bom: &[u8] = if self.settings.encoding == encoding_rs::UTF_16LE {
                     &[0xff, 0xfe]
@@ -1729,38 +2063,68 @@ impl CsvDocument {
                 }
             }
             write_comments(&mut output, usize::MAX, &mut comment_text, &mut encoded)?;
-            output.flush().map_err(|error| error.to_string())?;
-        }
+            let (buffered, len, hash) = output.finish()?;
+            drop(buffered);
+            (len, hash)
+        };
         cancellation.map(CancellationToken::check).transpose()?;
 
-        // Parse the exact bytes to be committed before replacing the user's
-        // file. This keeps the destination and the current document intact if
-        // an edit exceeds active parse limits or otherwise cannot be reopened.
+        // Parse the exact bytes to be committed once. The strict parser writes
+        // the immutable canonical backing while it captures data-row offsets,
+        // so validation and saved-document construction share one full pass.
         let temporary_path = temporary.path().to_path_buf();
+        let is_cancelled = || cancellation.is_some_and(CancellationToken::is_cancelled);
+        copy_destination_permissions(&commit_target, &temporary_path)?;
+        temporary.as_file().sync_all().map_err(|e| e.to_string())?;
+        let serialized_state = capture_open_file_state(temporary.as_file())?;
+        verify_path_references_open_file(&temporary_path, temporary.as_file())?;
+        validate_parse_overrides(&validation_overrides)?;
+        let detected = detect_parse_settings_for_encoding(
+            &temporary_path,
+            validation_overrides.encoding.as_deref(),
+        )
+        .map_err(|error| error.to_string())?;
+        let detected_settings = apply_parse_overrides(&detected, None);
+        let mut saved_settings = apply_parse_overrides(&detected, Some(validation_overrides));
+        validate_parse_settings(&saved_settings)?;
         let expected_saved_rows = self
             .row_count()
             .saturating_sub(self.edits.deleted_rows.len());
-        let mut saved_document = CsvDocument::open_with_cancellation(
+        let mut saved = prepare_saved_csv_source_cancellable(
             &temporary_path,
-            Some(validation_overrides),
-            None,
-            cancellation,
-            None,
+            &saved_settings,
+            &self.metadata.headers,
+            expected_saved_rows,
+            &is_cancelled,
         )?;
-        if saved_document.row_count() != expected_saved_rows
-            || (self.settings.has_headers
-                && saved_document.metadata.headers != self.metadata.headers)
-            || !saved_document.metadata.warnings.is_empty()
+        if saved.raw_len != serialized_len || saved.raw_content_hash != serialized_hash {
+            return Err("Saved CSV changed while it was being validated".to_string());
+        }
+        verify_open_file_state(temporary.as_file(), serialized_state)?;
+        verify_path_references_open_file(&temporary_path, temporary.as_file())?;
+        if (self.settings.has_headers && saved.headers != self.metadata.headers)
+            || !saved.prepared.warnings.is_empty()
         {
             return Err("Saved CSV did not round-trip under the active parse settings".to_string());
         }
-        saved_document.settings.malformed = original_malformed;
-        saved_document.storage_settings.malformed = original_malformed;
-        saved_document.metadata.effective.malformed = original_malformed_label;
         cancellation.map(CancellationToken::check).transpose()?;
-        copy_destination_permissions(&commit_target, &temporary_path)?;
-        temporary.as_file().sync_all().map_err(|e| e.to_string())?;
+        let commit_state = serialized_state;
+        let source_fingerprint = commit_state.fingerprint(serialized_len, serialized_hash)?;
+        saved_settings.malformed = original_malformed;
+        saved.prepared.settings.malformed = original_malformed;
+        let mut saved_document = CsvDocument::from_saved_build(
+            &temporary_path,
+            source_fingerprint,
+            saved_settings,
+            detected_settings,
+            saved.prepared,
+            saved.headers,
+            saved.offsets,
+        )?;
+
         saved_document.rebind_saved_path(&temporary_path, target, cache_root.as_deref());
+        verify_open_file_state(temporary.as_file(), commit_state)?;
+        verify_path_references_open_file(&temporary_path, temporary.as_file())?;
 
         // Re-check both the content and symlink route immediately before the
         // atomic replacement. Missing destinations use a no-clobber rename.
@@ -1770,6 +2134,7 @@ impl CsvDocument {
             &commit_target,
             expected_destination,
             saved_document.source_fingerprint,
+            commit_state,
         )?;
         *self = saved_document;
         // The rename already committed the save. Some filesystems do not
@@ -1997,6 +2362,7 @@ fn commit_temporary(
     resolved_target: &Path,
     expected: DestinationState,
     replacement_fingerprint: FileFingerprint,
+    replacement_state: OpenFileState,
 ) -> Result<(), String> {
     let conflict =
         || "CSV changed on disk; save was cancelled to protect the external changes".to_string();
@@ -2005,23 +2371,38 @@ fn commit_temporary(
     if !route_matches() {
         return Err(conflict());
     }
+    verify_open_file_state(temporary.as_file(), replacement_state)?;
+    verify_path_references_open_file(temporary.path(), temporary.as_file())?;
     if expected == DestinationState::Missing {
-        return temporary
+        let committed = temporary
             .persist_noclobber(resolved_target)
-            .map(|_| ())
             .map_err(|error| {
                 if error.error.kind() == std::io::ErrorKind::AlreadyExists {
                     conflict()
                 } else {
                     error.error.to_string()
                 }
-            });
+            })?;
+        let identity_matches =
+            verify_path_references_open_file(resolved_target, &committed).is_ok();
+        let replacement_matches = destination_state(resolved_target)
+            == Ok(DestinationState::Existing(replacement_fingerprint));
+        if identity_matches && replacement_matches && route_matches() {
+            return Ok(());
+        }
+        return Err(format!(
+            "{}; the unverified output was preserved at {}",
+            conflict(),
+            resolved_target.display()
+        ));
     }
 
     ensure_destination_unchanged(resolved_target, expected)?;
     if !route_matches() {
         return Err(conflict());
     }
+    verify_open_file_state(temporary.as_file(), replacement_state)?;
+    verify_path_references_open_file(temporary.path(), temporary.as_file())?;
 
     #[cfg(windows)]
     return commit_temporary_windows(
@@ -2088,7 +2469,7 @@ fn commit_temporary(
 
 fn destination_state(path: &Path) -> Result<DestinationState, String> {
     match path.try_exists().map_err(|error| error.to_string())? {
-        true => file_fingerprint(path)
+        true => file_fingerprint_cancellable(path, &|| false)
             .map(DestinationState::Existing)
             .map_err(|_| "CSV destination changed while preparing to save".to_string()),
         false => Ok(DestinationState::Missing),
@@ -2111,80 +2492,6 @@ fn copy_destination_permissions(target: &Path, temporary: &Path) -> Result<(), S
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
     }
-}
-
-fn file_metadata_matches(path: &Path, expected: FileFingerprint) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos() as u64)
-        .unwrap_or(0);
-    metadata.len() == expected.len && modified == expected.modified
-}
-
-fn snapshot_csv_source(
-    path: &Path,
-    expected: FileFingerprint,
-    cancellation: Option<&CancellationToken>,
-) -> Result<tempfile::NamedTempFile, String> {
-    cancellation.map(CancellationToken::check).transpose()?;
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("quickrows-source-").suffix(".csv");
-    let temporary = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .and_then(|parent| builder.tempfile_in(parent).ok())
-        .map(Ok)
-        .unwrap_or_else(|| builder.tempfile())
-        .map_err(|error| error.to_string())?;
-    let (placeholder, temporary_path) = temporary.into_parts();
-    drop(placeholder);
-    std::fs::remove_file(&temporary_path).map_err(|error| error.to_string())?;
-
-    let snapshot_matches = if reflink_copy::reflink(path, &temporary_path).is_ok() {
-        file_fingerprint(&temporary_path).is_ok_and(|fingerprint| {
-            fingerprint.len == expected.len && fingerprint.content_hash == expected.content_hash
-        })
-    } else {
-        let _ = std::fs::remove_file(&temporary_path);
-        let mut source = std::fs::File::open(path).map_err(|error| error.to_string())?;
-        let mut destination = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&temporary_path)
-            .map_err(|error| error.to_string())?;
-        let mut hasher = blake3::Hasher::new();
-        let mut copied = 0u64;
-        let mut buffer = vec![0u8; 1024 * 1024];
-        loop {
-            cancellation.map(CancellationToken::check).transpose()?;
-            let read = source
-                .read(&mut buffer)
-                .map_err(|error| error.to_string())?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-            copied = copied.saturating_add(read as u64);
-            destination
-                .write_all(&buffer[..read])
-                .map_err(|error| error.to_string())?;
-        }
-        destination.flush().map_err(|error| error.to_string())?;
-        copied == expected.len && hasher.finalize().as_bytes() == &expected.content_hash
-    };
-    cancellation.map(CancellationToken::check).transpose()?;
-
-    if !snapshot_matches || !file_metadata_matches(path, expected) {
-        return Err("CSV changed on disk while it was being opened".to_string());
-    }
-    let file = std::fs::File::open(&temporary_path).map_err(|error| error.to_string())?;
-    Ok(tempfile::NamedTempFile::from_parts(file, temporary_path))
 }
 
 fn cached_offsets_are_valid(offsets: &[u64], file_len: u64) -> bool {
@@ -2233,6 +2540,22 @@ mod tests {
         (dir, doc)
     }
 
+    fn document_with_headers(contents: &str) -> (tempfile::TempDir, CsvDocument) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.csv");
+        std::fs::write(&path, contents).unwrap();
+        let doc = CsvDocument::open(
+            path,
+            Some(ParseOverrides {
+                has_headers: Some(true),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        (dir, doc)
+    }
+
     fn utf16_bytes(text: &str, little_endian: bool, bom: bool) -> Vec<u8> {
         let mut bytes = if bom {
             if little_endian {
@@ -2267,6 +2590,18 @@ mod tests {
                 .unwrap()
                 .contains("cancelled")
         );
+        let cache_root = dir.path().join("cache");
+        assert!(CsvDocument::open_cancellable_cached(
+            &path,
+            None,
+            None,
+            &cancellation,
+            &cache_root,
+        )
+        .err()
+        .unwrap()
+        .contains("cancelled"));
+        assert!(!cache_root.join("csv-index-cache").exists());
 
         let active_cancellation = CancellationToken::new();
         let cancel_from_progress = active_cancellation.clone();
@@ -3289,6 +3624,31 @@ mod tests {
     }
 
     #[test]
+    fn dirty_on_demand_column_index_matches_dirty_scan() {
+        let (_dir, mut doc) =
+            document_with_headers("name,value\na,Alpha\nb,beta\nc,alphabet\nd,Alpha\n");
+        doc.edit_source_cell(0, 0, "unrelated".to_string()).unwrap();
+        doc.edit_source_cell(1, 1, "Alpha".to_string()).unwrap();
+        doc.edit_source_cell(2, 1, "changed".to_string()).unwrap();
+        doc.delete_display_row(3).unwrap();
+        let contains = doc.search("ALPHA", Some(1), false, false).unwrap();
+        let exact = doc.search("ALPHA", Some(1), false, true).unwrap();
+
+        doc.ensure_search_index_for_column_cancellable(1, &CancellationToken::new(), None)
+            .unwrap();
+
+        assert!(doc.has_search_index_for_column(1));
+        assert!(!doc.has_search_index_for_column(0));
+        assert_eq!(
+            doc.search("ALPHA", Some(1), false, false).unwrap(),
+            contains
+        );
+        assert_eq!(doc.search("ALPHA", Some(1), false, true).unwrap(), exact);
+        assert_eq!(contains, vec![0, 1]);
+        assert_eq!(exact, vec![0, 1]);
+    }
+
+    #[test]
     fn compact_postings_preserve_single_and_duplicate_rows() {
         let mut postings = RowPostings::One(3);
         assert_eq!(postings.as_slice(), &[3]);
@@ -3311,6 +3671,135 @@ mod tests {
     }
 
     #[test]
+    fn sort_uses_current_projected_column_and_source_ties() {
+        let (_dir, mut doc) = document_with_headers("key,note\nz,zero\na,one\na,two\nb,three\n");
+        doc.edit_source_cell(0, 0, "a".to_string()).unwrap();
+        doc.edit_source_cell(1, 1, "unrelated".to_string()).unwrap();
+        doc.delete_display_row(2).unwrap();
+
+        doc.sort(Some(SortSpec {
+            column: 0,
+            direction: SortDirection::Ascending,
+        }))
+        .unwrap();
+        assert_eq!(doc.sorted_order.as_deref(), Some(&[0, 1, 2, 3][..]));
+
+        doc.sort(Some(SortSpec {
+            column: 0,
+            direction: SortDirection::Descending,
+        }))
+        .unwrap();
+        assert_eq!(doc.sorted_order.as_deref(), Some(&[3, 0, 1, 2][..]));
+        assert!(doc.edits.is_deleted(2));
+    }
+
+    #[test]
+    fn bounded_sort_checks_cancellation_before_all_comparisons_finish() {
+        const TEST_CHUNK_SIZE: usize = 1_024;
+        let values = (0..TEST_CHUNK_SIZE * 64)
+            .map(|row| {
+                let key = row
+                    .wrapping_mul(2_654_435_761usize)
+                    .rotate_left((row % 31) as u32);
+                format!("{key:016x}")
+            })
+            .collect::<Vec<_>>();
+
+        let full_comparisons = std::sync::atomic::AtomicUsize::new(0);
+        sort_projected_order(&values, true, TEST_CHUNK_SIZE, &|| Ok(()), &|| {
+            full_comparisons.fetch_add(1, Ordering::Relaxed);
+        })
+        .unwrap();
+        let full_comparisons = full_comparisons.load(Ordering::Relaxed);
+
+        let cancelled_comparisons = std::sync::atomic::AtomicUsize::new(0);
+        let cancellation_checks = std::sync::atomic::AtomicUsize::new(0);
+        let check_cancellation = || {
+            cancellation_checks.fetch_add(1, Ordering::Relaxed);
+            if cancelled_comparisons.load(Ordering::Relaxed) >= 10_000 {
+                Err("Operation cancelled".to_string())
+            } else {
+                Ok(())
+            }
+        };
+        let result =
+            sort_projected_order(&values, true, TEST_CHUNK_SIZE, &check_cancellation, &|| {
+                cancelled_comparisons.fetch_add(1, Ordering::Relaxed);
+            });
+        let cancelled_comparisons = cancelled_comparisons.load(Ordering::Relaxed);
+
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(cancellation_checks.load(Ordering::Relaxed) > 1);
+        assert!(cancelled_comparisons >= 10_000);
+        assert!(cancelled_comparisons < full_comparisons);
+    }
+
+    #[test]
+    fn cancellable_sort_merges_chunks_with_source_row_ties() {
+        let row_count = SORT_MERGE_CHUNK_SIZE + 37;
+        let mut contents = String::with_capacity(row_count * 16);
+        contents.push_str("key,row\n");
+        for row in 0..row_count {
+            let key = row.wrapping_mul(7_919) % 997;
+            contents.push_str(&format!("{key:04},{row}\n"));
+        }
+        let (_dir, mut doc) = document_with_headers(&contents);
+        doc.sort_cancellable(
+            Some(SortSpec {
+                column: 0,
+                direction: SortDirection::Ascending,
+            }),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+        let mut expected = (0..row_count).collect::<Vec<_>>();
+        expected.sort_unstable_by_key(|row| (row.wrapping_mul(7_919) % 997, *row));
+        assert_eq!(doc.sorted_order.as_deref(), Some(expected.as_slice()));
+    }
+
+    #[test]
+    fn cancellable_sort_stops_during_bounded_sort_work() {
+        let row_count = SORT_MERGE_CHUNK_SIZE * 4 + 17;
+        let mut contents = String::with_capacity(row_count * 24);
+        contents.push_str("key,row\n");
+        for row in 0..row_count {
+            let key = row
+                .wrapping_mul(2_654_435_761)
+                .rotate_left((row % 31) as u32);
+            contents.push_str(&format!("{key:016x},{row}\n"));
+        }
+        let (_dir, mut doc) = document_with_headers(&contents);
+        let cancellation = CancellationToken::new();
+        let cancel_sort = cancellation.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let canceller = std::thread::spawn(move || {
+            started_rx.recv().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            cancel_sort.cancel();
+        });
+        let signalled = std::cell::Cell::new(false);
+        let progress = |processed, total| {
+            if processed == total && !signalled.replace(true) {
+                started_tx.send(()).unwrap();
+            }
+        };
+
+        let result = doc.sort_cancellable_with_progress(
+            Some(SortSpec {
+                column: 0,
+                direction: SortDirection::Ascending,
+            }),
+            &cancellation,
+            &progress,
+        );
+        canceller.join().unwrap();
+
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(doc.sorted_order.is_none());
+    }
+
+    #[test]
     fn edits_deletes_and_saves() {
         let (dir, mut doc) = document("name,value\na,1\nb,2\n");
         doc.edit_cell(0, 1, "9".to_string()).unwrap();
@@ -3323,6 +3812,27 @@ mod tests {
             "name,value\na,9\n"
         );
         assert!(!doc.is_dirty());
+    }
+
+    #[test]
+    fn save_tracks_committed_raw_bytes_and_keeps_an_immutable_backing() {
+        let (dir, mut doc) = document("name,value\na,1\nb,2\n");
+        doc.edit_cell(0, 1, "updated".to_string()).unwrap();
+        let output = dir.path().join("saved-fingerprint.csv");
+
+        doc.save(&output).unwrap();
+
+        assert_eq!(doc.source_fingerprint, file_fingerprint(&output).unwrap());
+        assert_ne!(doc.data_path, output);
+        assert!(doc._prepared_source.is_some());
+        std::fs::write(&output, "name,value\nexternal,9\n").unwrap();
+        assert_eq!(
+            doc.display_rows(0, 2).unwrap(),
+            vec![
+                (0, vec!["a".to_string(), "updated".to_string()]),
+                (1, vec!["b".to_string(), "2".to_string()]),
+            ]
+        );
     }
 
     #[test]
@@ -3638,6 +4148,31 @@ mod tests {
     }
 
     #[test]
+    fn missing_destination_commit_rejects_a_changed_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("new.csv");
+        let temporary = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        std::fs::write(temporary.path(), "a,b\nvalidated,1\n").unwrap();
+        let expected = file_fingerprint_cancellable(temporary.path(), &|| false).unwrap();
+        let expected_state = capture_open_file_state(temporary.as_file()).unwrap();
+        std::fs::write(temporary.path(), "a,b\nchanged,2\n").unwrap();
+
+        let resolved_target = resolve_save_target(&target).unwrap();
+        let error = commit_temporary(
+            temporary,
+            &target,
+            &resolved_target,
+            DestinationState::Missing,
+            expected,
+            expected_state,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("candidate changed"));
+        assert!(!target.exists());
+    }
+
+    #[test]
     fn concurrent_save_as_destination_change_is_not_overwritten() {
         let (dir, mut doc) = document("a,b\noriginal,1\n");
         doc.edit_cell(0, 1, "edited".to_string()).unwrap();
@@ -3737,7 +4272,12 @@ mod tests {
         )
         .unwrap();
         let prepared_path = doc.data_path.clone();
-        assert_eq!(prepared_path.parent(), path.parent());
+        assert_eq!(
+            prepared_path.parent(),
+            std::fs::canonicalize(path.parent().unwrap())
+                .ok()
+                .as_deref()
+        );
         let build = doc.prepare_search_index_build();
         drop(doc);
         assert!(prepared_path.exists());
@@ -3761,6 +4301,63 @@ mod tests {
     }
 
     #[test]
+    fn background_indexes_are_bound_to_their_originating_document() {
+        let (_first_dir, first) = document("name,value\na,one\nb,two\n");
+        let build = first.prepare_search_index_build();
+        let built = build.build(&CancellationToken::new(), None).unwrap();
+
+        let (_second_dir, mut second) = document("name,value\na,one\nb,two\n");
+        assert!(!second.install_search_index(built));
+        assert!(!second.has_search_index());
+    }
+
+    #[test]
+    fn background_indexes_are_rejected_after_save_resets_revision() {
+        let (dir, mut doc) = document("name,value\na,one\nb,two\n");
+        let build = doc.prepare_search_index_build();
+        let output = dir.path().join("saved.csv");
+        doc.save(&output).unwrap();
+
+        let built = build.build(&CancellationToken::new(), None).unwrap();
+        assert!(!doc.install_search_index(built));
+        assert!(!doc.has_search_index());
+    }
+
+    #[test]
+    fn cancelling_lazy_index_replacement_preserves_installed_index() {
+        let (_dir, mut doc) = document("name,value\nalpha,one\nbeta,two\n");
+        let expected = doc.search("ALPHA", Some(0), false, true).unwrap();
+        doc.ensure_search_index_for_column_cancellable(0, &CancellationToken::new(), None)
+            .unwrap();
+        assert!(doc.has_search_index_for_column(0));
+
+        let cancellation = CancellationToken::new();
+        let cancel_from_progress = cancellation.clone();
+        let progress = move |_, _| cancel_from_progress.cancel();
+        assert!(doc
+            .ensure_search_index_for_column_cancellable(1, &cancellation, Some(&progress))
+            .unwrap_err()
+            .contains("cancelled"));
+        assert!(doc.has_search_index_for_column(0));
+        assert!(!doc.has_search_index_for_column(1));
+        assert_eq!(doc.search("ALPHA", Some(0), false, true).unwrap(), expected);
+    }
+
+    #[test]
+    fn background_index_honors_cancellation_from_final_progress() {
+        let (_dir, doc) = document("name,value\nalpha,one\nbeta,two\n");
+        let build = doc.prepare_search_index_build();
+        let cancellation = CancellationToken::new();
+        let cancel_from_progress = cancellation.clone();
+        let progress = move |_, _| cancel_from_progress.cancel();
+
+        assert!(build
+            .build(&cancellation, Some(&progress))
+            .unwrap_err()
+            .contains("cancelled"));
+    }
+
+    #[test]
     fn indexed_search_uses_complete_values_and_queries() {
         let prefix = "x".repeat(300);
         let contents = format!("name,value\n{prefix}suffix,1\n{prefix},2\n");
@@ -3779,6 +4376,39 @@ mod tests {
         );
         assert_eq!(expected_contains, vec![0]);
         assert_eq!(expected_exact, vec![0]);
+    }
+
+    #[test]
+    fn dirty_column_search_reconciles_edits_and_deletes() {
+        let (_dir, mut doc) =
+            document_with_headers("name,value\na,target\nb,other\nc,target\nd,target\n");
+        doc.edit_source_cell(0, 1, "away".to_string()).unwrap();
+        doc.edit_source_cell(1, 1, "TARGET".to_string()).unwrap();
+        doc.delete_display_row(2).unwrap();
+        doc.edit_source_cell(3, 0, "unrelated".to_string()).unwrap();
+
+        assert_eq!(
+            doc.search("target", Some(1), false, true).unwrap(),
+            vec![1, 3]
+        );
+        assert_eq!(doc.search("target", Some(1), true, true).unwrap(), vec![3]);
+
+        let streamed = std::cell::RefCell::new(Vec::new());
+        let progress = |batch: &[usize], _processed, _total| {
+            streamed.borrow_mut().extend_from_slice(batch);
+        };
+        let result = doc
+            .search_cancellable_streaming(
+                "target",
+                Some(1),
+                false,
+                true,
+                &CancellationToken::new(),
+                &progress,
+            )
+            .unwrap();
+        assert_eq!(result, vec![1, 3]);
+        assert_eq!(*streamed.borrow(), vec![1, 3]);
     }
 
     #[test]
@@ -3984,6 +4614,119 @@ mod tests {
     }
 
     #[test]
+    fn prepared_document_fingerprint_uses_raw_utf16_source_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw-utf16.csv");
+        let bytes = utf16_bytes("name,value\r\nalpha,1\r\n", true, true);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let document = CsvDocument::open(
+            &path,
+            Some(ParseOverrides {
+                has_headers: Some(true),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(document.source_fingerprint.len, bytes.len() as u64);
+        assert_eq!(
+            document.source_fingerprint.content_hash,
+            *blake3::hash(&bytes).as_bytes()
+        );
+        assert_eq!(
+            document.source_fingerprint,
+            file_fingerprint(&path).unwrap()
+        );
+        assert_ne!(document.data_path, path);
+    }
+
+    #[test]
+    fn open_rejects_source_change_after_immutable_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("changing.csv");
+        std::fs::write(&path, "name,value\nalpha,1\nbeta,2\n").unwrap();
+        let original_fingerprint = file_fingerprint(&path).unwrap();
+        let original_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let changed = std::cell::Cell::new(false);
+        let source_path = path.clone();
+        let progress = |_| {
+            if !changed.replace(true) {
+                std::fs::write(&source_path, "name,value\nbravo,8\nzeta,9\n").unwrap();
+                let source = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&source_path)
+                    .unwrap();
+                source
+                    .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+                    .unwrap();
+            }
+        };
+
+        let error = CsvDocument::open(
+            &path,
+            Some(ParseOverrides {
+                has_headers: Some(true),
+                ..Default::default()
+            }),
+            Some(&progress),
+        )
+        .err()
+        .expect("open should reject a source change");
+
+        assert!(changed.get());
+        let replacement_fingerprint = file_fingerprint(&path).unwrap();
+        assert_eq!(replacement_fingerprint.len, original_fingerprint.len);
+        assert_eq!(
+            replacement_fingerprint.modified,
+            original_fingerprint.modified
+        );
+        assert_ne!(
+            replacement_fingerprint.content_hash,
+            original_fingerprint.content_hash
+        );
+        assert!(error.contains("changed on disk while it was being opened"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_symlink_retarget_after_immutable_capture() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.csv");
+        let second = dir.path().join("second.csv");
+        let link = dir.path().join("linked.csv");
+        std::fs::write(&first, "name,value\nfirst,1\n").unwrap();
+        std::fs::write(&second, "name,value\nother,2\n").unwrap();
+        symlink(&first, &link).unwrap();
+        let retargeted = std::cell::Cell::new(false);
+        let link_path = link.clone();
+        let second_path = second.clone();
+        let progress = |_| {
+            if !retargeted.replace(true) {
+                std::fs::remove_file(&link_path).unwrap();
+                symlink(&second_path, &link_path).unwrap();
+            }
+        };
+
+        let error = CsvDocument::open(
+            &link,
+            Some(ParseOverrides {
+                has_headers: Some(true),
+                ..Default::default()
+            }),
+            Some(&progress),
+        )
+        .err()
+        .expect("open should reject a retargeted source");
+
+        assert!(retargeted.get());
+        assert!(error.contains("changed on disk while it was being opened"));
+    }
+
+    #[test]
     fn immutable_snapshots_prefer_the_source_filesystem() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("snapshot.csv");
@@ -3991,7 +4734,12 @@ mod tests {
 
         let doc = CsvDocument::open(&path, None, None).unwrap();
 
-        assert_eq!(doc.data_path.parent(), path.parent());
+        assert_eq!(
+            doc.data_path.parent(),
+            std::fs::canonicalize(path.parent().unwrap())
+                .ok()
+                .as_deref()
+        );
     }
 
     #[test]
@@ -4117,6 +4865,52 @@ mod tests {
     }
 
     #[test]
+    fn cached_open_uses_raw_hash_when_content_changes_at_the_same_length_and_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cached.csv");
+        let cache_root = dir.path().join("cache");
+        let original = "name,value\na,1\nb,2\n";
+        let replacement = "name,value\nx,9\ny,8\n";
+        assert_eq!(original.len(), replacement.len());
+        std::fs::write(&path, original).unwrap();
+        let original_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let overrides = ParseOverrides {
+            has_headers: Some(true),
+            ..Default::default()
+        };
+        let original_document =
+            CsvDocument::open_cached(&path, Some(overrides.clone()), None, &cache_root).unwrap();
+        let original_key = original_document.disk_cache_key.unwrap();
+        drop(original_document);
+
+        std::fs::write(&path, replacement).unwrap();
+        let source = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        source
+            .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+            .unwrap();
+        drop(source);
+        let replacement_fingerprint = file_fingerprint(&path).unwrap();
+        assert_eq!(replacement_fingerprint.len, original_key.len);
+        assert_eq!(replacement_fingerprint.modified, original_key.modified);
+        assert_ne!(
+            replacement_fingerprint.content_hash,
+            original_key.content_hash
+        );
+        let replacement_document =
+            CsvDocument::open_cached(&path, Some(overrides), None, &cache_root).unwrap();
+        let replacement_key = replacement_document.disk_cache_key.unwrap();
+
+        assert_eq!(replacement_key.len, original_key.len);
+        assert_eq!(replacement_key.modified, original_key.modified);
+        assert_ne!(replacement_key.content_hash, original_key.content_hash);
+        assert_ne!(replacement_key.hash, original_key.hash);
+        assert_eq!(
+            replacement_document.display_rows(0, 2).unwrap()[0].1,
+            vec!["x", "9"]
+        );
+    }
+
+    #[test]
     fn prepared_unicode_sources_reuse_offset_and_sort_caches() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cached-unicode.csv");
@@ -4128,18 +4922,35 @@ mod tests {
             has_headers: Some(true),
             ..Default::default()
         };
-        let mut doc =
-            CsvDocument::open_cached(&path, Some(overrides.clone()), None, &cache_root).unwrap();
-        doc.sort(Some(SortSpec {
+        let sort = SortSpec {
             column: 0,
             direction: SortDirection::Ascending,
-        }))
-        .unwrap();
-        let cache_dir = cache_root.join("csv-index-cache");
-        assert!(std::fs::read_dir(&cache_dir).unwrap().count() >= 2);
+        };
+        let mut document =
+            CsvDocument::open_cached(&path, Some(overrides.clone()), None, &cache_root).unwrap();
+        document.sort(Some(sort)).unwrap();
+        let cache_dir = document.disk_cache_dir.clone().unwrap();
+        let cache_key = document.disk_cache_key.unwrap();
+        let offsets_path = offsets_cache_path(&cache_dir, cache_key);
+        let warnings_path = warnings_cache_path(&cache_dir, cache_key);
+        let order_path = order_cache_path(&cache_dir, cache_key, sort.column, true);
+        assert!(offsets_path.is_file());
+        assert!(warnings_path.is_file());
+        assert!(order_path.is_file());
+        let order_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&order_path)
+            .unwrap();
+        let marker = std::time::SystemTime::now() + std::time::Duration::from_secs(60 * 60);
+        order_file
+            .set_times(std::fs::FileTimes::new().set_modified(marker))
+            .unwrap();
+        let marked_modified = order_file.metadata().unwrap().modified().unwrap();
+        drop(order_file);
+        drop(document);
 
         let progress = std::cell::Cell::new(0);
-        let reopened = CsvDocument::open_cached(
+        let mut reopened = CsvDocument::open_cached(
             &path,
             Some(overrides),
             Some(&|rows| progress.set(rows)),
@@ -4147,7 +4958,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(progress.get(), reopened.row_count());
-        assert_eq!(reopened.display_rows(0, 2).unwrap().len(), 2);
+        reopened.sort(Some(sort)).unwrap();
+        assert_eq!(reopened.display_rows(0, 2).unwrap()[0].1[0], "a");
+        assert_eq!(
+            std::fs::metadata(order_path).unwrap().modified().unwrap(),
+            marked_modified
+        );
     }
 
     #[test]

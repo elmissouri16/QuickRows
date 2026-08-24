@@ -4,10 +4,12 @@ use encoding_rs::Encoding;
 use rayon::prelude::*;
 use rayon::slice::ParallelSliceMut;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 const SAMPLE_SIZE: usize = 64 * 1024;
@@ -235,6 +237,14 @@ pub struct PreparedCsvSource {
     pub temporary: Option<Arc<tempfile::NamedTempFile>>,
     pub warnings: Vec<ParseWarning>,
     pub comments: Vec<PreservedComment>,
+}
+
+pub(crate) struct PreparedSavedCsvSource {
+    pub prepared: PreparedCsvSource,
+    pub headers: Vec<String>,
+    pub offsets: Vec<u64>,
+    pub raw_len: u64,
+    pub raw_content_hash: [u8; 32],
 }
 
 fn push_warning(warnings: &mut Vec<ParseWarning>, warning: ParseWarning) {
@@ -828,6 +838,22 @@ pub fn default_parse_settings() -> ParseSettings {
     }
 }
 
+pub(crate) fn canonical_storage_settings(settings: &ParseSettings) -> ParseSettings {
+    let mut storage_settings = settings.clone();
+    storage_settings.delimiter = ',';
+    storage_settings.quote = '"';
+    storage_settings.escape = None;
+    storage_settings.comment = None;
+    storage_settings.excel_sep = false;
+    storage_settings.source_bom = false;
+    storage_settings.source_bom_len = 0;
+    storage_settings.terminator = Terminator::Any(b'\n');
+    storage_settings.line_ending = "lf".to_string();
+    storage_settings.encoding = encoding_rs::UTF_8;
+    storage_settings.encoding_label = "utf-8".to_string();
+    storage_settings
+}
+
 fn needs_prepared_source(settings: &ParseSettings) -> bool {
     settings.source_bom_len > 0
         || settings.encoding == encoding_rs::UTF_16LE
@@ -842,9 +868,174 @@ fn needs_prepared_source(settings: &ParseSettings) -> bool {
         || settings.malformed != MalformedMode::Skip
 }
 
-struct StreamingCanonicalWriter<'a, W: Write> {
-    settings: &'a ParseSettings,
+trait CanonicalRecordSink {
+    type Output;
+
+    fn write_record(&mut self, fields: &[String]) -> Result<(), String>;
+    fn finish(self) -> Result<Self::Output, String>;
+}
+
+struct CsvCanonicalSink<W: Write> {
     writer: csv::Writer<W>,
+}
+
+impl<W: Write> CsvCanonicalSink<W> {
+    fn new(output: W) -> Self {
+        Self {
+            writer: csv::WriterBuilder::new()
+                .has_headers(false)
+                .flexible(true)
+                .terminator(Terminator::Any(b'\n'))
+                .from_writer(output),
+        }
+    }
+}
+
+impl<W: Write> CanonicalRecordSink for CsvCanonicalSink<W> {
+    type Output = ();
+
+    fn write_record(&mut self, fields: &[String]) -> Result<(), String> {
+        self.writer
+            .write_record(fields)
+            .map_err(|error| error.to_string())
+    }
+
+    fn finish(mut self) -> Result<Self::Output, String> {
+        self.writer.flush().map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Clone, Default)]
+struct ReusableRecordBuffer(Rc<RefCell<Vec<u8>>>);
+
+impl Write for ReusableRecordBuffer {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct SavedCanonicalOutput {
+    headers: Vec<String>,
+    offsets: Vec<u64>,
+}
+
+struct IndexedSavedCsvSink<W: Write> {
+    output: W,
+    record_writer: csv::Writer<ReusableRecordBuffer>,
+    record_bytes: Rc<RefCell<Vec<u8>>>,
+    has_headers: bool,
+    expected_headers: Vec<String>,
+    expected_rows: usize,
+    headers: Vec<String>,
+    offsets: Vec<u64>,
+    records_seen: usize,
+    position: u64,
+}
+
+impl<W: Write> IndexedSavedCsvSink<W> {
+    fn new(
+        output: W,
+        has_headers: bool,
+        expected_headers: &[String],
+        expected_rows: usize,
+    ) -> Self {
+        let record_buffer = ReusableRecordBuffer::default();
+        let record_bytes = record_buffer.0.clone();
+        Self {
+            output,
+            record_writer: csv::WriterBuilder::new()
+                .has_headers(false)
+                .flexible(true)
+                .terminator(Terminator::Any(b'\n'))
+                .from_writer(record_buffer),
+            record_bytes,
+            has_headers,
+            expected_headers: expected_headers.to_vec(),
+            expected_rows,
+            headers: Vec::new(),
+            offsets: Vec::with_capacity(expected_rows),
+            records_seen: 0,
+            position: 0,
+        }
+    }
+
+    fn write_canonical_record(&mut self, fields: &[String]) -> Result<(), String> {
+        self.record_writer
+            .write_record(fields)
+            .map_err(|error| error.to_string())?;
+        self.record_writer
+            .flush()
+            .map_err(|error| error.to_string())?;
+        let mut bytes = self.record_bytes.borrow_mut();
+        self.output
+            .write_all(&bytes)
+            .map_err(|error| error.to_string())?;
+        self.position = self.position.saturating_add(bytes.len() as u64);
+        bytes.clear();
+        Ok(())
+    }
+}
+
+impl<W: Write> CanonicalRecordSink for IndexedSavedCsvSink<W> {
+    type Output = SavedCanonicalOutput;
+
+    fn write_record(&mut self, fields: &[String]) -> Result<(), String> {
+        let is_header = self.has_headers && self.records_seen == 0;
+        if is_header {
+            if fields != self.expected_headers {
+                return Err("Saved CSV headers changed during validation".to_string());
+            }
+            self.headers = fields.to_vec();
+        } else {
+            if !self.has_headers && self.headers.is_empty() {
+                self.headers = (0..fields.len())
+                    .map(|column| format!("Column {}", column + 1))
+                    .collect();
+                if !self.expected_headers.is_empty() && self.headers != self.expected_headers {
+                    return Err("Saved CSV column count changed during validation".to_string());
+                }
+            }
+            if fields.len() != self.headers.len() {
+                return Err(format!(
+                    "Saved CSV row has {} fields, expected {}",
+                    fields.len(),
+                    self.headers.len()
+                ));
+            }
+            self.offsets.push(self.position);
+        }
+        self.write_canonical_record(fields)?;
+        self.records_seen = self.records_seen.saturating_add(1);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Self::Output, String> {
+        if self.has_headers && !self.expected_headers.is_empty() && self.records_seen == 0 {
+            return Err("Saved CSV is missing its header record".to_string());
+        }
+        if self.offsets.len() != self.expected_rows {
+            return Err(format!(
+                "Saved CSV has {} rows, expected {}",
+                self.offsets.len(),
+                self.expected_rows
+            ));
+        }
+        self.output.flush().map_err(|error| error.to_string())?;
+        Ok(SavedCanonicalOutput {
+            headers: self.headers,
+            offsets: self.offsets,
+        })
+    }
+}
+
+struct StreamingCanonicalWriter<'a, S: CanonicalRecordSink> {
+    settings: &'a ParseSettings,
+    sink: S,
     warnings: &'a mut Vec<ParseWarning>,
     comments: &'a mut Vec<PreservedComment>,
     fields: Vec<String>,
@@ -869,20 +1060,16 @@ struct StreamingCanonicalWriter<'a, W: Write> {
     excel_prefix: String,
 }
 
-impl<'a, W: Write> StreamingCanonicalWriter<'a, W> {
+impl<'a, S: CanonicalRecordSink> StreamingCanonicalWriter<'a, S> {
     fn new(
-        output: W,
+        sink: S,
         settings: &'a ParseSettings,
         warnings: &'a mut Vec<ParseWarning>,
         comments: &'a mut Vec<PreservedComment>,
     ) -> Self {
         Self {
             settings,
-            writer: csv::WriterBuilder::new()
-                .has_headers(false)
-                .flexible(true)
-                .terminator(Terminator::Any(b'\n'))
-                .from_writer(output),
+            sink,
             warnings,
             comments,
             fields: Vec::new(),
@@ -1012,9 +1199,7 @@ impl<'a, W: Write> StreamingCanonicalWriter<'a, W> {
     fn finish_record(&mut self) -> Result<(), String> {
         self.fields.push(std::mem::take(&mut self.field));
         if !self.skip_record {
-            self.writer
-                .write_record(&self.fields)
-                .map_err(|error| error.to_string())?;
+            self.sink.write_record(&self.fields)?;
             self.emitted_records += 1;
         }
         self.fields.clear();
@@ -1191,7 +1376,7 @@ impl<'a, W: Write> StreamingCanonicalWriter<'a, W> {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<(), String> {
+    fn finish(mut self) -> Result<S::Output, String> {
         if self.checking_excel_sep {
             self.checking_excel_sep = false;
             let prefix = std::mem::take(&mut self.excel_prefix);
@@ -1227,27 +1412,49 @@ impl<'a, W: Write> StreamingCanonicalWriter<'a, W> {
                 self.finish_record()?;
             }
         }
-        self.writer.flush().map_err(|error| error.to_string())
+        self.sink.finish()
     }
 }
 
-fn stream_canonical_csv<W: Write>(
+#[derive(Default)]
+struct RawStreamFingerprint {
+    hasher: blake3::Hasher,
+    len: u64,
+}
+
+impl RawStreamFingerprint {
+    fn update(&mut self, bytes: &[u8]) {
+        self.hasher.update(bytes);
+        self.len = self.len.saturating_add(bytes.len() as u64);
+    }
+
+    fn finish(self) -> (u64, [u8; 32]) {
+        (self.len, *self.hasher.finalize().as_bytes())
+    }
+}
+
+fn stream_canonical_csv_to_sink<S: CanonicalRecordSink>(
     path: &Path,
     settings: &ParseSettings,
-    output: W,
+    sink: S,
     warnings: &mut Vec<ParseWarning>,
     comments: &mut Vec<PreservedComment>,
     progress: Option<&dyn Fn(usize)>,
     is_cancelled: &dyn Fn() -> bool,
-) -> Result<(), String> {
+    mut raw_fingerprint: Option<&mut RawStreamFingerprint>,
+) -> Result<S::Output, String> {
     let mut file = File::open(path).map_err(|error| error.to_string())?;
     if settings.source_bom_len > 0 {
-        file.seek(SeekFrom::Start(settings.source_bom_len as u64))
+        let mut bom = vec![0u8; settings.source_bom_len];
+        file.read_exact(&mut bom)
             .map_err(|error| error.to_string())?;
+        if let Some(fingerprint) = raw_fingerprint.as_deref_mut() {
+            fingerprint.update(&bom);
+        }
     }
     let mut reader = BufReader::new(file);
     let mut decoder = settings.encoding.new_decoder_without_bom_handling();
-    let mut canonical = StreamingCanonicalWriter::new(output, settings, warnings, comments);
+    let mut canonical = StreamingCanonicalWriter::new(sink, settings, warnings, comments);
     let mut input = vec![0u8; 64 * 1024];
     let mut decoded = vec![0u8; 256 * 1024 + 16];
     let mut total_read = settings.source_bom_len;
@@ -1257,6 +1464,9 @@ fn stream_canonical_csv<W: Write>(
             return Err("Operation cancelled".to_string());
         }
         let read = reader.read(&mut input).map_err(|error| error.to_string())?;
+        if let Some(fingerprint) = raw_fingerprint.as_deref_mut() {
+            fingerprint.update(&input[..read]);
+        }
         total_read += read;
         let last = read == 0;
         let mut consumed = 0;
@@ -1296,6 +1506,27 @@ fn stream_canonical_csv<W: Write>(
         }
     }
     canonical.finish()
+}
+
+fn stream_canonical_csv<W: Write>(
+    path: &Path,
+    settings: &ParseSettings,
+    output: W,
+    warnings: &mut Vec<ParseWarning>,
+    comments: &mut Vec<PreservedComment>,
+    progress: Option<&dyn Fn(usize)>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), String> {
+    stream_canonical_csv_to_sink(
+        path,
+        settings,
+        CsvCanonicalSink::new(output),
+        warnings,
+        comments,
+        progress,
+        is_cancelled,
+        None,
+    )
 }
 
 fn csv_tempfile_near(path: &Path, prefix: &str) -> Result<tempfile::NamedTempFile, String> {
@@ -1355,25 +1586,71 @@ pub fn prepare_csv_source_cancellable(
         .flush()
         .map_err(|error| error.to_string())?;
 
-    let mut storage_settings = settings.clone();
-    storage_settings.delimiter = ',';
-    storage_settings.quote = '"';
-    storage_settings.escape = None;
-    storage_settings.comment = None;
-    storage_settings.excel_sep = false;
-    storage_settings.source_bom = false;
-    storage_settings.source_bom_len = 0;
-    storage_settings.terminator = Terminator::Any(b'\n');
-    storage_settings.line_ending = "lf".to_string();
-    storage_settings.encoding = encoding_rs::UTF_8;
-    storage_settings.encoding_label = "utf-8".to_string();
-
     Ok(PreparedCsvSource {
         path: temporary.path().to_path_buf(),
-        settings: storage_settings,
+        settings: canonical_storage_settings(settings),
         temporary: Some(Arc::new(temporary)),
         warnings,
         comments,
+    })
+}
+
+pub(crate) fn prepare_saved_csv_source_cancellable(
+    raw_path: &Path,
+    strict_settings: &ParseSettings,
+    expected_headers: &[String],
+    expected_rows: usize,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<PreparedSavedCsvSource, String> {
+    if strict_settings.malformed != MalformedMode::Strict {
+        return Err("Saved CSV validation requires strict malformed-row handling".to_string());
+    }
+    if is_cancelled() {
+        return Err("Operation cancelled".to_string());
+    }
+
+    let mut temporary = csv_tempfile_near(raw_path, "quickrows-saved-")?;
+    let mut warnings = Vec::new();
+    let mut comments = Vec::new();
+    let output = BufWriter::with_capacity(1024 * 1024, temporary.as_file_mut());
+    let indexed = IndexedSavedCsvSink::new(
+        output,
+        strict_settings.has_headers,
+        expected_headers,
+        expected_rows,
+    );
+    let mut raw_fingerprint = RawStreamFingerprint::default();
+    let result = stream_canonical_csv_to_sink(
+        raw_path,
+        strict_settings,
+        indexed,
+        &mut warnings,
+        &mut comments,
+        None,
+        is_cancelled,
+        Some(&mut raw_fingerprint),
+    )?;
+    if !warnings.is_empty() {
+        return Err("Saved CSV produced warnings during strict validation".to_string());
+    }
+    if is_cancelled() {
+        return Err("Operation cancelled".to_string());
+    }
+
+    let path = temporary.path().to_path_buf();
+    let (raw_len, raw_content_hash) = raw_fingerprint.finish();
+    Ok(PreparedSavedCsvSource {
+        prepared: PreparedCsvSource {
+            path,
+            settings: canonical_storage_settings(strict_settings),
+            temporary: Some(Arc::new(temporary)),
+            warnings,
+            comments,
+        },
+        headers: result.headers,
+        offsets: result.offsets,
+        raw_len,
+        raw_content_hash,
     })
 }
 
@@ -2127,6 +2404,129 @@ fn read_chunk_with_offsets_from_reader<R: Read + Seek>(
     Ok(rows)
 }
 
+fn project_column_from_record(
+    record: &ByteRecord,
+    row_index: usize,
+    column_idx: usize,
+    settings: &ParseSettings,
+    expected_columns: Option<usize>,
+    warnings: &mut Vec<ParseWarning>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let valid_width = expected_columns.is_none_or(|expected| record.len() == expected);
+    let simple_utf8 = settings.encoding == encoding_rs::UTF_8
+        && settings.max_field_size == usize::MAX
+        && settings.max_record_size == usize::MAX
+        && valid_width
+        && record
+            .iter()
+            .all(|field| std::str::from_utf8(field).is_ok());
+    if simple_utf8 {
+        let Some(field) = record.get(column_idx) else {
+            return Ok(None);
+        };
+        let value = std::str::from_utf8(field)?;
+        return Ok(Some(
+            if !settings.has_headers && row_index == 0 && column_idx == 0 {
+                strip_bom(value)
+            } else {
+                value
+            }
+            .to_string(),
+        ));
+    }
+
+    let strip_bom = !settings.has_headers && row_index == 0;
+    let (decoded, had_errors) = decode_record(record, settings, strip_bom);
+    if had_errors {
+        push_warning(
+            warnings,
+            ParseWarning {
+                record: Some(row_index as u64),
+                line: None,
+                byte: None,
+                field: None,
+                kind: "utf8".to_string(),
+                message: "Record contains invalid encoding".to_string(),
+                expected_len: None,
+                len: None,
+            },
+        );
+        if settings.malformed == MalformedMode::Strict {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("CSV error: record {} has invalid encoding", row_index),
+            )));
+        }
+        if settings.malformed == MalformedMode::Skip {
+            return Ok(None);
+        }
+    }
+
+    let decoded = match apply_length_policy(
+        decoded,
+        expected_columns,
+        settings,
+        Some(row_index as u64),
+        warnings,
+    )? {
+        Some(row) => row,
+        None => return Ok(None),
+    };
+    let decoded = match enforce_size_limits(decoded, settings, Some(row_index as u64), warnings)? {
+        Some(row) => row,
+        None => return Ok(None),
+    };
+    Ok(decoded.get(column_idx).cloned())
+}
+
+fn read_column_range_with_offsets_from_reader<R: Read + Seek>(
+    mut rdr: csv::Reader<R>,
+    offsets: &[u64],
+    start: usize,
+    end: usize,
+    column_idx: usize,
+    settings: &ParseSettings,
+    expected_columns: Option<usize>,
+    warnings: &mut Vec<ParseWarning>,
+) -> Result<Vec<Option<String>>, Box<dyn std::error::Error>> {
+    if start >= offsets.len() || start >= end {
+        return Ok(Vec::new());
+    }
+    if expected_columns.is_some_and(|expected| column_idx >= expected) {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "CSV column is out of range",
+        )));
+    }
+
+    let end = end.min(offsets.len());
+    let mut values = vec![None; end - start];
+    let mut record = ByteRecord::new();
+    let mut position = Position::new();
+    position.set_byte(offsets[start]);
+    rdr.seek(position)?;
+
+    for row_index in start..end {
+        if rdr.position().byte() != offsets[row_index] {
+            let mut position = Position::new();
+            position.set_byte(offsets[row_index]);
+            rdr.seek(position)?;
+        }
+        if !rdr.read_byte_record(&mut record)? {
+            break;
+        }
+        values[row_index - start] = project_column_from_record(
+            &record,
+            row_index,
+            column_idx,
+            settings,
+            expected_columns,
+            warnings,
+        )?;
+    }
+    Ok(values)
+}
+
 fn read_rows_by_index_from_reader<R: Read + Seek>(
     mut rdr: csv::Reader<R>,
     offsets: &[u64],
@@ -2423,6 +2823,55 @@ pub fn read_chunk_with_offsets_mmap(
         offsets,
         start,
         count,
+        settings,
+        expected_columns,
+        warnings,
+    )
+}
+
+pub(crate) fn read_column_range_with_offsets(
+    path: impl AsRef<Path>,
+    offsets: &[u64],
+    start: usize,
+    end: usize,
+    column_idx: usize,
+    settings: &ParseSettings,
+    expected_columns: Option<usize>,
+    warnings: &mut Vec<ParseWarning>,
+) -> Result<Vec<Option<String>>, Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let rdr = build_reader(reader, settings, false);
+    read_column_range_with_offsets_from_reader(
+        rdr,
+        offsets,
+        start,
+        end,
+        column_idx,
+        settings,
+        expected_columns,
+        warnings,
+    )
+}
+
+pub(crate) fn read_column_range_with_offsets_mmap(
+    data: &[u8],
+    offsets: &[u64],
+    start: usize,
+    end: usize,
+    column_idx: usize,
+    settings: &ParseSettings,
+    expected_columns: Option<usize>,
+    warnings: &mut Vec<ParseWarning>,
+) -> Result<Vec<Option<String>>, Box<dyn std::error::Error>> {
+    let cursor = Cursor::new(data);
+    let rdr = build_reader(cursor, settings, false);
+    read_column_range_with_offsets_from_reader(
+        rdr,
+        offsets,
+        start,
+        end,
+        column_idx,
         settings,
         expected_columns,
         warnings,
@@ -3206,6 +3655,131 @@ mod tests {
         let (decoded, had_errors) = decode_record(&record, &settings, true);
         assert!(!had_errors);
         assert_eq!(decoded[0], "Name");
+    }
+
+    #[test]
+    fn saved_preparation_writes_canonical_offsets_during_validation() {
+        let file = write_temp_csv("name,note\r\nalpha,\"line one\nline two\"\r\nbeta,plain\r\n");
+        let mut settings = default_parse_settings();
+        settings.malformed = MalformedMode::Strict;
+        let saved = prepare_saved_csv_source_cancellable(
+            file.path(),
+            &settings,
+            &["name".to_string(), "note".to_string()],
+            2,
+            &|| false,
+        )
+        .expect("prepare saved source");
+        let generic = prepare_csv_source(file.path(), &settings).expect("prepare generic source");
+        let mut warnings = Vec::new();
+        let scanned_offsets = build_row_offsets(
+            &saved.prepared.path,
+            &saved.prepared.settings,
+            Some(2),
+            &mut warnings,
+            None,
+        )
+        .expect("scan canonical offsets");
+
+        assert_eq!(saved.headers, vec!["name", "note"]);
+        assert_eq!(saved.offsets, scanned_offsets);
+        let raw = std::fs::read(file.path()).unwrap();
+        assert_eq!(saved.raw_len, raw.len() as u64);
+        assert_eq!(saved.raw_content_hash, *blake3::hash(&raw).as_bytes());
+        assert_eq!(
+            std::fs::read(&saved.prepared.path).unwrap(),
+            std::fs::read(&generic.path).unwrap()
+        );
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn column_range_projection_is_aligned_and_matches_mmap() {
+        let file = write_temp_csv("id,value,tail\r\n1,\"two,2\",x\r\n2,\"line\nbreak\",\r\n");
+        let settings = default_parse_settings();
+        let mut warnings = Vec::new();
+        let offsets = build_row_offsets(file.path(), &settings, Some(3), &mut warnings, None)
+            .expect("build offsets");
+        let expected = vec![Some("two,2".to_string()), Some("line\nbreak".to_string())];
+
+        let projected = read_column_range_with_offsets(
+            file.path(),
+            &offsets,
+            0,
+            offsets.len(),
+            1,
+            &settings,
+            Some(3),
+            &mut Vec::new(),
+        )
+        .expect("project file column");
+        let data = std::fs::read(file.path()).expect("read file");
+        let mmap_projected = read_column_range_with_offsets_mmap(
+            &data,
+            &offsets,
+            0,
+            offsets.len(),
+            1,
+            &settings,
+            Some(3),
+            &mut Vec::new(),
+        )
+        .expect("project mmap column");
+
+        assert_eq!(projected, expected);
+        assert_eq!(mmap_projected, expected);
+        assert_eq!(
+            read_column_range_with_offsets(
+                file.path(),
+                &offsets,
+                1,
+                2,
+                2,
+                &settings,
+                Some(3),
+                &mut Vec::new(),
+            )
+            .unwrap(),
+            vec![Some(String::new())]
+        );
+    }
+
+    #[test]
+    fn column_projection_applies_record_repair_before_projection() {
+        let file = write_temp_csv("abc,def\n");
+        let mut settings = default_parse_settings();
+        settings.has_headers = false;
+        settings.malformed = MalformedMode::Repair;
+        settings.max_record_size = 2;
+        let mut warnings = Vec::new();
+        let offsets = build_row_offsets(file.path(), &settings, Some(2), &mut warnings, None)
+            .expect("build offsets");
+
+        let projected = read_column_range_with_offsets(
+            file.path(),
+            &offsets,
+            0,
+            1,
+            0,
+            &settings,
+            Some(2),
+            &mut Vec::new(),
+        )
+        .expect("project repaired column");
+        let full = read_chunk_with_offsets(
+            file.path(),
+            &offsets,
+            0,
+            1,
+            &settings,
+            Some(2),
+            &mut Vec::new(),
+        )
+        .expect("read repaired row");
+
+        assert_eq!(projected, vec![Some("ab".to_string())]);
+        assert_eq!(full[0][0], "ab");
+        assert_eq!(full[0][1], "");
     }
 
     #[test]
