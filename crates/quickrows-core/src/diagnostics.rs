@@ -1,9 +1,10 @@
+use crate::error::{QuickRowsError, QuickRowsResult};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,9 +27,9 @@ impl Diagnostics {
         }
     }
 
-    pub fn new(directory: impl Into<PathBuf>, enabled: bool) -> Result<Self, String> {
+    pub fn new(directory: impl Into<PathBuf>, enabled: bool) -> QuickRowsResult<Self> {
         let directory = directory.into();
-        fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+        fs::create_dir_all(&directory).map_err(QuickRowsError::from)?;
         Ok(Self {
             directory,
             enabled: Arc::new(AtomicBool::new(enabled)),
@@ -51,7 +52,7 @@ impl Diagnostics {
         self.enabled.load(Ordering::Relaxed)
     }
 
-    pub fn set_enabled(&self, enabled: bool) -> Result<(), String> {
+    pub fn set_enabled(&self, enabled: bool) -> QuickRowsResult<()> {
         self.enabled.store(enabled, Ordering::Relaxed);
         if enabled {
             self.append_debug("debug logging enabled")?;
@@ -59,18 +60,18 @@ impl Diagnostics {
         Ok(())
     }
 
-    pub fn append_debug(&self, message: &str) -> Result<(), String> {
+    pub fn append_debug(&self, message: &str) -> QuickRowsResult<()> {
         if !self.enabled() {
             return Ok(());
         }
         append_line(&self.debug_log_path(), message)
     }
 
-    pub fn clear_debug_log(&self) -> Result<(), String> {
+    pub fn clear_debug_log(&self) -> QuickRowsResult<()> {
         let _guard = LOG_WRITE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        fs::write(self.debug_log_path(), b"").map_err(|e| e.to_string())
+        fs::write(self.debug_log_path(), b"").map_err(QuickRowsError::from)
     }
 
     pub fn install_panic_hook(&self) {
@@ -88,12 +89,12 @@ impl Diagnostics {
     }
 }
 
-fn append_line(path: &Path, message: &str) -> Result<(), String> {
+fn append_line(path: &Path, message: &str) -> QuickRowsResult<()> {
     let _guard = LOG_WRITE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if fs::metadata(path).map(|meta| meta.len()).unwrap_or(0) > LOG_MAX_BYTES {
-        fs::write(path, b"").map_err(|e| e.to_string())?;
+        fs::write(path, b"").map_err(QuickRowsError::from)?;
     }
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -103,8 +104,9 @@ fn append_line(path: &Path, message: &str) -> Result<(), String> {
         .create(true)
         .append(true)
         .open(path)
-        .map_err(|e| e.to_string())?;
-    writeln!(file, "[{timestamp}] {}", truncate_utf8(message, 16 * 1024)).map_err(|e| e.to_string())
+        .map_err(QuickRowsError::from)?;
+    writeln!(file, "[{timestamp}] {}", truncate_utf8(message, 16 * 1024))
+        .map_err(QuickRowsError::from)
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {

@@ -14,10 +14,12 @@ def main() -> None:
         "output",
         nargs="?",
         type=Path,
-        default=Path("test-data/million-rows.csv"),
+        default=Path("test-data/generated/million-rows.csv"),
     )
     parser.add_argument("--rows", type=int, default=1_000_000)
     args = parser.parse_args()
+    if args.rows < 0:
+        parser.error("--rows must be non-negative")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", newline="", encoding="utf-8") as stream:

@@ -8,7 +8,7 @@ fn fixture() -> PathBuf {
         .unwrap_or_else(|| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../..")
-                .join("test-data/million-rows.csv")
+                .join("test-data/generated/million-rows.csv")
         })
 }
 

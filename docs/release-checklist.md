@@ -1,6 +1,6 @@
 # Native release validation
 
-Run the Package smoke workflow and complete this checklist on physical or representative virtual machines before publishing a release.
+Run the Package smoke workflow and complete this checklist on physical or representative virtual machines before publishing a release. Use the [supported-platform matrix](supported-platforms.md) for required OS floors and copy the [validation evidence template](releases/validation-template.md) into the release record.
 
 ## Every platform
 

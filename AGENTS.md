@@ -1,8 +1,8 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `crates/quickrows-core/`: UI-independent CSV engine, settings, and tests.
-- `crates/quickrows-gpui/`: native GPUI + GPUI Component application.
+- `crates/quickrows-core/`: UI-independent CSV engine; `csv/` and `document/` group focused implementation and test files.
+- `crates/quickrows-gpui/`: native GPUI application; `workspace/` groups state, operations, platform integration, and rendering.
 - `assets/`: desktop application icons and source artwork.
 - `docs/`: CSV compatibility and release-validation documentation.
 - `scripts/`: packaging and large-fixture helpers.

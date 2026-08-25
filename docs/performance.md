@@ -16,11 +16,11 @@ manual large-file validation pass.
 
 ## Optimization reference run
 
-Reference environment, captured 2026-08-24:
+Reference environment, captured 2026-08-24 (machine-readable record: [`performance-results/2026-08-24-m3-pro.json`](performance-results/2026-08-24-m3-pro.json)):
 
 - Apple M3 Pro, arm64 macOS/Darwin 25.5.0
 - Rust 1.97.1 (`8bab26f4f`, LLVM 22.1.6)
-- Generated `test-data/million-rows.csv` fixture with 1,000,000 data rows
+- Generated `test-data/generated/million-rows.csv` fixture with 1,000,000 data rows
 - Release benchmark profile; seven samples except three save samples
 
 | Benchmark | Median |

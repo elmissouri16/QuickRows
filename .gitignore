@@ -8,8 +8,8 @@ target
 # Temporary cargo-packager configuration
 /.packager-macos.*.toml
 
-# Generated large-file fixtures
-/test-data/*.csv
+# Generated large-file fixtures and transient stress-test output
+/test-data/generated/
 
 # Editor directories and files
 .vscode/*
@@ -21,3 +21,5 @@ target
 *.njsproj
 *.sln
 *.sw?
+__pycache__/
+*.py[cod]

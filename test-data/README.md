@@ -1,10 +1,13 @@
-# Large-file test data
+# Test data
+
+- `generated/` contains ignored large or transient files created locally.
+- `fixtures/` is reserved for small, deterministic CSV fixtures that should be reviewed and tracked.
 
 Generate the ignored million-record fixture from the repository root:
 
 ```bash
 python3 scripts/generate_million_csv.py
-cargo run -p quickrows-gpui -- test-data/million-rows.csv
+cargo run -p quickrows-gpui -- test-data/generated/million-rows.csv
 ```
 
 The generated file contains exactly 1,000,000 data records plus a header. It uses CRLF endings and includes intentional duplicate groups, quoted commas, quotes, and embedded newlines.
@@ -33,7 +36,7 @@ warm-cache opens; clean sorting; clean and dirty searches; and save-after-edit.
 The default is seven samples per operation and three save samples. Override them
 for a quick local pass with `QUICKROWS_BENCH_SAMPLES` and
 `QUICKROWS_BENCH_SAVE_SAMPLES`. Set `QUICKROWS_MILLION_FIXTURE` to benchmark a
-fixture outside `test-data/`.
+fixture outside `test-data/generated/`.
 
 For stable comparisons, use the same release toolchain and fixture, close other
 I/O-heavy applications, and record both elapsed time and peak resident memory.

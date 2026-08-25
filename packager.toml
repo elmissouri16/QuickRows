@@ -1,4 +1,4 @@
-"$schema" = "https://raw.githubusercontent.com/crabnebula-dev/cargo-packager/master/schema.json"
+"$schema" = "https://raw.githubusercontent.com/crabnebula-dev/cargo-packager/v0.11.8/schema.json"
 name = "quickrows"
 productName = "QuickRows"
 version = "0.1.1"

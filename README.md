@@ -37,14 +37,17 @@ versions together and validate all platforms when upgrading.
 
 ## Native GPUI Development
 
-The project requires a recent stable Rust toolchain (edition 2024 support).
+The project uses the pinned Rust toolchain in `rust-toolchain.toml`.
 
 ```sh
-# Type-check the native app
-cargo check -p quickrows-gpui
+# Type-check every target
+cargo check --workspace --all-targets --locked
 
-# Run core tests
-cargo test -p quickrows-core
+# Run the complete test suite
+cargo test --workspace --locked
+
+# Lint the workspace
+cargo clippy --workspace --all-targets --locked -- -D warnings
 
 # Run the native app
 cargo run -p quickrows-gpui
@@ -70,7 +73,7 @@ Generate the ignored deterministic fixture, then open it directly:
 
 ```sh
 python3 scripts/generate_million_csv.py
-cargo run -p quickrows-gpui -- test-data/million-rows.csv
+cargo run -p quickrows-gpui -- test-data/generated/million-rows.csv
 ```
 
 The generator writes 1,000,000 CRLF records with duplicate groups, quoted
@@ -86,7 +89,7 @@ cargo test -p quickrows-core --test million_rows -- --ignored --nocapture
 Install the packager and build the platform-default native package:
 
 ```sh
-cargo install cargo-packager --locked
+cargo install cargo-packager --version 0.11.8 --locked
 cargo packager --release --config packager.toml
 ```
 
@@ -113,7 +116,7 @@ Developer ID signature and Apple notarization as described in
 `docs/release-checklist.md`.
 
 `packager.toml` builds `quickrows`, uses the existing application icons, and
-registers QuickRows as a viewer for `.csv`/`text-csv` files. The manual/tagged
+registers QuickRows as a viewer for `.csv`/`text/csv` files. The manual/tagged
 `Package smoke` workflow builds native artifacts on macOS, Windows, and Linux.
 Installers are not cross-built; complete `docs/release-checklist.md`, including
 signing/notarization and X11/Wayland checks, before publishing.
@@ -129,25 +132,14 @@ Settings are persisted natively after first use.
 
 ## Architecture
 
-`quickrows-core::CsvDocument` owns parse settings, row offsets, optional mmap,
-a bounded row cache, sort order, edits, and deleted rows. GPUI starts blocking
-CSV operations on its background executor and applies results back to the UI
-entity on the foreground executor. A separate bounded 1,024-row presentation
-cache keeps file reads and document locking out of the virtual-list render
-path; stale viewport requests are rejected by document generation and request
-identity. Sorting changes only the display-to-source mapping.
+`quickrows-core::CsvDocument` is the UI-independent document façade. The GPUI
+application coordinates blocking work on its background executor and applies
+request- and generation-checked results on the foreground executor. Rendering
+uses bounded row caching and row/column virtualization so the complete CSV is
+never represented as UI entities.
 
-The current GPUI shell includes native open/save/save-as, removable recent
-files, virtualized rows, persistent offset/sort caches, configurable density and
-row numbers, compact range-based row selection, complete keyboard extension,
-spreadsheet-style rectangular cell selection, inline editing, explicit
-multi-row delete/restore actions, accessible context menus, sort cycling,
-streamed search and duplicate results, operation progress/cancellation, parse
-override dropdowns, detected-versus-effective format details, parse-warning
-inspection, diagnostics controls, runtime operating-system file-open handling,
-and single-instance forwarding. Final installer/signing validation and broader
-automated end-to-end scroll/platform interaction coverage remain before public
-stable distribution.
+See [`docs/architecture.md`](docs/architecture.md) for module ownership and
+[`docs/README.md`](docs/README.md) for the complete documentation index.
 
 ## Diagnostics
 

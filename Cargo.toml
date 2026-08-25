@@ -3,15 +3,16 @@ members = [
     "crates/quickrows-core",
     "crates/quickrows-gpui",
 ]
-default-members = ["crates/quickrows-gpui"]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.1"
-edition = "2021"
+edition = "2024"
+rust-version = "1.97"
 license = "MIT"
 authors = ["@elmissouri16"]
 repository = "https://github.com/elmissouri16/quickrows"
+homepage = "https://github.com/elmissouri16/quickrows"
 
 [workspace.dependencies]
 csv = "1.3"

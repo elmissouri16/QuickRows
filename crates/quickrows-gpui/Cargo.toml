@@ -1,9 +1,18 @@
 [package]
 name = "quickrows-gpui"
 version.workspace = true
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
 description = "Fast native CSV viewer built with GPUI"
+
+[lib]
+name = "quickrows_gpui"
+path = "src/lib.rs"
 
 [[bin]]
 name = "quickrows"

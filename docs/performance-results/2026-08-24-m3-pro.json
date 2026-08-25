@@ -1,0 +1,24 @@
+{
+  "date": "2026-08-24",
+  "machine": "Apple M3 Pro",
+  "architecture": "arm64",
+  "os": "macOS Darwin 25.5.0",
+  "rust": "1.97.1 (8bab26f4f, LLVM 22.1.6)",
+  "fixture": "test-data/generated/million-rows.csv",
+  "fixture_rows": 1000000,
+  "profile": "release",
+  "samples": {
+    "default": 7,
+    "save": 3
+  },
+  "median_ms": {
+    "uncached_open": 206.247,
+    "cold_cache_open": 218.280,
+    "warm_cache_open": 98.225,
+    "clean_selected_column_sort": 137.291,
+    "clean_selected_column_search": 86.111,
+    "clean_all_column_search": 261.331,
+    "dirty_selected_column_search": 88.286,
+    "save_after_one_edit": 1362.869
+  }
+}

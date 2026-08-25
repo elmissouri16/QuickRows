@@ -2,8 +2,11 @@ use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
 
+type ChunkKey = (usize, usize);
+type CsvChunk = Vec<Vec<String>>;
+
 pub struct CsvCache {
-    cache: Mutex<LruCache<(usize, usize), Vec<Vec<String>>>>,
+    cache: Mutex<LruCache<ChunkKey, CsvChunk>>,
 }
 
 impl CsvCache {
@@ -21,10 +24,6 @@ impl CsvCache {
     pub fn put(&self, start: usize, count: usize, data: Vec<Vec<String>>) {
         self.cache.lock().unwrap().put((start, count), data);
     }
-
-    pub fn clear(&self) {
-        self.cache.lock().unwrap().clear();
-    }
 }
 
 #[cfg(test)]
@@ -32,7 +31,7 @@ mod tests {
     use super::CsvCache;
 
     #[test]
-    fn put_get_clear_and_eviction() {
+    fn put_get_and_eviction() {
         let cache = CsvCache::new(1);
         cache.put(0, 1, vec![vec!["a".to_string()]]);
         assert_eq!(cache.get(0, 1), Some(vec![vec!["a".to_string()]]));
@@ -40,8 +39,5 @@ mod tests {
         cache.put(1, 1, vec![vec!["b".to_string()]]);
         assert!(cache.get(0, 1).is_none());
         assert_eq!(cache.get(1, 1), Some(vec![vec!["b".to_string()]]));
-
-        cache.clear();
-        assert!(cache.get(1, 1).is_none());
     }
 }
