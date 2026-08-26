@@ -6,6 +6,8 @@ mount_quickrows_dmg() {
   MOUNT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/quickrows-dmg.XXXXXX")
   echo "==> Mounting DMG"
   hdiutil attach "$DMG_PATH" -nobrowse -readonly -mountpoint "$MOUNT_DIR" >/dev/null
+  # Read by cleanup_macos_dmg in the sourced common helper.
+  # shellcheck disable=SC2034
   MOUNTED=1
 
   SOURCE_APP="$MOUNT_DIR/QuickRows.app"
@@ -83,6 +85,8 @@ restore_previous_application() {
       return 1
     fi
   fi
+  # Read by cleanup_macos_dmg in the sourced common helper.
+  # shellcheck disable=SC2034
   INSTALL_TRANSACTION_ACTIVE=0
 }
 
@@ -116,6 +120,8 @@ copy_application_transactionally() {
 }
 
 commit_application_install() {
+  # Read by cleanup_macos_dmg in the sourced common helper.
+  # shellcheck disable=SC2034
   INSTALL_TRANSACTION_ACTIVE=0
   cleanup_install_backup
 }

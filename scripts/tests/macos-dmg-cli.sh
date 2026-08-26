@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Non-destructive CLI contract checks; safe to run on every platform.
+# The cleanup fixture intentionally defines globals and callback functions that
+# are consumed only by the dynamically sourced common helper.
+# shellcheck disable=SC1091,SC2034,SC2317,SC2329
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

@@ -1,4 +1,4 @@
-fn needs_prepared_source(settings: &ParseSettings) -> bool {
+fn needs_canonical_storage(settings: &ParseSettings) -> bool {
     settings.source_bom_len > 0
         || settings.encoding == encoding_rs::UTF_16LE
         || settings.encoding == encoding_rs::UTF_16BE
@@ -7,9 +7,10 @@ fn needs_prepared_source(settings: &ParseSettings) -> bool {
         || settings.escape.is_some_and(|value| !value.is_ascii())
         || settings.comment.is_some()
         || settings.excel_sep
-        || settings.max_field_size != usize::MAX
-        || settings.max_record_size != usize::MAX
-        || settings.malformed != MalformedMode::Skip
+}
+
+fn needs_prepared_source(settings: &ParseSettings) -> bool {
+    needs_canonical_storage(settings) || settings.malformed == MalformedMode::Repair
 }
 
 trait CanonicalRecordSink {
@@ -17,6 +18,39 @@ trait CanonicalRecordSink {
 
     fn write_record(&mut self, fields: &[String]) -> QuickRowsResult<()>;
     fn finish(self) -> QuickRowsResult<Self::Output>;
+}
+
+struct DirectValidationSink {
+    malformed: MalformedMode,
+    expected_columns: Option<usize>,
+}
+
+impl DirectValidationSink {
+    fn new(malformed: MalformedMode) -> Self {
+        Self {
+            malformed,
+            expected_columns: None,
+        }
+    }
+}
+
+impl CanonicalRecordSink for DirectValidationSink {
+    type Output = ();
+
+    fn write_record(&mut self, fields: &[String]) -> QuickRowsResult<()> {
+        let expected = *self.expected_columns.get_or_insert(fields.len());
+        if self.malformed == MalformedMode::Strict && fields.len() != expected {
+            return Err(QuickRowsError::invalid_csv(format!(
+                "CSV row has {} fields, expected {expected}",
+                fields.len()
+            )));
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> QuickRowsResult<Self::Output> {
+        Ok(())
+    }
 }
 
 struct CsvCanonicalSink<W: Write> {
@@ -680,16 +714,11 @@ fn stream_canonical_csv<W: Write>(
     )
 }
 
-fn csv_tempfile_near(path: &Path, prefix: &str) -> QuickRowsResult<tempfile::NamedTempFile> {
+fn csv_tempfile(prefix: &str) -> QuickRowsResult<tempfile::NamedTempFile> {
     let mut builder = tempfile::Builder::new();
     builder.prefix(prefix).suffix(".csv");
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        && let Ok(temporary) = builder.tempfile_in(parent)
-    {
-        return Ok(temporary);
-    }
+    // Decoded/canonical files are implementation details. Never expose them
+    // as sidecars in the directory containing a user-owned CSV.
     builder.tempfile().map_err(QuickRowsError::from)
 }
 
@@ -710,16 +739,36 @@ pub fn prepare_csv_source_cancellable(
         return Err(QuickRowsError::cancelled());
     }
     if !needs_prepared_source(settings) {
+        let mut warnings = Vec::new();
+        let mut comments = Vec::new();
+        let needs_validation = settings.max_field_size != usize::MAX
+            || settings.max_record_size != usize::MAX
+            || settings.malformed != MalformedMode::Skip;
+        if needs_validation {
+            // Strict/repair policies and finite limits need a validation pass,
+            // not a second full-size file. Discard canonical output while the
+            // live source remains the document's directly indexed backing.
+            stream_canonical_csv_to_sink(
+                path,
+                settings,
+                DirectValidationSink::new(settings.malformed),
+                &mut warnings,
+                &mut comments,
+                progress,
+                is_cancelled,
+                None,
+            )?;
+        }
         return Ok(PreparedCsvSource {
             path: path.to_path_buf(),
             settings: settings.clone(),
             temporary: None,
-            warnings: Vec::new(),
-            comments: Vec::new(),
+            warnings,
+            comments,
         });
     }
 
-    let mut temporary = csv_tempfile_near(path, "quickrows-decoded-")?;
+    let mut temporary = csv_tempfile("quickrows-decoded-")?;
     let mut warnings = Vec::new();
     let mut comments = Vec::new();
     stream_canonical_csv(
@@ -761,7 +810,58 @@ pub(crate) fn prepare_saved_csv_source_cancellable(
         return Err(QuickRowsError::cancelled());
     }
 
-    let mut temporary = csv_tempfile_near(raw_path, "quickrows-saved-")?;
+    // The serializer already emits directly indexable bytes for ordinary
+    // single-byte CSVs. Validate and index that atomic-save file in place
+    // instead of retaining another full-size canonical copy.
+    if !needs_canonical_storage(strict_settings) {
+        let mut warnings = Vec::new();
+        let headers = get_headers(raw_path, strict_settings, &mut warnings)?;
+        if !expected_headers.is_empty()
+            && headers != expected_headers
+            && !(!strict_settings.has_headers && expected_rows == 0 && headers.is_empty())
+        {
+            return Err(QuickRowsError::invalid_csv(
+                "Saved CSV headers changed during validation",
+            ));
+        }
+        let expected_columns = (!headers.is_empty()).then_some(headers.len());
+        let offsets = build_row_offsets_cancellable(
+            raw_path,
+            strict_settings,
+            expected_columns,
+            &mut warnings,
+            None,
+            is_cancelled,
+        )?;
+        if !warnings.is_empty() {
+            return Err(QuickRowsError::invalid_csv(
+                "Saved CSV produced warnings during strict validation",
+            ));
+        }
+        if offsets.len() != expected_rows {
+            return Err(QuickRowsError::invalid_csv(format!(
+                "Saved CSV has {} rows, expected {expected_rows}",
+                offsets.len()
+            )));
+        }
+        let fingerprint =
+            crate::source_file::file_fingerprint_cancellable(raw_path, is_cancelled)?;
+        return Ok(PreparedSavedCsvSource {
+            prepared: PreparedCsvSource {
+                path: raw_path.to_path_buf(),
+                settings: strict_settings.clone(),
+                temporary: None,
+                warnings,
+                comments: Vec::new(),
+            },
+            headers,
+            offsets,
+            raw_len: fingerprint.len,
+            raw_content_hash: fingerprint.content_hash,
+        });
+    }
+
+    let mut temporary = csv_tempfile("quickrows-saved-")?;
     let mut warnings = Vec::new();
     let mut comments = Vec::new();
     let output = BufWriter::with_capacity(1024 * 1024, temporary.as_file_mut());

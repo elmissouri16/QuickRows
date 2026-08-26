@@ -15,17 +15,21 @@ impl QuickRowsView {
                     .max_w(px(560.0))
                     .gap_5()
                     .child(
-                        Button::new("open-csv")
-                            .icon(IconName::FolderOpen)
-                            .label(if self.operation.is_running() {
-                                "Opening…"
-                            } else {
-                                "Choose a CSV file"
-                            })
-                            .disabled(self.operation.is_running())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_dialog(&OpenFile, window, cx)
-                            })),
+                        div()
+                            .debug_selector(|| "open-csv".to_string())
+                            .child(
+                                Button::new("open-csv")
+                                    .icon(IconName::FolderOpen)
+                                    .label(if self.operation.is_running() {
+                                        "Opening…"
+                                    } else {
+                                        "Choose a CSV file"
+                                    })
+                                    .disabled(self.operation.is_running())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_dialog(&OpenFile, window, cx)
+                                    })),
+                            ),
                     )
                     .when(!recent.is_empty(), |this| {
                         this.child(
@@ -76,8 +80,16 @@ impl QuickRowsView {
     }
 
     fn render_unsaved_confirmation(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let external_reload = self.document.external_change_detected
+            && matches!(
+                self.overlay.modal,
+                Modal::Destructive(PendingDestructiveAction::Reload)
+            );
         let action = match &self.overlay.modal {
             Modal::Destructive(PendingDestructiveAction::Open(_)) => "opening another file",
+            Modal::Destructive(PendingDestructiveAction::Reload) if external_reload => {
+                "reloading the externally changed file"
+            }
             Modal::Destructive(PendingDestructiveAction::Reload) => "reloading with new parse settings",
             Modal::Destructive(PendingDestructiveAction::Clear) => "clearing this file",
             Modal::Destructive(PendingDestructiveAction::Close) => "closing this window",
@@ -86,6 +98,7 @@ impl QuickRowsView {
         };
         div()
             .id("unsaved-backdrop")
+            .debug_selector(|| "unsaved-backdrop".to_string())
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
@@ -111,7 +124,11 @@ impl QuickRowsView {
                         div()
                             .text_xl()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child("Save changes?"),
+                            .child(if external_reload {
+                                "Reload and discard edits?"
+                            } else {
+                                "Save changes?"
+                            }),
                     )
                     .child(format!(
                         "Your cell edits or deleted rows will be lost before {action}."
@@ -121,31 +138,41 @@ impl QuickRowsView {
                             .justify_end()
                             .gap_2()
                             .child(
-                                Button::new("unsaved-cancel")
-                                    .ghost()
-                                    .label("Cancel")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.cancel_pending_destructive(cx)
-                                    })),
+                                div()
+                                    .debug_selector(|| "unsaved-cancel".to_string())
+                                    .child(
+                                        Button::new("unsaved-cancel")
+                                            .ghost()
+                                            .label("Cancel")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.cancel_pending_destructive(cx)
+                                            })),
+                                    ),
                             )
                             .child(
                                 Button::new("unsaved-discard")
                                     .danger()
-                                    .label("Discard")
+                                    .label(if external_reload {
+                                        "Discard & Reload"
+                                    } else {
+                                        "Discard"
+                                    })
                                     .disabled(self.operation.is_running())
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.discard_pending_destructive(window, cx)
                                     })),
                             )
-                            .child(
-                                Button::new("unsaved-save")
-                                    .primary()
-                                    .label("Save")
-                                    .disabled(self.operation.is_running())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.save_pending_destructive(window, cx)
-                                    })),
-                            ),
+                            .when(!external_reload, |actions| {
+                                actions.child(
+                                    Button::new("unsaved-save")
+                                        .primary()
+                                        .label("Save")
+                                        .disabled(self.operation.is_running())
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.save_pending_destructive(window, cx)
+                                        })),
+                                )
+                            }),
                     ),
             )
             .into_any_element()
@@ -181,7 +208,7 @@ impl QuickRowsView {
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child("The CSV changed on disk"),
                     )
-                    .child("Saving here would overwrite changes made by another program. Reload, save a copy, or explicitly overwrite the file.")
+                    .child("QuickRows no longer has a stable view of this file. Reload it before saving so stale row offsets cannot overwrite newer data.")
                     .child(
                         h_flex()
                             .flex_wrap()
@@ -200,21 +227,6 @@ impl QuickRowsView {
                                     .label("Reload")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.reload_external_change(cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("external-save-as")
-                                    .label("Save As…")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.save_external_as(cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("external-save-overwrite")
-                                    .danger()
-                                    .label("Overwrite")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.confirm_external_overwrite(cx)
                                     })),
                             ),
                     ),

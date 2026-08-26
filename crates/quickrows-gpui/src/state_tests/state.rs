@@ -2,8 +2,28 @@
 
 use crate::{
     EditingCell, LoadedDocument, Modal, OperationKind, PendingEditAction, QuickRowsView,
-    cache_header_labels, merge_sorted_unique,
+    cache_header_labels, is_csv_path, is_external_save_conflict, merge_sorted_unique,
 };
+
+#[test]
+fn open_paths_accept_only_csv_extensions_case_insensitively() {
+    assert!(is_csv_path(std::path::Path::new("report.csv")));
+    assert!(is_csv_path(std::path::Path::new("REPORT.CSV")));
+    assert!(!is_csv_path(std::path::Path::new("report.tsv")));
+    assert!(!is_csv_path(std::path::Path::new("report.csv.tmp")));
+    assert!(!is_csv_path(std::path::Path::new("report")));
+}
+
+#[test]
+fn source_and_destination_changes_both_trigger_external_save_handling() {
+    assert!(is_external_save_conflict(
+        quickrows_core::ErrorKind::SourceChanged
+    ));
+    assert!(is_external_save_conflict(
+        quickrows_core::ErrorKind::DestinationChanged
+    ));
+    assert!(!is_external_save_conflict(quickrows_core::ErrorKind::Io));
+}
 
 #[test]
 fn foreground_operation_has_one_consistent_state() {

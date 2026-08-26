@@ -85,17 +85,21 @@ impl QuickRowsView {
             .child(settings_section_title("VIEW", cx))
             .child(settings_row(
                 "Show Row Numbers",
-                Switch::new("settings-index-switch")
-                    .checked(show_index)
-                    .tooltip("Show row numbers")
-                    .on_click({
-                        let view = view.clone();
-                        move |_, window, cx| {
-                            let _ = view.update(cx, |this, cx| {
-                                this.toggle_index(&ToggleIndex, window, cx)
-                            });
-                        }
-                    }),
+                div()
+                    .debug_selector(|| "settings-index-switch".to_string())
+                    .child(
+                        Switch::new("settings-index-switch")
+                            .checked(show_index)
+                            .tooltip("Show row numbers")
+                            .on_click({
+                                let view = view.clone();
+                                move |_, window, cx| {
+                                    let _ = view.update(cx, |this, cx| {
+                                        this.toggle_index(&ToggleIndex, window, cx)
+                                    });
+                                }
+                            }),
+                    ),
                 cx,
             ))
             .child(settings_section_title("SEARCH & PARSING", cx))
@@ -533,11 +537,15 @@ impl QuickRowsView {
                             .border_t_1()
                             .border_color(cx.theme().border)
                             .child(
-                                Button::new("settings-done")
-                                    .primary()
-                                    .label("Done")
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.close_settings(cx)),
+                                div()
+                                    .debug_selector(|| "settings-done".to_string())
+                                    .child(
+                                        Button::new("settings-done")
+                                            .primary()
+                                            .label("Done")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.close_settings(cx)
+                                            })),
                                     ),
                             ),
                     ),

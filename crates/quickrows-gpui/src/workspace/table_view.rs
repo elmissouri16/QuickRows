@@ -595,16 +595,20 @@ impl QuickRowsView {
                         ))
                         .child(Input::new(&self.inputs.search_input).flex_1().min_w(px(180.0)))
                         .child(
-                            Button::new("search-match-case")
-                                .compact()
-                                .label(if self.queries.search.match_case {
-                                    "Aa ✓"
-                                } else {
-                                    "Aa"
-                                })
-                                .disabled(self.operation.is_running())
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.toggle_search_match_case(cx)),
+                            div()
+                                .debug_selector(|| "search-match-case".to_string())
+                                .child(
+                                    Button::new("search-match-case")
+                                        .compact()
+                                        .label(if self.queries.search.match_case {
+                                            "Aa ✓"
+                                        } else {
+                                            "Aa"
+                                        })
+                                        .disabled(self.operation.is_running())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.toggle_search_match_case(cx)
+                                        })),
                                 ),
                         )
                         .child(
@@ -686,11 +690,17 @@ impl QuickRowsView {
                                 })),
                         )
                         .child(
-                            Button::new("close-find")
-                                .compact()
-                                .ghost()
-                                .label("Close")
-                                .on_click(cx.listener(|this, _, _, cx| this.hide_find(cx))),
+                            div()
+                                .debug_selector(|| "close-find".to_string())
+                                .child(
+                                    Button::new("close-find")
+                                        .compact()
+                                        .ghost()
+                                        .label("Close")
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.hide_find(cx)),
+                                        ),
+                                ),
                         ),
                 )
             })

@@ -1,18 +1,45 @@
 #[test]
-fn live_source_files_are_read_from_an_immutable_snapshot() {
+fn ordinary_sources_are_opened_without_a_full_file_snapshot() {
     let mut contents = String::from("a,b\n");
     for row in 0..256 {
         contents.push_str(&format!("row-{row},value-{row}\n"));
     }
     assert!(contents.len() > 1024);
     let (_dir, doc) = document(&contents);
-    assert!(doc._prepared_source.is_some());
-    assert_ne!(doc.data_path, doc.path);
-    assert!(doc.mmap.is_some());
-    let last_row = doc.display_rows(doc.row_count() - 1, 1).unwrap();
+    assert!(doc._prepared_source.is_none());
+    assert_eq!(doc.data_path, doc.path);
+    assert!(doc.mmap.is_none());
+    assert!(doc
+        .path
+        .parent()
+        .unwrap()
+        .read_dir()
+        .unwrap()
+        .all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with("quickrows-")));
+}
 
-    std::fs::write(&doc.path, "a,b\ntruncated,source\n").unwrap();
-    assert_eq!(doc.display_rows(doc.row_count() - 1, 1).unwrap(), last_row);
+#[test]
+fn strict_size_limited_sources_are_opened_without_a_full_file_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("strict.csv");
+    std::fs::write(&path, "name,value\nalpha,1\nbeta,2\n").unwrap();
+
+    let doc = CsvDocument::open(
+        &path,
+        Some(ParseOverrides {
+            has_headers: Some(true),
+            malformed: Some("strict".to_string()),
+            max_field_size: Some(1024),
+            max_record_size: Some(4096),
+            ..Default::default()
+        }),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(doc.data_path, path);
+    assert!(doc._prepared_source.is_none());
+    assert_eq!(dir.path().read_dir().unwrap().count(), 1);
 }
 
 #[test]
@@ -31,12 +58,14 @@ fn prepared_source_lives_until_a_background_index_build_finishes() {
     )
     .unwrap();
     let prepared_path = doc.data_path.clone();
-    assert_eq!(
-        prepared_path.parent(),
-        std::fs::canonicalize(path.parent().unwrap())
-            .ok()
-            .as_deref()
-    );
+    assert_ne!(prepared_path.parent(), path.parent());
+    assert!(path.parent().unwrap().read_dir().unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("quickrows-")
+    }));
     let build = doc.prepare_search_index_build();
     drop(doc);
     assert!(prepared_path.exists());

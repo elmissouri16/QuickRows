@@ -19,6 +19,7 @@ Run the Package smoke workflow and complete this checklist on physical or repres
 ## macOS
 
 - Test the `.dmg`/`.app` on the oldest supported macOS and current macOS.
+- Run `scripts/smoke-test-macos-picker.sh` against the installed application.
 - Confirm bundle identifier `com.el.csv-viewer`, icons, CSV document role, Dock reopen, and Finder open-document events.
 - Validate Developer ID signing, hardened runtime, notarization, and Gatekeeper on a downloaded artifact.
 

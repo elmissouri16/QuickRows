@@ -194,7 +194,27 @@ fn prepared_document_fingerprint_uses_raw_utf16_source_bytes() {
 }
 
 #[test]
-fn open_rejects_source_change_after_immutable_capture() {
+fn source_pipeline_failures_prefer_a_typed_change_after_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rewritten.csv");
+    std::fs::write(&path, "name,value\nalpha,1\n").unwrap();
+    let expected = file_fingerprint(&path).unwrap();
+    std::fs::write(&path, "name,value\nbravo,9\n").unwrap();
+
+    let error = prefer_source_changed(
+        &path,
+        expected,
+        &|| false,
+        QuickRowsError::invalid_csv("interrupted source parse"),
+        "CSV changed while reading",
+    );
+
+    assert_eq!(error.kind(), crate::ErrorKind::SourceChanged);
+    assert_eq!(error.to_string(), "CSV changed while reading");
+}
+
+#[test]
+fn open_rejects_source_change_during_indexing() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("changing.csv");
     std::fs::write(&path, "name,value\nalpha,1\nbeta,2\n").unwrap();
@@ -242,7 +262,7 @@ fn open_rejects_source_change_after_immutable_capture() {
 }
 
 #[test]
-fn open_classifies_source_deletion_during_capture_as_source_changed() {
+fn open_classifies_source_deletion_during_indexing_as_source_changed() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("deleted-during-open.csv");
     std::fs::write(&path, "name,value\nalpha,1\nbeta,2\n").unwrap();
@@ -272,7 +292,7 @@ fn open_classifies_source_deletion_during_capture_as_source_changed() {
 
 #[cfg(unix)]
 #[test]
-fn open_rejects_symlink_retarget_after_immutable_capture() {
+fn open_rejects_symlink_retarget_during_indexing() {
     use std::os::unix::fs::symlink;
 
     let dir = tempfile::tempdir().unwrap();
@@ -308,17 +328,25 @@ fn open_rejects_symlink_retarget_after_immutable_capture() {
 }
 
 #[test]
-fn immutable_snapshots_prefer_the_source_filesystem() {
+fn ordinary_open_does_not_create_a_source_sidecar() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("snapshot.csv");
+    let path = dir.path().join("direct.csv");
     std::fs::write(&path, "name,value\na,1\n").unwrap();
+    let visible_sidecar_observed = std::cell::Cell::new(false);
+    let progress = |_| {
+        visible_sidecar_observed.set(dir.path().read_dir().unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("quickrows-")
+        }));
+    };
 
-    let doc = CsvDocument::open(&path, None, None).unwrap();
+    let doc = CsvDocument::open(&path, None, Some(&progress)).unwrap();
 
-    assert_eq!(
-        doc.data_path.parent(),
-        std::fs::canonicalize(path.parent().unwrap())
-            .ok()
-            .as_deref()
-    );
+    assert!(!visible_sidecar_observed.get());
+    assert_eq!(doc.data_path, path);
+    assert!(doc._prepared_source.is_none());
+    assert_eq!(dir.path().read_dir().unwrap().count(), 1);
 }

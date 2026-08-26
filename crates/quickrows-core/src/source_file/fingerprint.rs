@@ -27,8 +27,8 @@ fn fingerprint_open_file(
     let expected_len = metadata.len();
     let modified = metadata_modified(&metadata);
     let change_before = file_change_token(source)?;
-    let (len, content_hash) = hash_snapshot(source, is_cancelled)?;
-    check_snapshot_cancellation(is_cancelled)?;
+    let (len, content_hash) = hash_open_file(source, is_cancelled)?;
+    check_source_cancellation(is_cancelled)?;
     let metadata_after = source.metadata().map_err(QuickRowsError::from)?;
     let change_after = file_change_token(source)?;
     if len != expected_len
@@ -60,12 +60,12 @@ pub(super) fn file_fingerprint_with_identity(
     is_cancelled: &dyn Fn() -> bool,
     identity_of: &dyn Fn(&std::fs::File) -> QuickRowsResult<Option<FileIdentity>>,
 ) -> QuickRowsResult<FileFingerprint> {
-    check_snapshot_cancellation(is_cancelled)?;
+    check_source_cancellation(is_cancelled)?;
     let mut source = std::fs::File::open(path).map_err(QuickRowsError::from)?;
     let identity = identity_of(&source)?;
     let observed = fingerprint_open_file(&mut source, is_cancelled)?;
     let fingerprint = observed.fingerprint;
-    check_snapshot_cancellation(is_cancelled)?;
+    check_source_cancellation(is_cancelled)?;
 
     // Reopen the path after hashing so a replacement or symlink retarget cannot
     // hide behind the still-live descriptor for the original referent.
@@ -81,7 +81,7 @@ pub(super) fn file_fingerprint_with_identity(
         ));
     }
     let current_identity = identity_of(&current)?;
-    check_snapshot_cancellation(is_cancelled)?;
+    check_source_cancellation(is_cancelled)?;
     let current_change = file_change_token(&current)?;
     let identity_is_stable = match (identity, current_identity) {
         (Some(expected), Some(actual)) if expected == actual => true,
@@ -131,7 +131,7 @@ pub(super) fn file_fingerprint_with_identity(
         ));
     }
     let latest_identity = identity_of(&latest)?;
-    check_snapshot_cancellation(is_cancelled)?;
+    check_source_cancellation(is_cancelled)?;
     let latest_change = file_change_token(&latest)?;
     match (current_identity, latest_identity) {
         (Some(expected), Some(actual)) if expected != actual => {

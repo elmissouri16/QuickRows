@@ -154,8 +154,10 @@ fn commit_temporary_windows(
     let parent = resolved_target.parent().unwrap_or_else(|| Path::new("."));
     let backup = unused_temporary_path(parent, ".quickrows-backup-")?;
     let recovery = unused_temporary_path(parent, ".quickrows-recovery-")?;
-    replace_file_windows(resolved_target, temporary.path(), &backup)
-        .map_err(QuickRowsError::from)?;
+    // ReplaceFileW requires the replacement path to be movable. Consume the
+    // NamedTempFile first so its open handle cannot deny delete sharing.
+    let temporary = temporary.into_temp_path();
+    replace_file_windows(resolved_target, &temporary, &backup).map_err(QuickRowsError::from)?;
 
     let route_matches =
         resolve_save_target(logical_target).is_ok_and(|current| current == resolved_target);

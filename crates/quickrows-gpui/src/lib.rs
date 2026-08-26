@@ -7,10 +7,12 @@ mod state_tests;
 use actions::*;
 use cell_selection::CellSelection;
 use directories::ProjectDirs;
+#[cfg(all(not(target_os = "macos"), not(test)))]
+use gpui::PathPromptOptions;
 use gpui::{
     App, Application, Axis, Bounds, ClickEvent, ClipboardItem, Context, FocusHandle, KeyBinding,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
-    Pixels, Point, ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement,
     UniformListScrollHandle, WeakEntity, Window, WindowBounds, WindowOptions, div, prelude::*, px,
     relative, size, uniform_list,
 };

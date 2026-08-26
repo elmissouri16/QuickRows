@@ -246,7 +246,7 @@ fn chunk_ranges_saturate_instead_of_overflowing() {
 }
 
 #[test]
-fn finite_size_limits_stream_oversized_records_into_a_bounded_snapshot() {
+fn finite_size_limits_validate_without_copying_the_source() {
     let mut source = tempfile::NamedTempFile::new().unwrap();
     source.write_all(b"name,value\nrow,").unwrap();
     source.write_all(&vec![b'x'; 2 * 1024 * 1024]).unwrap();
@@ -260,12 +260,9 @@ fn finite_size_limits_stream_oversized_records_into_a_bounded_snapshot() {
     settings.max_record_size = 64;
     let prepared = prepare_csv_source(source.path(), &settings).unwrap();
 
-    assert!(prepared.temporary.is_some());
-    assert!(std::fs::metadata(&prepared.path).unwrap().len() < 128);
-    assert_eq!(
-        std::fs::read_to_string(&prepared.path).unwrap(),
-        "name,value\n"
-    );
+    assert!(prepared.temporary.is_none());
+    assert_eq!(prepared.path, source.path());
+    assert!(std::fs::metadata(&prepared.path).unwrap().len() > 2 * 1024 * 1024);
     assert!(
         prepared
             .warnings
@@ -411,7 +408,7 @@ fn decode_record_strips_bom() {
 }
 
 #[test]
-fn saved_preparation_writes_canonical_offsets_during_validation() {
+fn saved_preparation_indexes_directly_readable_output_without_copying() {
     let file = write_temp_csv("name,note\r\nalpha,\"line one\nline two\"\r\nbeta,plain\r\n");
     let mut settings = default_parse_settings();
     settings.malformed = MalformedMode::Strict;
@@ -423,7 +420,6 @@ fn saved_preparation_writes_canonical_offsets_during_validation() {
         &|| false,
     )
     .expect("prepare saved source");
-    let generic = prepare_csv_source(file.path(), &settings).expect("prepare generic source");
     let mut warnings = Vec::new();
     let scanned_offsets = build_row_offsets(
         &saved.prepared.path,
@@ -439,10 +435,9 @@ fn saved_preparation_writes_canonical_offsets_during_validation() {
     let raw = std::fs::read(file.path()).unwrap();
     assert_eq!(saved.raw_len, raw.len() as u64);
     assert_eq!(saved.raw_content_hash, *blake3::hash(&raw).as_bytes());
-    assert_eq!(
-        std::fs::read(&saved.prepared.path).unwrap(),
-        std::fs::read(&generic.path).unwrap()
-    );
+    assert_eq!(saved.prepared.path, file.path());
+    assert!(saved.prepared.temporary.is_none());
+    assert_eq!(std::fs::read(&saved.prepared.path).unwrap(), raw);
     assert!(warnings.is_empty());
 }
 

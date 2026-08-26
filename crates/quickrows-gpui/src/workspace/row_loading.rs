@@ -153,37 +153,78 @@ impl QuickRowsView {
         if self.operation.is_running() || self.modal_active() {
             return;
         }
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Open CSV".into()),
-        });
-        cx.spawn(async move |this, cx| {
-            match receiver.await {
-                Ok(Ok(Some(paths))) => {
-                    if let Some(path) = paths.into_iter().next() {
-                        this.update(cx, |this, cx| this.open_path(path.into(), cx))?;
-                    }
-                }
-                Ok(Ok(None)) => {}
-                Ok(Err(error)) => {
-                    this.update(cx, |this, cx| {
-                        this.feedback.error = Some(format!("Unable to open file dialog: {error}").into());
-                        cx.notify();
-                    })?;
-                }
+        #[cfg(test)]
+        {
+            // GPUI's test platform does not implement `prompt_for_paths`, but it
+            // does provide a deterministic path prompt. Keep this seam inside
+            // the real action flow so rendered tests exercise dispatch, async
+            // completion, validation, and repeated opens without invoking an OS
+            // dialog.
+            let receiver = cx.prompt_for_new_path(Path::new("."), Some("Open CSV"));
+            cx.spawn(async move |this, cx| {
+                let result = match receiver.await {
+                    Ok(Ok(path)) => Ok(path),
+                    Ok(Err(error)) => Err(format!("Unable to open file dialog: {error}")),
+                    Err(error) => Err(format!("File dialog closed unexpectedly: {error}")),
+                };
+                this.update(cx, |this, cx| this.finish_open_dialog(result, cx))?;
+                anyhow::Ok(())
+            })
+            .detach();
+        }
+        #[cfg(all(not(test), target_os = "macos"))]
+        {
+            let receiver = match prompt_for_csv_path() {
+                Ok(receiver) => receiver,
                 Err(error) => {
-                    this.update(cx, |this, cx| {
-                        this.feedback.error =
-                            Some(format!("File dialog closed unexpectedly: {error}").into());
-                        cx.notify();
-                    })?;
+                    self.finish_open_dialog(Err(format!("Unable to open file dialog: {error}")), cx);
+                    return;
                 }
+            };
+            cx.spawn(async move |this, cx| {
+                let result = match receiver.await {
+                    Ok(result) => result.map_err(|error| format!("Unable to open file dialog: {error}")),
+                    Err(_) => Err("File dialog closed unexpectedly.".to_string()),
+                };
+                this.update(cx, |this, cx| this.finish_open_dialog(result, cx))?;
+                anyhow::Ok(())
+            })
+            .detach();
+        }
+        #[cfg(all(not(test), not(target_os = "macos")))]
+        {
+            let receiver = cx.prompt_for_paths(PathPromptOptions {
+                files: true,
+                directories: false,
+                multiple: false,
+                prompt: Some("Open CSV".into()),
+            });
+            cx.spawn(async move |this, cx| {
+                let result = match receiver.await {
+                    Ok(Ok(paths)) => Ok(paths.and_then(|paths| paths.into_iter().next())),
+                    Ok(Err(error)) => Err(format!("Unable to open file dialog: {error}")),
+                    Err(error) => Err(format!("File dialog closed unexpectedly: {error}")),
+                };
+                this.update(cx, |this, cx| this.finish_open_dialog(result, cx))?;
+                anyhow::Ok(())
+            })
+            .detach();
+        }
+    }
+
+    fn finish_open_dialog(
+        &mut self,
+        result: Result<Option<PathBuf>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(Some(path)) => self.open_path(path.into(), cx),
+            Ok(None) => {}
+            Err(error) => {
+                self.feedback.error = Some(error.into());
+                cx.notify();
             }
-            anyhow::Ok(())
-        })
-        .detach();
+        }
     }
 
     fn track_open_progress(

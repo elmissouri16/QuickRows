@@ -378,7 +378,7 @@ impl QuickRowsView {
             self.resolve_header_prompt(None, cx);
             return;
         }
-        if matches!(self.overlay.modal, Modal::ExternalSave(_)) {
+        if matches!(self.overlay.modal, Modal::ExternalChange) {
             self.cancel_external_save(cx);
             return;
         }

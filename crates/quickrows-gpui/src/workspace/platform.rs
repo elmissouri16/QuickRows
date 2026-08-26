@@ -1,4 +1,45 @@
 // Native paths, open-target encoding, and single-instance coordination.
+#[cfg(all(target_os = "macos", not(test)))]
+fn prompt_for_csv_path(
+) -> Result<futures_channel::oneshot::Receiver<Result<Option<PathBuf>, String>>, String> {
+    use block2::RcBlock;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSModalResponse, NSModalResponseOK, NSOpenPanel};
+    use objc2_foundation::NSArray;
+    use objc2_uniform_type_identifiers::UTTypeCommaSeparatedText;
+
+    let main_thread = MainThreadMarker::new()
+        .ok_or_else(|| "the macOS file picker must run on the main thread".to_string())?;
+    let panel = NSOpenPanel::openPanel(main_thread);
+    panel.setCanChooseFiles(true);
+    panel.setCanChooseDirectories(false);
+    panel.setAllowsMultipleSelection(false);
+    // SAFETY: UniformTypeIdentifiers exports this immutable system singleton on
+    // supported macOS versions, and the panel copies the array when configured.
+    let csv_type = unsafe { UTTypeCommaSeparatedText };
+    panel.setAllowedContentTypes(&NSArray::from_slice(&[csv_type]));
+
+    let (sender, receiver) = futures_channel::oneshot::channel();
+    let sender = std::sync::Mutex::new(Some(sender));
+    let selected_panel = panel.clone();
+    let handler: RcBlock<dyn Fn(NSModalResponse)> = RcBlock::new(move |response| {
+        let result = if response == NSModalResponseOK {
+            selected_panel
+                .URL()
+                .and_then(|url| url.path())
+                .map(|path| Some(PathBuf::from(path.to_string())))
+                .ok_or_else(|| "the selected CSV did not have a local file path".to_string())
+        } else {
+            Ok(None)
+        };
+        if let Some(sender) = sender.lock().ok().and_then(|mut sender| sender.take()) {
+            let _ = sender.send(result);
+        }
+    });
+    panel.beginWithCompletionHandler(&handler);
+    Ok(receiver)
+}
+
 fn settings_path() -> PathBuf {
     ProjectDirs::from("com", "el", "csv-viewer")
         .map(|dirs| dirs.config_dir().join("settings.json"))

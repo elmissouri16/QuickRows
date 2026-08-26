@@ -8,7 +8,6 @@ struct CellRangeRequest<'a> {
 
 struct SaveRequest<'a> {
     path: &'a Path,
-    overwrite_external_changes: bool,
     operation: RowOperationContext<'a>,
 }
 
@@ -282,7 +281,6 @@ impl CsvDocument {
     pub fn save(&mut self, path: impl AsRef<Path>) -> QuickRowsResult<()> {
         self.save_request(SaveRequest {
             path: path.as_ref(),
-            overwrite_external_changes: false,
             operation: OperationContext::new(None, None),
         })
     }
@@ -294,7 +292,6 @@ impl CsvDocument {
     ) -> QuickRowsResult<()> {
         self.save_request(SaveRequest {
             path: path.as_ref(),
-            overwrite_external_changes: false,
             operation: OperationContext::new(Some(cancellation), None),
         })
     }
@@ -307,35 +304,53 @@ impl CsvDocument {
     ) -> QuickRowsResult<()> {
         self.save_request(SaveRequest {
             path: path.as_ref(),
-            overwrite_external_changes: false,
             operation: OperationContext::new(Some(cancellation), Some(progress)),
         })
     }
 
+    /// Compatibility entry point for callers that previously requested an
+    /// unsafe overwrite after an external source change.
+    ///
+    /// QuickRows now applies the same optimistic-concurrency check as a normal
+    /// save and returns [`ErrorKind::SourceChanged`] until the file is reloaded.
+    #[deprecated(
+        since = "0.1.1",
+        note = "external changes must be reloaded before saving"
+    )]
     pub fn save_cancellable_with_progress_overwrite_external(
         &mut self,
         path: impl AsRef<Path>,
         cancellation: &CancellationToken,
         progress: &dyn Fn(usize, usize),
     ) -> QuickRowsResult<()> {
-        self.save_request(SaveRequest {
-            path: path.as_ref(),
-            overwrite_external_changes: true,
-            operation: OperationContext::new(Some(cancellation), Some(progress)),
-        })
+        self.save_cancellable_with_progress(path, cancellation, progress)
     }
 
     fn save_request(&mut self, request: SaveRequest<'_>) -> QuickRowsResult<()> {
         let SaveRequest {
             path: target,
-            overwrite_external_changes,
             operation,
         } = request;
         operation.check()?;
         let cancellation = operation.cancellation;
         let progress = operation.progress;
+        let is_cancelled = || cancellation.is_some_and(CancellationToken::is_cancelled);
+        let live_source = file_fingerprint_cancellable(&self.path, &is_cancelled).map_err(|error| {
+            if error.kind() == ErrorKind::Io {
+                QuickRowsError::source_changed(format!(
+                    "CSV changed or became inaccessible; reload before saving: {error}"
+                ))
+            } else {
+                error
+            }
+        })?;
+        if live_source != self.source_fingerprint {
+            return Err(QuickRowsError::source_changed(
+                "CSV changed on disk; reload before saving",
+            ));
+        }
         let commit_target = resolve_save_target(target)?;
-        let expected_destination = if target == self.path && !overwrite_external_changes {
+        let expected_destination = if target == self.path {
             let expected = DestinationState::Existing(self.source_fingerprint);
             ensure_destination_unchanged(&commit_target, expected)?;
             expected
@@ -437,7 +452,15 @@ impl CsvDocument {
                 let end = start.saturating_add(INDEX_CHUNK_SIZE).min(self.row_count());
                 source_rows.clear();
                 source_rows.extend(start..end);
-                let rows = self.read_source_rows(&source_rows)?;
+                let rows = self.read_source_rows(&source_rows).map_err(|error| {
+                    prefer_source_changed(
+                        &self.path,
+                        self.source_fingerprint,
+                        &is_cancelled,
+                        error,
+                        "CSV changed on disk while it was being saved",
+                    )
+                })?;
                 for (source_row, mut row) in source_rows.iter().copied().zip(rows) {
                     operation.check()?;
                     let source_record = source_row + usize::from(self.settings.has_headers);
@@ -466,12 +489,27 @@ impl CsvDocument {
             (len, hash)
         };
         operation.check()?;
+        let final_source = file_fingerprint_cancellable(&self.path, &is_cancelled).map_err(
+            |error| {
+                if error.kind() == ErrorKind::Io {
+                    QuickRowsError::source_changed(format!(
+                        "CSV changed or became inaccessible while saving: {error}"
+                    ))
+                } else {
+                    error
+                }
+            },
+        )?;
+        if final_source != self.source_fingerprint {
+            return Err(QuickRowsError::source_changed(
+                "CSV changed on disk while saving; reload and try again",
+            ));
+        }
 
-        // Parse the exact bytes to be committed once. The strict parser writes
-        // the immutable canonical backing while it captures data-row offsets,
-        // so validation and saved-document construction share one full pass.
+        // Validate the exact bytes to be committed and capture data-row
+        // offsets. Directly indexable output stays in the atomic-save file;
+        // formats requiring canonical storage use an OS-temporary backing.
         let temporary_path = temporary.path().to_path_buf();
-        let is_cancelled = || cancellation.is_some_and(CancellationToken::is_cancelled);
         copy_destination_permissions(&commit_target, &temporary_path)?;
         temporary
             .as_file()

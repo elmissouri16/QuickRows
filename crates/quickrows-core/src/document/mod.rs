@@ -20,9 +20,9 @@ use crate::disk_cache::{
 use crate::error::{ErrorKind, QuickRowsError, QuickRowsResult};
 use crate::fragment::{CsvFragment, ResolvedFragmentRegion};
 use crate::mmap::open_immutable_mmap_if_large;
-use crate::source_snapshot::{
-    OpenFileState, SourceSnapshot, capture_open_file_state, file_fingerprint_cancellable,
-    snapshot_csv_source, verify_open_file_state, verify_path_references_open_file,
+use crate::source_file::{
+    OpenFileState, capture_open_file_state, file_fingerprint_cancellable, verify_open_file_state,
+    verify_path_references_open_file,
 };
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -43,6 +43,30 @@ const DEFAULT_CACHE_CHUNKS: usize = 8;
 const SORT_CHUNK_SIZE: usize = 10_000;
 const INDEX_CHUNK_SIZE: usize = 10_000;
 const SAVE_IO_BUFFER_BYTES: usize = 1024 * 1024;
+
+fn prefer_source_changed(
+    path: &Path,
+    expected: FileFingerprint,
+    is_cancelled: &dyn Fn() -> bool,
+    error: QuickRowsError,
+    message: &str,
+) -> QuickRowsError {
+    if error.kind() == ErrorKind::Cancelled {
+        return error;
+    }
+    match file_fingerprint_cancellable(path, is_cancelled) {
+        Ok(current) if current != expected => QuickRowsError::source_changed(message),
+        Err(fingerprint_error)
+            if matches!(
+                fingerprint_error.kind(),
+                ErrorKind::Io | ErrorKind::SourceChanged
+            ) =>
+        {
+            QuickRowsError::source_changed(format!("{message}: {fingerprint_error}"))
+        }
+        _ => error,
+    }
+}
 const INDEX_MAX_CARDINALITY: usize = 500_000;
 const SORT_MERGE_CHUNK_SIZE: usize = 65_536;
 const SORT_CANCELLATION_INTERVAL: usize = 4_096;

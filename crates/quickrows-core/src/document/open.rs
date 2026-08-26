@@ -77,43 +77,72 @@ impl CsvDocument {
         if let Some(overrides) = overrides.as_ref() {
             validate_parse_overrides(overrides)?;
         }
-        let SourceSnapshot {
-            temporary,
-            fingerprint: source_fingerprint,
-        } = snapshot_csv_source(&path, &is_cancelled)?;
-        // All parsing and cache work below uses the immutable capture. A final
-        // cancellable live fingerprint rejects source changes before open returns.
-        let immutable_source = Arc::new(temporary);
-        let immutable_path = immutable_source.path().to_path_buf();
+        // Opening a CSV must not duplicate a potentially huge file. Observe the
+        // live source before and after parsing instead; a mismatch rejects an
+        // inconsistent open and asks the caller to retry.
+        let source_fingerprint = file_fingerprint_cancellable(&path, &is_cancelled)?;
+        macro_rules! observe_source {
+            ($result:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Err(prefer_source_changed(
+                            &path,
+                            source_fingerprint,
+                            &is_cancelled,
+                            error,
+                            "CSV changed on disk while it was being opened",
+                        ));
+                    }
+                }
+            };
+        }
         let encoding_override = overrides
             .as_ref()
             .and_then(|overrides| overrides.encoding.as_deref());
-        let detected = detect_parse_settings_for_encoding(&immutable_path, encoding_override)?;
+        let detected = observe_source!(detect_parse_settings_for_encoding(
+            &path,
+            encoding_override
+        ));
         let detected_settings = apply_parse_overrides(&detected, None);
         let explicit_headers = overrides.as_ref().and_then(|value| value.has_headers);
         let mut settings = apply_parse_overrides(&detected, overrides);
-        validate_parse_settings(&settings)?;
-        let mut prepared =
-            prepare_csv_source_cancellable(&immutable_path, &settings, progress, &is_cancelled)?;
-        if prepared.temporary.is_none() {
-            prepared.path = immutable_path;
-            prepared.temporary = Some(immutable_source);
-        } else {
-            drop(immutable_source);
-        }
+        observe_source!(validate_parse_settings(&settings));
+        let prepared = observe_source!(prepare_csv_source_cancellable(
+            &path,
+            &settings,
+            progress,
+            &is_cancelled
+        ));
         let data_path = prepared.path.clone();
         let mut storage_settings = prepared.settings.clone();
         if explicit_headers.is_none() {
-            let has_headers = detect_headers_for_settings(&data_path, &storage_settings)?;
+            let has_headers = observe_source!(detect_headers_for_settings(
+                &data_path,
+                &storage_settings
+            ));
             settings.has_headers = has_headers;
             storage_settings.has_headers = has_headers;
         }
-        let mut warnings = prepared.warnings.clone();
-        let headers = get_headers(&data_path, &storage_settings, &mut warnings)?;
+        // Direct validation and offset construction apply the same skip/limit
+        // policy. The offset pass owns diagnostics so malformed rows are not
+        // reported twice; transformed sources retain preparation warnings.
+        let mut warnings = if prepared.temporary.is_some() {
+            prepared.warnings.clone()
+        } else {
+            Vec::new()
+        };
+        let headers = observe_source!(get_headers(
+            &data_path,
+            &storage_settings,
+            &mut warnings
+        ));
         let expected_columns = (!headers.is_empty()).then_some(headers.len());
         let header_warning_count = warnings.len();
         let mmap = if prepared.temporary.is_some() {
-            open_immutable_mmap_if_large(&data_path).map_err(QuickRowsError::from)?
+            observe_source!(
+                open_immutable_mmap_if_large(&data_path).map_err(QuickRowsError::from)
+            )
         } else {
             None
         };
@@ -156,7 +185,7 @@ impl CsvDocument {
             }
             offsets
         } else {
-            match (mmap.as_deref(), cancellation) {
+            observe_source!(match (mmap.as_deref(), cancellation) {
                 (Some(mmap), Some(cancellation)) => build_row_offsets_mmap_cancellable(
                     &mmap[..],
                     &storage_settings,
@@ -187,9 +216,11 @@ impl CsvDocument {
                     &mut warnings,
                     progress,
                 ),
-            }?
+            })
         };
-        cancellation.map(CancellationToken::check).transpose()?;
+        observe_source!(cancellation.map(CancellationToken::check).transpose());
+        // Reject a source that changed during detection, preparation, or
+        // indexing instead of retaining a full-size private copy.
         match file_fingerprint_cancellable(&path, &is_cancelled) {
             Ok(final_fingerprint) if final_fingerprint == source_fingerprint => {}
             Ok(_) => {

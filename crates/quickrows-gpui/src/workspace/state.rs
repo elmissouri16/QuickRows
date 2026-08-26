@@ -443,7 +443,7 @@ enum Modal {
     About,
     Destructive(PendingDestructiveAction),
     Bulk(PendingBulkAction),
-    ExternalSave(PathBuf),
+    ExternalChange,
 }
 
 impl Modal {

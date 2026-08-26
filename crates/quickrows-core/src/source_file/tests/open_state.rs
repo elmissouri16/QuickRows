@@ -21,10 +21,22 @@ fn open_file_state_rejects_a_same_length_rewrite() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("candidate.csv");
     std::fs::write(&path, "a,b\n1,2\n").unwrap();
-    let file = std::fs::File::open(&path).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
     let state = capture_open_file_state(&file).unwrap();
 
-    std::fs::write(&path, "a,b\n3,4\n").unwrap();
+    use std::io::{Seek, Write};
+    file.seek(std::io::SeekFrom::Start(0)).unwrap();
+    file.write_all(b"a,b\n3,4\n").unwrap();
+    file.flush().unwrap();
+    file.set_times(
+        std::fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60)),
+    )
+    .unwrap();
 
     let error = verify_open_file_state(&file, state).unwrap_err();
     assert_eq!(error.kind(), crate::ErrorKind::DestinationChanged);

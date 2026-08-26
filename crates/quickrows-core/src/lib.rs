@@ -12,7 +12,7 @@ mod error;
 mod fragment;
 mod mmap;
 mod settings;
-mod source_snapshot;
+mod source_file;
 mod storage;
 
 pub use csv::{

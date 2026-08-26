@@ -877,6 +877,15 @@ fn explicit_size_limits_apply_in_all_malformed_modes() {
     assert_eq!(strict_error.kind(), crate::ErrorKind::InvalidCsv);
     let skipped = CsvDocument::open(&path, Some(settings("skip")), None).unwrap();
     assert_eq!(skipped.row_count(), 0);
+    assert_eq!(
+        skipped
+            .metadata()
+            .warnings
+            .iter()
+            .filter(|warning| warning.kind == "max-field-size")
+            .count(),
+        1
+    );
     let repaired = CsvDocument::open(&path, Some(settings("repair")), None).unwrap();
     assert_eq!(repaired.row_count(), 1);
     assert_eq!(

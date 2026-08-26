@@ -50,7 +50,7 @@ impl Render for QuickRowsView {
             .then(|| self.render_shortcuts(cx));
         let about = matches!(self.overlay.modal, Modal::About)
             .then(|| self.render_about(cx));
-        let external_save = matches!(self.overlay.modal, Modal::ExternalSave(_))
+        let external_save = matches!(self.overlay.modal, Modal::ExternalChange)
             .then(|| self.render_external_save_confirmation(cx));
         let unsaved = matches!(self.overlay.modal, Modal::Destructive(_))
             .then(|| self.render_unsaved_confirmation(cx));

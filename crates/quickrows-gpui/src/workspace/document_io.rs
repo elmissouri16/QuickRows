@@ -1,6 +1,22 @@
 // Document open, reload, close, save, and conflict handling.
+fn is_external_save_conflict(kind: ErrorKind) -> bool {
+    matches!(kind, ErrorKind::SourceChanged | ErrorKind::DestinationChanged)
+}
+
+fn is_csv_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("csv"))
+}
+
 impl QuickRowsView {
     fn open_path(&mut self, target: OpenTarget, cx: &mut Context<Self>) {
+        if !is_csv_path(&target.path) {
+            self.feedback.error = Some("QuickRows can only open .csv files.".into());
+            self.feedback.notice = None;
+            cx.notify();
+            return;
+        }
         if self.operation.is_running() {
             return;
         }
@@ -414,17 +430,6 @@ impl QuickRowsView {
         cx.notify();
     }
 
-    fn confirm_external_overwrite(&mut self, cx: &mut Context<Self>) {
-        if let Modal::ExternalSave(path) = std::mem::take(&mut self.overlay.modal) {
-            self.save_to_unchecked(path, true, cx);
-        }
-    }
-
-    fn save_external_as(&mut self, cx: &mut Context<Self>) {
-        self.overlay.modal = Modal::None;
-        self.prompt_save_as(cx);
-    }
-
     fn reload_external_change(&mut self, cx: &mut Context<Self>) {
         self.overlay.modal = Modal::None;
         let Some(path) = self.document.loaded.as_ref().map(|loaded| loaded.path.clone()) else {
@@ -522,25 +527,15 @@ impl QuickRowsView {
         if self.operation.is_running() {
             return;
         }
-        if self.document.external_change_detected
-            && self
-                .document.loaded
-                .as_ref()
-                .is_some_and(|loaded| loaded.path == path)
-        {
-            self.overlay.modal = Modal::ExternalSave(path);
+        if self.document.external_change_detected {
+            self.overlay.modal = Modal::ExternalChange;
             cx.notify();
             return;
         }
-        self.save_to_unchecked(path, false, cx);
+        self.save_to_unchecked(path, cx);
     }
 
-    fn save_to_unchecked(
-        &mut self,
-        path: PathBuf,
-        overwrite_external_changes: bool,
-        cx: &mut Context<Self>,
-    ) {
+    fn save_to_unchecked(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.operation.is_running() {
             return;
         }
@@ -567,19 +562,11 @@ impl QuickRowsView {
             let mut document = document
                 .lock()
                 .map_err(|_| QuickRowsError::other("CSV document lock was poisoned"))?;
-            if overwrite_external_changes {
-                document.save_cancellable_with_progress_overwrite_external(
-                    &save_path,
-                    &cancellation,
-                    &update_progress,
-                )?;
-            } else {
-                document.save_cancellable_with_progress(
-                    &save_path,
-                    &cancellation,
-                    &update_progress,
-                )?;
-            }
+            document.save_cancellable_with_progress(
+                &save_path,
+                &cancellation,
+                &update_progress,
+            )?;
             Ok::<_, QuickRowsError>(())
         });
         cx.spawn(async move |this, cx| {
@@ -660,8 +647,10 @@ impl QuickRowsView {
                     Err(error) if error.kind() == ErrorKind::Cancelled => {
                         this.feedback.notice = Some("Save cancelled.".into());
                     }
-                    Err(error) if error.kind() == ErrorKind::DestinationChanged => {
+                    Err(error) if is_external_save_conflict(error.kind()) =>
+                    {
                         this.document.external_change_detected = true;
+                        this.overlay.modal = Modal::ExternalChange;
                         this.feedback.error = Some(format!("Unable to save CSV: {error}").into());
                         this.feedback.notice = None;
                     }

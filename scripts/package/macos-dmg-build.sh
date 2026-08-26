@@ -34,7 +34,9 @@ ensure_cargo_packager() {
 
 create_package_config() {
   PACKAGE_CONFIG=packager.toml
-  [[ -n "$SIGNING_IDENTITY" ]] || return
+  if [[ -z "$SIGNING_IDENTITY" ]]; then
+    return 0
+  fi
 
   if grep -q '^\[macos\]' packager.toml; then
     echo "error: packager.toml already has a [macos] table; set signingIdentity there" >&2

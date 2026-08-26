@@ -14,7 +14,7 @@ fn edits_deletes_and_saves() {
 }
 
 #[test]
-fn save_tracks_committed_raw_bytes_and_keeps_an_immutable_backing() {
+fn save_tracks_committed_raw_bytes_without_a_full_file_backing_copy() {
     let (dir, mut doc) = document("name,value\na,1\nb,2\n");
     doc.edit_cell(0, 1, "updated".to_string()).unwrap();
     let output = dir.path().join("saved-fingerprint.csv");
@@ -22,16 +22,8 @@ fn save_tracks_committed_raw_bytes_and_keeps_an_immutable_backing() {
     doc.save(&output).unwrap();
 
     assert_eq!(doc.source_fingerprint, file_fingerprint(&output).unwrap());
-    assert_ne!(doc.data_path, output);
-    assert!(doc._prepared_source.is_some());
-    std::fs::write(&output, "name,value\nexternal,9\n").unwrap();
-    assert_eq!(
-        doc.display_rows(0, 2).unwrap(),
-        vec![
-            (0, vec!["a".to_string(), "updated".to_string()]),
-            (1, vec!["b".to_string(), "2".to_string()]),
-        ]
-    );
+    assert_eq!(doc.data_path, output);
+    assert!(doc._prepared_source.is_none());
 }
 
 #[test]
@@ -195,7 +187,7 @@ fn symlink_retargeted_during_save_aborts_without_touching_either_referent() {
     let error = doc
         .save_cancellable_with_progress(&link, &CancellationToken::new(), &progress)
         .unwrap_err();
-    assert_eq!(error.kind(), crate::ErrorKind::DestinationChanged);
+    assert_eq!(error.kind(), crate::ErrorKind::SourceChanged);
     assert!(error.contains("changed on disk"));
     assert_eq!(
         std::fs::read_to_string(&first).unwrap(),
@@ -339,6 +331,7 @@ fn external_change_during_save_is_checked_before_commit() {
     let error = doc
         .save_cancellable_with_progress(&path, &cancellation, &progress)
         .unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::SourceChanged);
     assert!(error.contains("changed on disk"));
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
@@ -398,7 +391,7 @@ fn concurrent_save_as_destination_change_is_not_overwritten() {
 }
 
 #[test]
-fn explicit_external_overwrite_uses_the_immutable_opened_snapshot() {
+fn save_requires_reload_after_an_external_rewrite() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("overwrite.csv");
     std::fs::write(&path, "a,b\noriginal,1\nsecond,2\n").unwrap();
@@ -415,26 +408,27 @@ fn explicit_external_overwrite_uses_the_immutable_opened_snapshot() {
     std::fs::write(&path, "a,b\nexternal,8\nchanged,9\n").unwrap();
     let cancellation = CancellationToken::new();
 
-    doc.save_cancellable_with_progress_overwrite_external(&path, &cancellation, &|_, _| {})
-        .unwrap();
+    let error = doc
+        .save_cancellable_with_progress(&path, &cancellation, &|_, _| {})
+        .unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::SourceChanged);
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
-        "a,b\noriginal,edited\nsecond,2\n"
+        "a,b\nexternal,8\nchanged,9\n"
     );
 }
 
 #[test]
-fn explicit_external_overwrite_can_restore_a_deleted_source() {
+fn save_requires_reload_after_the_source_is_deleted() {
     let (dir, mut doc) = document("a,b\noriginal,1\n");
     let path = dir.path().join("sample.csv");
     doc.edit_cell(0, 1, "restored".to_string()).unwrap();
     std::fs::remove_file(&path).unwrap();
     let cancellation = CancellationToken::new();
 
-    doc.save_cancellable_with_progress_overwrite_external(&path, &cancellation, &|_, _| {})
-        .unwrap();
-    assert_eq!(
-        std::fs::read_to_string(&path).unwrap(),
-        "a,b\noriginal,restored\n"
-    );
+    let error = doc
+        .save_cancellable_with_progress(&path, &cancellation, &|_, _| {})
+        .unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::SourceChanged);
+    assert!(!path.exists());
 }
