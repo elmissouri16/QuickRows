@@ -609,21 +609,24 @@ fn detect_excel_sep(sample: &str) -> Option<(char, usize)> {
     Some((delimiter, consumed))
 }
 
-fn read_sample(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut file = File::open(path)?;
-    let mut sample = vec![0; SAMPLE_SIZE];
-    let read = file.read(&mut sample)?;
-    sample.truncate(read);
-    Ok(sample)
+fn read_sample(path: &Path) -> Result<(Vec<u8>, bool), Box<dyn std::error::Error>> {
+    // Read one extra byte to distinguish the sampling boundary from actual EOF.
+    let mut sample = Vec::with_capacity(SAMPLE_SIZE + 1);
+    File::open(path)?
+        .take((SAMPLE_SIZE + 1) as u64)
+        .read_to_end(&mut sample)?;
+    let at_eof = sample.len() <= SAMPLE_SIZE;
+    sample.truncate(SAMPLE_SIZE);
+    Ok((sample, at_eof))
 }
 
-fn detect_encoding(sample: &[u8]) -> (&'static Encoding, String, usize) {
+fn detect_encoding(sample: &[u8], at_eof: bool) -> (&'static Encoding, String, usize) {
     if let Some((encoding, bom_len)) = Encoding::for_bom(sample) {
         return (encoding, encoding.name().to_string(), bom_len);
     }
 
     let mut detector = EncodingDetector::new();
-    detector.feed(sample, true);
+    detector.feed(sample, at_eof);
     let encoding = detector.guess(None, true);
     (encoding, encoding.name().to_string(), 0)
 }
@@ -659,8 +662,8 @@ pub fn detect_parse_settings_for_encoding(
     path: impl AsRef<Path>,
     encoding_override: Option<&str>,
 ) -> QuickRowsResult<DetectedSettings> {
-    let sample = read_sample(path.as_ref()).map_err(QuickRowsError::from)?;
-    let (detected_encoding, detected_label, bom_len) = detect_encoding(&sample);
+    let (sample, at_eof) = read_sample(path.as_ref()).map_err(QuickRowsError::from)?;
+    let (detected_encoding, detected_label, bom_len) = detect_encoding(&sample, at_eof);
     let forced_encoding = encoding_override
         .map(normalize_encoding_label)
         .and_then(|label| Encoding::for_label(label.as_bytes()));

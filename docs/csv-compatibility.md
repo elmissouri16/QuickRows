@@ -21,6 +21,7 @@ QuickRows treats RFC 4180 and RFC 7111 as the standards baseline, then adds opt-
 ## Encodings and byte handling
 
 - UTF-8, UTF-16LE, and UTF-16BE, with or without a BOM when endianness is explicit.
+- UTF-8 detection tolerates multibyte characters split by the sampling boundary while still checking incomplete sequences at the actual end of the file.
 - BOM length is tracked independently from an encoding override, so a forced encoding cannot leave part of a BOM in the first field.
 - BOM presence is preserved only when compatible with the output encoding; BOMless UTF-16 stays BOMless.
 - Legacy encodings exposed by `encoding_rs`, with atomic save failure when edited text is not representable.

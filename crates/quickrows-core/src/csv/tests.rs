@@ -176,6 +176,54 @@ fn delimiter_detection_handles_quoted_unicode_delimiters_and_truncated_samples()
 }
 
 #[test]
+fn detects_utf8_when_sample_splits_a_multibyte_character() {
+    for character in ['я', '€', '🦀'] {
+        for sampled_bytes in 1..character.len_utf8() {
+            let prefix = "id,name\n1,";
+            let value = format!(
+                "{}{character}",
+                "x".repeat(SAMPLE_SIZE - prefix.len() - sampled_bytes)
+            );
+            let contents = format!("{prefix}{value}\n");
+            let file = write_temp_csv(&contents);
+            let detected = detect_parse_settings(file.path()).unwrap();
+            assert_eq!(
+                detected.encoding,
+                encoding_rs::UTF_8,
+                "{sampled_bytes} sampled bytes of {character:?}"
+            );
+
+            let settings = apply_parse_overrides(&detected, None);
+            let rows = read_chunk_mmap(
+                contents.as_bytes(),
+                0,
+                1,
+                &settings,
+                Some(2),
+                &mut Vec::new(),
+            )
+            .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], "1");
+            assert!(rows[0][1] == value);
+        }
+    }
+}
+
+#[test]
+fn incomplete_utf8_at_actual_eof_is_not_detected_as_utf8() {
+    for length in [1, SAMPLE_SIZE - 1, SAMPLE_SIZE] {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&vec![b'x'; length - 1]).unwrap();
+        file.write_all(&[0xd0]).unwrap();
+        file.flush().unwrap();
+
+        let detected = detect_parse_settings(file.path()).unwrap();
+        assert_ne!(detected.encoding, encoding_rs::UTF_8, "{length} bytes");
+    }
+}
+
+#[test]
 fn detects_excel_separator_without_treating_it_as_a_header() {
     let file = write_temp_csv("sep=;\r\nname;value\r\nalpha;1\r\n");
     let detected = detect_parse_settings(file.path()).unwrap();
